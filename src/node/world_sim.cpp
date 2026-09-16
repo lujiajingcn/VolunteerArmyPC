@@ -93,6 +93,12 @@ void WorldSim::_ready() {
 
     build_scene(this, refs_);
     va_trace("_ready:build_scene ok");
+    // 取证用消融开关：把某一层藏起来，用来判定"画面上这块到底是什么"。
+    // 本机已经在"肉眼认几何体"上错过好几次（把树当成枪、把枪当成草地……），
+    // 分层消融是唯一可靠的归属判断手段。
+    if (std::getenv("VA_HIDE_PROPS") != nullptr && refs_.props != nullptr) refs_.props->set_visible(false);
+    if (std::getenv("VA_HIDE_UNITS") != nullptr && refs_.units != nullptr) refs_.units->set_visible(false);
+    if (std::getenv("VA_HIDE_VEH") != nullptr && refs_.vehicles != nullptr) refs_.vehicles->set_visible(false);
     spawn_entity_nodes();
     va_trace("_ready:spawn ok");
     setup_runtime_ui();
@@ -189,26 +195,22 @@ void WorldSim::setup_runtime_ui() {
     layer->set_layer(10);
     add_child(layer);
 
-    lbl_help_ = memnew(Label);
-    lbl_help_->set_position(Vector2(18, 14));
-    lbl_help_->add_theme_color_override("font_color", Color(0.85f, 0.92f, 0.96f, 0.85f));
-    lbl_help_->set_text(String::utf8("WASD 移动 · 鼠标 视角 · Shift 疾跑 · Ctrl 蹲 · 左键 射击 · 右键 瞄准 · Esc 释放鼠标"));
-    layer->add_child(lbl_help_);
+    // 整个 HUD 就是一个 Control，内容全部手绘。
+    // 早期版本用 4 个 Label 平铺文字，能读但完全没有"界面"可言 ——
+    // 使命召唤那套 UI 的信息有一半是用形状讲的（罗盘刻度、雷达、切角面板、
+    // 动态准星），Label 表达不了。详见 node/hud.h 顶部说明。
+    hud_ = memnew(Hud);
+    hud_->set_name("Hud");
+    // 铺满视口。HUD 只画不点，必须忽略鼠标事件，
+    // 否则它会吃掉 _input 里那套鼠标视角控制。
+    hud_->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
+    hud_->set_mouse_filter(Control::MOUSE_FILTER_IGNORE);
+    layer->add_child(hud_);
 
-    lbl_status_ = memnew(Label);
-    lbl_status_->set_position(Vector2(18, 34));
-    lbl_status_->add_theme_color_override("font_color", Color(0.55f, 0.83f, 1.0f, 0.95f));
-    layer->add_child(lbl_status_);
-
-    lbl_subs_ = memnew(Label);
-    lbl_subs_->set_position(Vector2(18, 560));
-    lbl_subs_->add_theme_color_override("font_color", Color(0.93f, 0.86f, 0.62f, 0.95f));
-    layer->add_child(lbl_subs_);
-
-    lbl_toast_ = memnew(Label);
-    lbl_toast_->set_position(Vector2(360, 90));
-    lbl_toast_->add_theme_color_override("font_color", Color(1.0f, 0.78f, 0.30f));
-    layer->add_child(lbl_toast_);
+    // 取证用消融开关：把 HUD 整层藏掉，剩下的一定是 3D 画面。
+    // 上一轮"画面正中央那根黑竖条到底是谁"靠肉眼认几何体认错过一次，
+    // 所以凡是"这块黑东西属于哪一层"的问题，一律用消融来答，不靠眼看。
+    if (std::getenv("VA_HIDE_HUD") != nullptr) hud_->set_visible(false);
 }
 
 void WorldSim::spawn_entity_nodes() {
@@ -308,23 +310,9 @@ void WorldSim::_process(double p_delta) {
 
     va_trace("_process:cam ok");
 
-    // HUD 文本（每 6 帧刷新一次，避免每帧构造字符串）
-    ui_t_ += p_delta;
-    if (ui_t_ > 0.1) {
-        ui_t_ = 0.0;
-        char buf[256];
-        std::snprintf(buf, sizeof(buf), "T+%05.1f s  ·  阶段 %s  ·  天气 %s  ·  存活队友 %d  ·  敌军阵亡 %d",
-                      va::W.t, va::W.phaseName.c_str(), va::W.weather.c_str(),
-                      (int)va::alive_allies().size(), va::W.stats.enemyDead);
-        lbl_status_->set_text(String::utf8(buf));
-
-        String s;
-        for (const auto &sub : va::W.subs) {
-            s += String::utf8("[") + String::utf8(sub.who.c_str()) + String::utf8("] ")
-               + String::utf8(sub.text.c_str()) + String::utf8("\n");
-        }
-        lbl_subs_->set_text(s);
-    }
+    // HUD：采样世界状态 + 推进动画。整屏内容一次 _draw() 画完，
+    // 所以这里只需每帧调一次 update（它内部会 queue_redraw）。
+    if (hud_ != nullptr) hud_->update(p_delta);
 
     // 视图模型：只读逻辑层的状态，反过来不影响逻辑
     {
@@ -395,7 +383,15 @@ void WorldSim::_input(const Ref<InputEvent> &p_event) {
             case Key::KEY_D: case Key::KEY_RIGHT: va::IN.d = down; break;
             case Key::KEY_SHIFT: va::IN.shift = down; break;
             case Key::KEY_CTRL:  va::IN.ctrl = down; break;
-            case Key::KEY_R:     if (down) va::IN.reload = true; break;
+            // R 有双重语义：战斗中换弹，结算界面上重开一局。
+            // 用 W.over 分支而不是再占一个键 —— 结算时换弹毫无意义，
+            // 键位重叠不会产生歧义。
+            case Key::KEY_R:
+                if (down) {
+                    if (hud_ != nullptr && hud_->mission_over()) reset_mission();
+                    else va::IN.reload = true;
+                }
+                break;
             case Key::KEY_G:     if (down) va::IN.grenade = true; break;
             case Key::KEY_F:     if (down) va::IN.smoke = true; break;
             case Key::KEY_Q:     if (down) { /* 指令面板（待接入） */ } break;
@@ -427,14 +423,15 @@ void WorldSim::on_sfx(const std::string &id, float x, float y, float gain, bool 
     last_sfx_t_ = now;
 }
 void WorldSim::on_toast(const std::string &text) {
-    if (lbl_toast_) lbl_toast_->set_text(String::utf8(text.c_str()));
+    if (hud_ != nullptr) hud_->ev_toast(text);
 }
 void WorldSim::on_alert(const std::string &text, float dur) {
-    (void)dur;
-    if (lbl_toast_) lbl_toast_->set_text(String::utf8(text.c_str()));
+    if (hud_ != nullptr) hud_->ev_alert(text, dur);
 }
 void WorldSim::on_end(const std::string &kind, const std::string &text) {
-    if (lbl_toast_) lbl_toast_->set_text(String::utf8((kind + "：" + text).c_str()));
+    // 结算本身由 HUD 的结算面板呈现（成败、评级、统计）；
+    // 这里只把逻辑层给的这段文案留个记录，方便对照逻辑输出。
+    UtilityFunctions::print("[结算] ", String::utf8(kind.c_str()), "：", String::utf8(text.c_str()));
 }
 void WorldSim::on_subs_dirty() {}
 void WorldSim::on_objectives_dirty() {}

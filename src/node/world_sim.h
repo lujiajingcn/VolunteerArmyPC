@@ -9,10 +9,10 @@
 
 #include <godot_cpp/classes/camera3d.hpp>
 #include <godot_cpp/classes/input_event.hpp>
-#include <godot_cpp/classes/label.hpp>
 #include <godot_cpp/classes/node3d.hpp>
 #include <godot_cpp/variant/string.hpp>
 
+#include "node/hud.h"
 #include "node/scene_builder.h"
 #include "node/viewmodel.h"
 #include "sim/va_world.h"
@@ -76,7 +76,6 @@ private:
 
     // 主循环
     double acc_ = 0.0;
-    double ui_t_ = 0.0;
     bool  mission_started_ = false;
 
     // 音频节流（同一音效 id 在极短时间内不重复触发）
@@ -95,11 +94,8 @@ private:
     bool   cap_enabled_ = false;
     int    cap_frame_skip_ = 0;
 
-    // UI
-    godot::Label *lbl_status_ = nullptr;
-    godot::Label *lbl_subs_ = nullptr;
-    godot::Label *lbl_toast_ = nullptr;
-    godot::Label *lbl_help_ = nullptr;
+    // UI：全套使命召唤风格 HUD，手绘在一个 Control 里（见 node/hud.h）
+    Hud *hud_ = nullptr;
 };
 
 } // namespace volunteer_army

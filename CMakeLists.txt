@@ -40,6 +40,7 @@ set(VA_SOURCES
     src/sim/va_ai_enemy.cpp
     src/sim/va_flow.cpp
     src/node/viewmodel.cpp
+    src/node/hud.cpp
     src/node/world_sim.cpp
     src/node/scene_builder.cpp
 )

@@ -35,12 +35,16 @@ struct SceneRefs {
     godot::Node3D *vehicles = nullptr;
     godot::Node3D *decals = nullptr;
 
-    // 光照三件套（主光 / 补光 / 反弹光）—— 留引用是为了运行时还能调
+    // 光照四件套（主光 / 补光 / 反弹光 / 补洞光）—— 留引用是为了运行时还能调
     // （例如夜战 / 爆炸闪光临时提亮、剧情转折时换色温）
     godot::WorldEnvironment *world_env = nullptr;
     godot::DirectionalLight3D *sun = nullptr;
     godot::DirectionalLight3D *fill = nullptr;
     godot::DirectionalLight3D *bounce = nullptr;
+    // RIM：专补太阳与补光之间那个"两边都照不到"的方位扇区，见 scene_builder.cpp
+    // 里 RIM 那段的长注释 —— 少了它，竖直面朝那个方位时三盏灯 N·L 全为负，
+    // 只剩微弱环境光，在画面上就是一根纯黑剪影树干（实测 RGB(9,15,26)）。
+    godot::DirectionalLight3D *rim = nullptr;
     godot::Ref<godot::Material> sky_mat;   // ProceduralSkyMaterial，随天气换色
 };
 

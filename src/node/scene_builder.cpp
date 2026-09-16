@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <vector>
 
@@ -615,13 +616,22 @@ static Ref<Texture3D> make_grade_lut() {
 // ------------------------------------------------------- 环境 / 光照
 // 使命召唤式的战场氛围：冷调阴影 + 暖调阳光 + 强烈空气透视 + 体积光。
 //
-// 【为什么必须三点布光】
+// 【为什么必须四点布光】
 // 只有一盏 DirectionalLight 时，背光面除了 ambient 之外收不到任何方向性光照，
 // 只要法线一转过去就塌成纯黑剪影（实测截图里树干、树冠背面全是死黑）。
-// 真实世界的背光面靠天空漫射 + 地面反弹照亮，所以要显式补两盏无阴影光源：
+// 真实世界的背光面靠天空漫射 + 地面反弹照亮，所以要显式补无阴影光源：
 //     SUN    主光，暖白，投影，定调
-//     FILL   冷蓝，无影，从主光反方向斜射，把暗部结构"读"出来
+//     FILL   冷蓝，无影，**正对主光反面**，负责把"相机看到的那一面"照出来
 //     BOUNCE 暖土色，无影，自下而上，模拟大地反弹，让模型从背景里"立起来"
+//     RIM    补洞光，无影，压在 SUN 与 FILL 之间那个两边都照不到的扇区上
+//
+// 【FILL 和 RIM 不是一回事，别合并】
+// SUN 与 FILL 对冲，各自覆盖约 180°，但**覆盖边缘的权重趋近于零**：
+// 取方位 φ=210°（SUN 118° 与 FILL 302° 的正中），两边的 cos 都 ≈ 0，
+// 即存在两个"谁都不管"的扇区（约 210° 与 30°）。
+// 竖直面（树干/油桶/载具侧板/电线杆）法线水平，正好会被扫进这两个扇区，
+// 于是 RIM 单独补的就是这两处 —— 它救的是少数朝向，FILL 救的是整个逆光半区。
+// 两者能量差了 3 倍多，作用面完全不同，不能互相替代。
 //
 // 【为什么分三套配方】
 // logic 层的 W.weather 本来就参与玩法（能见度、伤害、雾），见文件头的说明。
@@ -653,40 +663,71 @@ struct WeatherLook {
     float   saturation;
     float   contrast;
     float   glow_intensity;
+    // RIM 补洞光。追加在**末尾**而不是插在中间：这张表是 25 个字段的聚合初始化，
+    // 中间插一个字段会让后面每一行的值整体错位一格，而且是静默错位 ——
+    // 编得过、跑得起来、只是画面微妙地不对，极难发现。加字段一律只往尾部加。
+    Color   rim_color;
+    float   rim_energy;
 };
 
 // 数值来源：网页版 FOG 表（index.html:4066）与天空 zenith 表（index.html:4226），
 // 换算到 Godot 的线性 HDR 空间后再按色调映射特性做反向补偿。
+//
+// 【fill_energy 的标定过程（0.32 → 2.05）】
+// 这一格原先只有 0.32，是本文件里最贵的一个错。症状：白天空下画面正中一根
+// 贯穿全高的纯黑柱（树干，实测 RGB(9,15,26)，偏蓝），另外所有石块侧面也是死黑。
+// 定位过程与结论：
+//   1. 把 ambient_light_color 换成刺眼的洋红 (1,0,1) —— 树干变成 RGB(73,0,45)。
+//      **它被环境光照到了**，之所以黑是因为**只剩环境光**。这一刀切掉了
+//      "环境光路径没接上"的假设。
+//   2. VA_NO_AO / VA_NO_SHADOW 逐个摘除 —— 死黑只降 0.1~0.9pp，AO 与阴影都不是主因。
+//   3. 逐灯单独加压：SUN 翻 1.74 倍树干只从 L15 到 L19；FILL 翻到 2.56 直接到 L51。
+//      树干对补光的响应是主光的 2 倍以上。
+//   4. 把补光方位角扫一圈（VA_RIM_AZ 0..315）—— 树干在任何方位都点不亮，
+//      说明它正好朝着太阳的反面；而补光方位 302° 与太阳 118° 恰好对冲，
+//      也就是**"被逆光的那一面就是相机看到的那一面"**。
+// 说白了：太阳负责照亮朝向它的一半世界，补光负责另一半，而补光被压到了 0.32，
+// 于是"相机看向哪一面，那一面就是黑的"。这不是审美参数，是结构性欠账。
+// 标定结果（VA_FILL 倍率扫描，VA_SEED=1）：
+//     倍率 1.0（0.32）死黑 7.21%  树干 L15  草地 L163
+//     倍率 5.0（1.60）死黑 2.09%  树干 L36  草地 L174
+//     倍率 6.4（2.05）死黑 1.95%  树干 L43  草地 L177   ← 取这一档
+//     倍率 8.0（2.56）死黑 1.85%  树干 L51  草地 L181
+// 取 6.4：死黑从 7.21% 降到 1.95%（过曝仍 0.30%），而草地只从 L163 到 L177 ——
+// 代价小、收益最大的一档。雨天/夜战按同一比例缩放。
 static const WeatherLook LOOKS[] = {
     // ---------------- 晴天：能见度高，暖光冷影，对比强 ----------------
     { "sunny",
       Vector3(-58.0f, 118.0f, 0.0f), SRGB(1.000f, 0.960f, 0.900f), 2.30f,
       Color(0.44f, 0.52f, 0.66f), 1.62f,
-      Color(0.60f, 0.73f, 0.94f), 0.32f, 0.16f,
+      Color(0.60f, 0.73f, 0.94f), 2.05f, 0.16f,
       SRGB(0.300f, 0.440f, 0.620f), SRGB(0.680f, 0.700f, 0.680f), SRGB(0.340f, 0.320f, 0.280f), 1.00f,
       SRGB(0.520f, 0.570f, 0.600f), 0.0055f, 0.028f, 0.20f, 0.30f, 0.12f,
       0.0050f, 0.32f,
-      1.32f, 1.02f, 1.08f, 0.42f },
+      1.32f, 1.02f, 1.08f, 0.42f,
+      SRGB(0.560f, 0.640f, 0.800f), 0.62f },
 
     // ---------------- 雨天：低压冷灰，对比低、空气浑 ----------------
     { "rain",
       Vector3(-66.0f, 138.0f, 0.0f), SRGB(0.900f, 0.930f, 0.970f), 0.95f,
       Color(0.50f, 0.55f, 0.60f), 1.22f,
-      Color(0.72f, 0.78f, 0.86f), 0.27f, 0.12f,
+      Color(0.72f, 0.78f, 0.86f), 1.73f, 0.12f,
       SRGB(0.260f, 0.300f, 0.330f), SRGB(0.500f, 0.520f, 0.530f), SRGB(0.260f, 0.270f, 0.260f), 0.92f,
       SRGB(0.400f, 0.440f, 0.470f), 0.0125f, 0.052f, 0.06f, 0.40f, 0.20f,
       0.0100f, 0.10f,
-      1.62f, 0.84f, 0.95f, 0.26f },
+      1.62f, 0.84f, 0.95f, 0.26f,
+      SRGB(0.620f, 0.680f, 0.760f), 0.42f },
 
     // ---------------- 夜战：月光 + 深蓝，能见度最差 ----------------
     { "night",
       Vector3(-30.0f, 108.0f, 0.0f), SRGB(0.620f, 0.720f, 0.950f), 0.55f,
       Color(0.16f, 0.22f, 0.34f), 0.60f,
-      Color(0.42f, 0.55f, 0.85f), 0.17f, 0.08f,
+      Color(0.42f, 0.55f, 0.85f), 0.70f, 0.08f,
       SRGB(0.020f, 0.035f, 0.075f), SRGB(0.075f, 0.090f, 0.130f), SRGB(0.045f, 0.050f, 0.062f), 0.80f,
       SRGB(0.055f, 0.075f, 0.115f), 0.0055f, 0.028f, 0.12f, 0.35f, 0.12f,
       0.0045f, 0.25f,
-      1.50f, 0.92f, 1.05f, 0.55f },
+      1.50f, 0.92f, 1.05f, 0.55f,
+      SRGB(0.300f, 0.400f, 0.620f), 0.30f },
 };
 
 static const int LOOK_COUNT = (int)(sizeof(LOOKS) / sizeof(LOOKS[0]));
@@ -725,10 +766,24 @@ static void build_environment(Node3D *root, SceneRefs &out) {
     env->set_sky(sky);
     env->set_reflection_source(Environment::REFLECTION_SOURCE_SKY);
 
-    // 环境光：混合「天空辐射」与「手调冷色」。
-    // 纯 SKY(1.0) 会让暗部跟着天空发灰、丢掉金属冷感；所以留一部分手动色。
-    env->set_ambient_source(Environment::AMBIENT_SOURCE_SKY);
-    env->set_ambient_light_sky_contribution(0.72f);
+    // 环境光：负责把「太阳照不到的那一半世界」从纯黑里捞回来。
+    // 来源可切，便于 A/B：VA_AMB_SRC=sky|color（默认 sky，保持原行为）
+    //   sky   —— 天空辐照度按 sky_contribution 混入手调色
+    //   color —— 完全走 ambient_light_color × ambient_light_energy 这条确定路径
+    {
+        const char *src = std::getenv("VA_AMB_SRC");
+        const std::string s = (src != nullptr && *src != '\0') ? std::string(src) : std::string("sky");
+        env->set_ambient_source(s == "color" ? Environment::AMBIENT_SOURCE_COLOR
+                                             : Environment::AMBIENT_SOURCE_SKY);
+    }
+    /* sky_contribution：天空辐照度占环境光的比例。
+       为什么默认压到 0：实测 sky_contribution=0.72 时，把 ambient_light_energy
+       乘 40 倍，草地只从 RGB(79,96,128) 变到 (82,98,131)，但掩体背光面从
+       RGB(4,8,20) 直接恢复正常 —— 说明**被照面靠太阳（能量 2.30）撑着、
+       背光面几乎无光**，中间那一档本该由这里补。天空辐照度这条路径在本工程里
+       观测不到有效贡献，与其依赖一个测不准的量，不如关掉它、把环境色做成
+       一个能直接调的确定值。 */
+    env->set_ambient_light_sky_contribution(knob("VA_AMB_SKY", 0.0f));
 
     // 雾：指数雾打底做纵深，再叠高度雾做"谷地晨霭"
     env->set_fog_enabled(true);
@@ -783,7 +838,11 @@ static void build_environment(Node3D *root, SceneRefs &out) {
 
     // SSAO 只做缝隙接触阴影，不拿它当"全局压暗"用。
     // （第一版 intensity=1.6，等于在背光死黑上又补一刀；光源补齐后必须收回来。）
-    env->set_ssao_enabled(true);
+    // VA_NO_AO=1 可整体关掉 AO 链（SSAO + SSIL）：AO 是乘在环境光上的，
+    // 它要是过强，表现就是「环境光怎么加都点不亮暗部」——和当前这个 bug 的
+    // 症状完全一致，所以必须能单独摘掉它验一验。
+    const bool no_ao = (std::getenv("VA_NO_AO") != nullptr);
+    env->set_ssao_enabled(!no_ao);
     env->set_ssao_radius(1.1f);
     env->set_ssao_power(1.45f);
     env->set_ssao_detail(0.35f);
@@ -794,7 +853,7 @@ static void build_environment(Node3D *root, SceneRefs &out) {
 
     // 屏幕空间间接光：把周围环境的颜色"渗"进暗部，进一步消死黑。
     // 权重压得很低，只补一口气，不做主光。
-    env->set_ssil_enabled(true);
+    env->set_ssil_enabled(!no_ao);
     env->set_ssil_radius(1.6f);
     env->set_ssil_intensity(0.35f);
     env->set_ssil_sharpness(0.94f);
@@ -814,7 +873,9 @@ static void build_environment(Node3D *root, SceneRefs &out) {
     sun->set_param(Light3D::PARAM_VOLUMETRIC_FOG_ENERGY, 1.35f);
     sun->set_param(Light3D::PARAM_SPECULAR, 1.0f);
     sun->set_sky_mode(DirectionalLight3D::SKY_MODE_LIGHT_AND_SKY);
-    sun->set_shadow(true);
+    // VA_NO_SHADOW=1：给太阳摘掉阴影贴图，用来判定「死黑的那些像素」
+    // 到底是阴影里的表面，还是根本不参与光照的东西。
+    sun->set_shadow(std::getenv("VA_NO_SHADOW") == nullptr);
     sun->set_shadow_mode(DirectionalLight3D::SHADOW_PARALLEL_4_SPLITS);
     sun->set_blend_splits(true);
     sun->set_param(Light3D::PARAM_SHADOW_MAX_DISTANCE, 120.0f);
@@ -851,6 +912,34 @@ static void build_environment(Node3D *root, SceneRefs &out) {
     root->add_child(bounce);
     out.bounce = bounce;
 
+    // RIM —— 补洞光。这一盏不是"再来点氛围"，它是**结构性必需**的。
+    //
+    // 【为什么三盏灯必然漏一个扇区】
+    // 对一根竖直圆柱（树干、电线杆、油桶、载具侧面）法线是水平的，N·L 完全由
+    // 方位角差决定。SUN 方位 118°、FILL 302°（正好对冲）、BOUNCE 46° 且能量只有
+    // 0.16。取方位 φ=210°（SUN 与 FILL 的正中）：
+    //     cos(210-118) ≈ -0.03   SUN   → 0
+    //     cos(210-302) ≈ -0.03   FILL  → 0
+    //     cos(210-46)  <  0      BOUNCE→ 0
+    // **三盏灯全部 N·L ≤ 0**，那个朝向的竖直面一点直射光都收不到。
+    // 实测症状：树干 RGB(9,15,26)（偏蓝 —— 因为只剩蓝色的环境光），
+    // 白天空下是一根贯穿全高的纯黑剪影。玩家鼠标一转就能看进这个洞里。
+    //
+    // 【为什么方位角是"太阳+88°"而不是写死一个数】
+    // SUN 与 FILL 永远对冲，所以洞的中心永远在两者正中 = 太阳方位 +88°。
+    // 三套天气配方的太阳方位各不相同（118/138/108），写死数值会在换天气时失配，
+    // 于是这里直接从 L->sun_rot_deg.y 推出来 —— 太阳转到哪，补洞光跟到哪。
+    //
+    // 仰角取 -20°（略俯），这样它同时还能擦亮一点朝上的面，不至于只救竖直面。
+    DirectionalLight3D *rim = memnew(DirectionalLight3D);
+    rim->set_name("Rim");
+    rim->set_param(Light3D::PARAM_INDIRECT_ENERGY, 0.0f);
+    rim->set_param(Light3D::PARAM_SPECULAR, 0.25f);
+    rim->set_sky_mode(DirectionalLight3D::SKY_MODE_LIGHT_ONLY);
+    rim->set_shadow(false);
+    root->add_child(rim);
+    out.rim = rim;
+
     // 节点建完必须立刻把当前天气那一套参数打上去（声明在头文件里，定义在本函数之后）。
     // 漏掉这一步的后果非常隐蔽：Godot 的 Environment 默认 fog_density=0.01，
     // 比晴天配方浓 3 倍多，整张画面会被一层均匀奶白盖住 —— 而且因为盖住之后
@@ -874,7 +963,17 @@ void apply_weather(SceneRefs &refs) {
 
     const Ref<Environment> env = refs.world_env->get_environment();
     if (env.is_valid()) {
-        env->set_ambient_light_color(L->ambient_color);
+        // 环境色可覆盖，专供取证：VA_AMB_COLOR="r,g,b"（线性 0~1）。
+        // 用途是把环境光换成刺眼的洋红之类 —— 如果画面完全不变，说明这条路
+        // 根本没接上；如果画面整体染上洋红，说明接上了、只是原来的基数偏小。
+        // 这是唯一能一刀切开「路径断」与「量太小」两种假设的办法。
+        Color amb_c = L->ambient_color;
+        const char *ac = std::getenv("VA_AMB_COLOR");
+        if (ac != nullptr && *ac != '\0') {
+            float r = 0.0f, g = 0.0f, b = 0.0f;
+            if (std::sscanf(ac, "%f,%f,%f", &r, &g, &b) == 3) amb_c = Color(r, g, b);
+        }
+        env->set_ambient_light_color(amb_c);
         env->set_ambient_light_energy(L->ambient_energy * k_amb);
 
         env->set_fog_light_color(L->fog_color);
@@ -917,6 +1016,47 @@ void apply_weather(SceneRefs &refs) {
     }
     if (refs.bounce != nullptr) {
         refs.bounce->set_param(Light3D::PARAM_ENERGY, L->bounce_energy * k_bounce);
+    }
+    if (refs.rim != nullptr) {
+        // 方位角默认 = 太阳方位 + 88°（SUN 与 FILL 的正中，也就是三灯理论上漏掉的扇区中心）。
+        // VA_RIM_AZ 可以**绝对覆盖**方位角：扫一圈就能实测出这个洞到底在哪一侧，
+        // 比拿纸笔推欧拉角可靠 —— 引擎的 rotation_degrees→光方向 映射里
+        // 手性/轴向很容易推错，而"扫一圈看树干哪一档变亮"是不会骗人的。
+        const float az = knob("VA_RIM_AZ", L->sun_rot_deg.y + 88.0f);
+        const float el = knob("VA_RIM_EL", -20.0f);
+        refs.rim->set_rotation_degrees(Vector3(el, az, 0.0f));
+        refs.rim->set_color(L->rim_color);
+        refs.rim->set_param(Light3D::PARAM_ENERGY, L->rim_energy * knob("VA_RIM", 1.0f));
+    }
+
+    // 读回一次，把「我以为打进去的」和「引擎真正拿到的」对上账。
+    // 这一步必须放在函数**最后** —— 上一版把它插在 ambient 之后，
+    // 结果 exposure 打印出 1.0（真实值 1.32，还没轮到那行赋值），
+    // 差点被当成「曝光设置没生效」去追一个不存在的 bug。
+    if (env.is_valid()) {
+        UtilityFunctions::print(String("[env] ambient src="), (int)env->get_ambient_source(),
+                                String(" sky_contrib="), env->get_ambient_light_sky_contribution(),
+                                String(" color="), env->get_ambient_light_color(),
+                                String(" energy="), env->get_ambient_light_energy(),
+                                String(" exposure="), env->get_tonemap_exposure(),
+                                String(" tonemap="), (int)env->get_tonemapper(),
+                                String(" ae="), env->is_adjustment_enabled(),
+                                String(" ssao="), env->is_ssao_enabled(),
+                                String(" ssil="), env->is_ssil_enabled(),
+                                String(" fog="), env->get_fog_density());
+        // 四盏灯的能量也报出来。教训：改完配方只截图看画面，是看不出
+        // "这次改的值到底有没有编进去"的 —— 实测有两处 Edit 被 NTFS 丢更新静默吞掉，
+        // 而画面"看起来差不多"，白跑了一整轮扫描。参数读回是唯一可靠的对照。
+        UtilityFunctions::print(String("[light] sun="),
+                                (refs.sun != nullptr ? refs.sun->get_param(Light3D::PARAM_ENERGY) : -1.0f),
+                                String(" fill="),
+                                (refs.fill != nullptr ? refs.fill->get_param(Light3D::PARAM_ENERGY) : -1.0f),
+                                String(" bounce="),
+                                (refs.bounce != nullptr ? refs.bounce->get_param(Light3D::PARAM_ENERGY) : -1.0f),
+                                String(" rim="),
+                                (refs.rim != nullptr ? refs.rim->get_param(Light3D::PARAM_ENERGY) : -1.0f),
+                                String(" rim_az="),
+                                (refs.rim != nullptr ? refs.rim->get_rotation_degrees().y : -1.0f));
     }
 }
 
