@@ -1,0 +1,40 @@
+; VolunteerArmyPC —— 断头谷公路 · 第一人称伏击战（PC 原生版）
+; Godot 4.5 + C++ GDExtension
+
+config_version=5
+
+[application]
+
+config/name="VolunteerArmyPC"
+config/description="断头谷公路 · 第一人称伏击战 —— 原生 PC 版（Godot 4.5 + C++）"
+run/main_scene="res://scenes/Main.tscn"
+config/features=PackedStringArray("4.5", "Forward Plus")
+config/icon="res://icon.svg"
+
+[display]
+
+window/size/viewport_width=1920
+window/size/viewport_height=1080
+window/size/mode=2
+window/stretch/mode="canvas_items"
+window/stretch/aspect="expand"
+window/vsync/vsync_mode=1
+
+[rendering]
+
+renderer/rendering_method="forward_plus"
+textures/default_filters/anisotropic_filtering_level=3
+anti_aliasing/quality/msaa_3d=2
+anti_aliasing/quality/screen_space_aa=1
+environment/defaults/default_clear_color=Color(0.22, 0.26, 0.30, 1)
+lights_and_shadows/directional_shadow/soft_shadow_filter_quality=3
+lights_and_shadows/directional_shadow/size=4096
+lights_and_shadows/directional_shadow/16_bits=false
+
+[physics]
+
+common/physics_ticks_per_second=60
+
+[input_devices]
+
+pointing/emulate_touch_from_mouse=false

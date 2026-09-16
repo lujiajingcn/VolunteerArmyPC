@@ -1,0 +1,105 @@
+#pragma once
+// VolunteerArmyPC —— WorldSim：逻辑层与 Godot 场景之间的唯一桥梁
+//
+// 职责边界（严格）：
+//   逻辑层 src/sim/* —— 不认识 Godot，可脱离引擎单独跑
+//   本类             —— 驱动逻辑步进、把状态同步到 3D 节点、把输入喂回逻辑层、
+//                       实现 SimEvents 把"说/播/提示/结算"转成引擎侧的音频与 UI
+#include <vector>
+
+#include <godot_cpp/classes/camera3d.hpp>
+#include <godot_cpp/classes/input_event.hpp>
+#include <godot_cpp/classes/label.hpp>
+#include <godot_cpp/classes/node3d.hpp>
+#include <godot_cpp/variant/string.hpp>
+
+#include "node/scene_builder.h"
+#include "node/viewmodel.h"
+#include "sim/va_world.h"
+
+namespace volunteer_army {
+
+class WorldSim : public godot::Node3D, public va::SimEvents {
+    GDCLASS(WorldSim, godot::Node3D)
+
+public:
+    WorldSim();
+    ~WorldSim() override;
+
+    void _ready() override;
+    void _process(double p_delta) override;
+    void _input(const godot::Ref<godot::InputEvent> &p_event) override;
+    void _notification(int p_what);
+
+    // ---- SimEvents 实现 ----
+    void on_say(const std::string &who, const std::string &text, const std::string &cls) override;
+    void on_log(const std::string &text, const std::string &cls) override;
+    void on_sfx(const std::string &id, float x, float y, float gain, bool local) override;
+    void on_toast(const std::string &text) override;
+    void on_alert(const std::string &text, float dur) override;
+    void on_end(const std::string &kind, const std::string &text) override;
+    void on_subs_dirty() override;
+    void on_objectives_dirty() override;
+
+    // ---- 供 GDScript ----
+    void start_mission(bool p_skip_deploy);
+    void reset_mission();
+    godot::Dictionary get_status() const;
+    godot::String get_diag() const;
+
+protected:
+    static void _bind_methods();
+
+private:
+    void spawn_entity_nodes();
+    void sync_entity_nodes();
+    void setup_runtime_ui();
+    void push_subtitle(const std::string &who, const std::string &text, const std::string &cls);
+    // 开发用截图探针：设了环境变量 VA_CAPTURE=<秒,秒,...> 时，
+    // 在指定的战局时刻把视口存成 PNG 到 res://captures/，全部拍完后自动退出。
+    // 这是验证「3D 战场真的渲染出来了」最直接的手段（无头运行也能取证）。
+    void capture_step();
+    void capture_setup();
+    void aim_at_road();
+
+    SceneRefs refs_;
+    godot::Camera3D *cam_ = nullptr;
+    ViewModel vm_;                 // 第一人称武器视图模型（相机的子节点）
+    std::vector<godot::Node3D *> unit_nodes_;
+    std::vector<godot::Node3D *> veh_nodes_;
+    godot::Node3D *box_node_ = nullptr;
+
+    // 视角
+    float yaw_ = 0.0f, pitch_ = 0.0f;
+    float sens_ = 0.0022f;
+    float bob_t_ = 0.0f;
+
+    // 主循环
+    double acc_ = 0.0;
+    double ui_t_ = 0.0;
+    bool  mission_started_ = false;
+
+    // 音频节流（同一音效 id 在极短时间内不重复触发）
+    double last_sfx_t_ = 0.0;
+
+    // 视图模型手感：靠「观测量跳变」判断开火/换弹，不去侵入逻辑层。
+    // 逻辑层删掉开火事件回调也不影响这里 —— 渲染层只读状态。
+    float prev_fire_cd_ = -1.0f;
+    float prev_reload_t_ = -1.0f;
+    bool force_ads_ = false;       // VA_ADS=1：取证时强制据枪（截图时按不了鼠标右键）
+
+    // 截图探针
+    std::vector<double> cap_times_;
+    int    cap_i_ = 0;
+    double cap_sim_t_ = 0.0;
+    bool   cap_enabled_ = false;
+    int    cap_frame_skip_ = 0;
+
+    // UI
+    godot::Label *lbl_status_ = nullptr;
+    godot::Label *lbl_subs_ = nullptr;
+    godot::Label *lbl_toast_ = nullptr;
+    godot::Label *lbl_help_ = nullptr;
+};
+
+} // namespace volunteer_army

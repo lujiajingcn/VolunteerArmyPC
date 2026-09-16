@@ -1,0 +1,19 @@
+[configuration]
+
+entry_symbol = "volunteer_army_pc_library_init"
+compatibility_minimum = "4.5"
+reloadable = true
+
+[libraries]
+
+windows.debug.x86_64 = "res://bin/volunteer_army_pc.dll"
+windows.release.x86_64 = "res://bin/volunteer_army_pc.dll"
+windows.editor.x86_64 = "res://bin/volunteer_army_pc.dll"
+
+linux.debug.x86_64 = "res://bin/libvolunteer_army_pc.so"
+linux.release.x86_64 = "res://bin/libvolunteer_army_pc.so"
+linux.editor.x86_64 = "res://bin/libvolunteer_army_pc.so"
+
+macos.debug = "res://bin/libvolunteer_army_pc.dylib"
+macos.release = "res://bin/libvolunteer_army_pc.dylib"
+macos.editor = "res://bin/libvolunteer_army_pc.dylib"
