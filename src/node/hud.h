@@ -1,5 +1,5 @@
 #pragma once
-// VolunteerArmyPC —— HUD：手工自绘的使命召唤风格战术界面
+// VolunteerArmyPC —— HUD：手工自绘的使命召唤风格界面外壳
 //
 // 【为什么整篇手绘，而不是堆 Label】
 // 使命召唤那套界面的辨识度几乎全在"形状"上：45° 切角面板、1px 冷白细描边、
@@ -7,6 +7,18 @@
 // Label 只能表达文字，而这里一半的信息是用几何讲的。
 // 所以本类继承 Control，全部走 _draw() 手绘：一个节点、一次绘制，
 // 任何分辨率下都是矢量的（缩放系数 s_ = 视口高度 / 1080）。
+//
+// 【为什么主菜单 / 任务简报也在本类里，而不是另起一个 Control】
+// 本类已经握有整套绘制原语（chamfer / poly_panel / tx / tx_c / tw / bar）、
+// 已解析好的字体（含中文回退链）、以及 1080p 设计稿的缩放系数 s_。
+// 主菜单与简报用的完全是同一套视觉语言（切角面板、冷白细描边、粗体大写标题、
+// 琥珀色高亮）。另起一个 Control 就得把这套原语与状态复制一遍，
+// 而且菜单 ↔ 简报 ↔ 战斗 ↔ 结算 之间的切换会变成跨节点握手。
+// 所以按「同一个界面外壳的不同屏」来做：
+//     SCREEN_MENU   主菜单        —— key art 背景 + 标题 + 菜单项
+//     SCREEN_BRIEF  任务简报      —— 区域态势图 + 任务元信息 + 目标清单
+//     SCREEN_PLAY   战斗中        —— 原有的全部战术 HUD
+// 结算面板仍归 SCREEN_PLAY（它压在战场画面上），只是背景换成了 key art。
 //
 // 【数据来源：只读】
 //   - va::W（逻辑层全局状态）—— 弹药、生命、小队、目标、车队、天气
@@ -20,7 +32,9 @@
 
 #include <godot_cpp/classes/control.hpp>
 #include <godot_cpp/classes/font.hpp>
+#include <godot_cpp/classes/texture2d.hpp>
 #include <godot_cpp/variant/color.hpp>
+#include <godot_cpp/variant/packed_color_array.hpp>
 #include <godot_cpp/variant/packed_vector2_array.hpp>
 #include <godot_cpp/variant/rect2.hpp>
 #include <godot_cpp/variant/vector2.hpp>
@@ -31,6 +45,13 @@ class Hud : public godot::Control {
     GDCLASS(Hud, godot::Control)
 
 public:
+    // 界面外壳的屏。顺序即流程：MENU → BRIEF → PLAY。
+    enum Screen {
+        SCREEN_MENU = 0,
+        SCREEN_BRIEF = 1,
+        SCREEN_PLAY = 2,
+    };
+
     Hud();
     ~Hud() override;
 
@@ -41,6 +62,30 @@ public:
 
     // 每帧由 world_sim 调用：采样世界状态、推进动画计时、请求重绘
     void update(double p_delta);
+
+    // ---- 界面外壳 ----
+    // ---- 界面外壳 ----
+    // 任务素材。走 Image::load_from_file 而不是 ResourceLoader：
+    // 这些 PNG 是运行时新加进工程的，没有经过编辑器的导入工序，
+    // res:// 下不存在对应的 .ctex，ResourceLoader 会直接报错。
+    // （load_art 里两条路都试，谁成用谁。）
+    // world_sim 在 _ready 里调一次 —— 纹理必须在首帧 _draw 之前就位，
+    // 否则会先闪一帧没有背景的菜单。
+    void load_art();
+
+    Screen screen() const { return screen_; }
+    void   set_screen(Screen s);
+    // 是否还在菜单/简报里（world_sim 据此暂停逻辑步进、并让键鼠改走界面）
+    bool   shell_active() const { return screen_ != SCREEN_PLAY; }
+    // 键盘：返回 true 表示这次按键被界面吃掉，不要传给游戏逻辑
+    bool   shell_key(int64_t p_keycode);
+    // 鼠标：主菜单用鼠标悬停 / 点击（PC 菜单不能只认键盘）
+    void   shell_hover(const godot::Vector2 &p);
+    bool   shell_click(const godot::Vector2 &p);
+    // 玩家在简报里确认开始（消费一次；world_sim 据此接管鼠标并同步实体）
+    bool   take_start();
+    // 玩家选了退出
+    bool   take_quit();
 
     // ---- SimEvents 转发入口 ----
     void ev_toast(const std::string &text);
@@ -66,6 +111,19 @@ private:
     godot::PackedVector2Array chamfer(const godot::Rect2 &r, float cut) const;
     void poly_panel(const godot::Rect2 &r, float cut, const godot::Color &fill,
                     const godot::Color &line, float lw);
+    // 横向渐变（左 / 中 / 右三个停靠点）。逐顶点配色，一次调用完成插值 ——
+    // 没有"分段"，也就不可能出现分段边界那种规则竖纹。
+    // 用它替代"叠 N 条不同 alpha 的 draw_rect"：见 hud.cpp 里的实测数据。
+    void grad_h(const godot::Rect2 &r, const godot::Color &cl, const godot::Color &cm,
+                const godot::Color &cr);
+    // 通用版：固定色，alpha 由 alpha_at(t)（t∈[0,1]）给出 —— 可以表达任意剖面
+    // （罗盘底衬的 sin^1.35 就要这个；三停靠点的线性近似会把两翼压得太透）。
+    // 传无捕获 lambda 即可。
+    void grad_h(const godot::Rect2 &r, const godot::Color &rgb, float (*alpha_at)(float t));
+    // 竖向版（t 由上沿 0 到下沿 1）。给"底部渐浓"的衬底用：上沿 alpha 取 0，
+    // 于是看不出衬底从哪开始；下沿落在屏幕底边，也不会多出一条边界。
+    // 如果改用"上方一条硬边的矩形"，那条边本身就是新的可见缺陷。
+    void grad_v(const godot::Rect2 &r, const godot::Color &rgb, float (*alpha_at)(float t));
     void bar(const godot::Rect2 &r, float t, const godot::Color &fg, const godot::Color &bg);
     float tw(const godot::String &t, int size) const;
     // tx = 给定基线；tx_top = 给定顶边；tx_mid = 给定竖直中心
@@ -81,6 +139,31 @@ private:
     // 想让文字"以 cx 为中心"，就得先自己量宽度。这两个函数把这件事包掉。
     void tx_c(const godot::String &t, float cx, float baseline, int size, const godot::Color &c);
     void tx_r(const godot::String &t, float rx, float baseline, int size, const godot::Color &c);
+
+    // ======================================================== 界面外壳
+    godot::Ref<godot::Texture2D> load_tex(const char *p_res_path);
+    // 按「cover」铺满：等比放大到刚好盖住视口，多出来的居中裁掉。
+    // 不能用拉伸 —— 素材是 16:9、视口也是 16:9，但窗口尺寸可被玩家改，
+    // 一旦比例变了拉伸就会把人脸拉扁。
+    void draw_art_bg(const godot::Ref<godot::Texture2D> &tex, float dim_center, float dim_edge);
+    void draw_menu();             // 主菜单
+    void draw_brief();            // 任务简报
+    godot::Rect2 menu_item_rect(int i) const;
+    int   menu_hit(const godot::Vector2 &p) const;
+    void  menu_activate(int i);
+
+    godot::Ref<godot::Texture2D> art_menu_;     // 主菜单背景
+    godot::Ref<godot::Texture2D> art_brief_;    // 简报主视觉
+    godot::Ref<godot::Texture2D> art_chapter_;  // 区域态势（俯瞰公路）
+    godot::Ref<godot::Texture2D> art_win_;      // 结算 · 成功
+    godot::Ref<godot::Texture2D> art_lose_;     // 结算 · 失败
+
+    Screen screen_ = SCREEN_PLAY;
+    int    menu_sel_ = 0;         // 当前菜单项
+    float  menu_t_ = 0;           // 菜单停留时长（驱动脉冲/闪烁）
+    float  brief_t_ = 0;          // 简报停留时长
+    bool   start_req_ = false;    // 玩家确认开始（take_start 消费）
+    bool   quit_req_ = false;     // 玩家选择退出（take_quit 消费）
 
     // ======================================================== 各区块
     void draw_compass();          // 顶部罗盘刻度带（含目标方位标记）
@@ -99,7 +182,7 @@ private:
     void draw_score_popups();     // 击杀飘字
     void draw_downed();           // 倒地倒计时
     void draw_vignette();         // 受伤全屏暗角
-    void draw_end_panel();        // 结算面板
+    void draw_end_panel();        // 结算面板（背景换成 key art）
     void draw_help();             // 操作提示（开局一段时间后淡出）
 
     // ======================================================== 状态采样

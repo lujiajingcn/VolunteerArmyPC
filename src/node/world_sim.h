@@ -54,6 +54,13 @@ private:
     void spawn_entity_nodes();
     void sync_entity_nodes();
     void setup_runtime_ui();
+    // ---- 界面外壳（主菜单 / 任务简报）----
+    // 详见 node/hud.h 顶部：Hud 同时充当"界面外壳"，这三件事由本类代劳 ——
+    //   enter_play()    从简报切进战斗：接管鼠标、把实体节点对齐到新一局的布局
+    //   shell_owns_input()  shell 期间键鼠一律不喂给逻辑层（否则菜单里按 WASD
+    //                      会把战斗中的角色一起推着走）
+    void enter_play();
+    bool shell_owns_input() const;
     void push_subtitle(const std::string &who, const std::string &text, const std::string &cls);
     // 开发用截图探针：设了环境变量 VA_CAPTURE=<秒,秒,...> 时，
     // 在指定的战局时刻把视口存成 PNG 到 res://captures/，全部拍完后自动退出。
@@ -93,6 +100,10 @@ private:
     double cap_sim_t_ = 0.0;
     bool   cap_enabled_ = false;
     int    cap_frame_skip_ = 0;
+    // 界面外壳期间逻辑层的 t 是冻结的，截图探针按 t 触发就永远不会响。
+    // 所以菜单/简报里改用这个墙钟累计值来驱动截图 —— 否则新加的这两屏
+    // 一条证据都拿不到，只能靠"我看着是对的"。
+    double shell_t_ = 0.0;
 
     // UI：全套使命召唤风格 HUD，手绘在一个 Control 里（见 node/hud.h）
     Hud *hud_ = nullptr;

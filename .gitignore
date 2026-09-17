@@ -27,6 +27,15 @@
 /captures/*
 !/captures/.gdignore
 *.log
+# tools/capture_ui.sh 会把五屏取证的日志按屏分开写（run_ui_ui3.log.menu 这种
+# 名字不匹配上面的 *.log，所以单独补一条；只放行 assets 下的正式素材）
+run_ui_*.log.*
+
+# --- 第三方参考图（版权不在本项目，且本仓库是 Public）---
+# ref/ 里是调研阶段从各壁纸站下载的《使命召唤》官方宣传图，只用于提炼
+# 视觉语法（冷底 + 单一暖锚点 + 人物剪影 + 轮廓光）。这些图的版权属于
+# 原发行商，**不能**随本仓库分发；需要时按 README 的说明自行下载。
+/ref/
 
 # --- 本地 AI 会话记忆 ---
 /.workbuddy/

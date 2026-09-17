@@ -6,7 +6,12 @@
 #include <cstdio>
 #include <string>
 
+#include <godot_cpp/classes/image.hpp>
+#include <godot_cpp/classes/image_texture.hpp>
 #include <godot_cpp/classes/label.hpp>
+#include <godot_cpp/classes/os.hpp>
+#include <godot_cpp/classes/resource_loader.hpp>
+#include <godot_cpp/classes/scene_tree.hpp>
 #include <godot_cpp/classes/theme_db.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
@@ -24,6 +29,20 @@ namespace {
 inline Color c_text()  { return Color(0.88f, 0.905f, 0.925f, 1.00f); }
 inline Color c_dim()   { return Color(0.80f, 0.84f, 0.88f, 0.58f); }
 inline Color c_faint() { return Color(0.78f, 0.82f, 0.86f, 0.26f); }
+
+/* 界面外壳专用的两档"弱文字"。
+ *
+ * 【为什么不能直接复用 c_dim / c_faint】那两档是照 HUD 的暗面板调的
+ * （0.58 / 0.26）。HUD 的底是自己画的近黑面板，亮度可控；界面外壳的底是
+ * key art —— 亮度不可控，换一张图就变。0.26 的 13px 灰字压到暮色天空上
+ * 会直接消失，简报底部那行"Esc 返回主菜单"就是这么丢的，右栏的
+ * (0/6) 计数器也一样（0.58 压在士兵剪影和亮天空的交界上）。
+ *
+ * 所以外壳这一档的下限必须按**最坏情况（亮天空）**来定，而不是按
+ * "我们这张 key art 正好偏暗"来定 —— 和 tools/prep_art.py 里水印阈值
+ * 那条经验是同一件事：按最好情况定的阈值，换一张图就变成假阴性。 */
+inline Color c_shell_dim()   { return Color(0.86f, 0.89f, 0.93f, 0.82f); }
+inline Color c_shell_faint() { return Color(0.84f, 0.88f, 0.92f, 0.62f); }
 inline Color c_amber() { return Color(0.96f, 0.68f, 0.26f, 1.00f); }
 inline Color c_red()   { return Color(0.93f, 0.28f, 0.22f, 1.00f); }
 inline Color c_green() { return Color(0.40f, 0.80f, 0.60f, 1.00f); }
@@ -180,6 +199,115 @@ void Hud::poly_panel(const Rect2 &r, float cut, const Color &fill, const Color &
     }
 }
 
+/* 横向渐变（左 / 中 / 右三个停靠点），用两个四边形 + 逐顶点配色一次画完。
+ *
+ * 【为什么不继续用"叠 N 条 draw_rect"】
+ * draw_rect 没有渐变，只能叠 N 条不同 alpha 的矩形。那会同时引入两种可见缺陷：
+ *   1) N 段离散 alpha 在段边界上是**硬跳变**；
+ *   2) 相邻矩形为了不留缝常写成 width = 段宽 + 1，重叠的 1px 被合成两次，
+ *      边界更明显。
+ * 这不是理论担忧，是量出来的：40 段压暗层在 2560 宽的菜单背景上留下了
+ * 周期 65.6px（= 2560/39）的规则竖纹，自相关在滞后 66/131/197/263 上
+ * 给出 0.69/0.42/0.88/0.62 的峰值；而同一张**原始素材**的自相关是平滑衰减、
+ * 没有任何周期峰 —— 证明竖纹来自绘制方式，不是素材自带。
+ * 肉眼当时只看到"背景有点脏"，是自相关把它定性成"规律人造条纹"的。
+ *
+ * draw_polygon 支持逐顶点配色，插值在一次调用内完成：没有"段"，
+ * 也就不可能有段的边界。左半 + 右半两个四边形拼出「左→中→右」。 */
+void Hud::grad_h(const Rect2 &r, const Color &cl, const Color &cm, const Color &cr) {
+    const float x0 = r.position.x;
+    const float xm = r.position.x + r.size.x * 0.5f;
+    const float x1 = r.position.x + r.size.x;
+    const float y0 = r.position.y;
+    const float y1 = r.position.y + r.size.y;
+
+    PackedVector2Array pl;
+    pl.push_back(Vector2(x0, y0));
+    pl.push_back(Vector2(xm, y0));
+    pl.push_back(Vector2(xm, y1));
+    pl.push_back(Vector2(x0, y1));
+    PackedColorArray clc;
+    clc.push_back(cl);
+    clc.push_back(cm);
+    clc.push_back(cm);
+    clc.push_back(cl);
+    draw_polygon(pl, clc);
+
+    PackedVector2Array pr;
+    pr.push_back(Vector2(xm, y0));
+    pr.push_back(Vector2(x1, y0));
+    pr.push_back(Vector2(x1, y1));
+    pr.push_back(Vector2(xm, y1));
+    PackedColorArray crc;
+    crc.push_back(cm);
+    crc.push_back(cr);
+    crc.push_back(cr);
+    crc.push_back(cm);
+    draw_polygon(pr, crc);
+}
+
+/* 通用版横向渐变：固定色 rgb，alpha 由 alpha_at(t) 给出（t ∈ [0,1]）。
+ *
+ * 为什么还要一个"任意曲线"的版本：三停靠点的线性近似只够画对称的简单压暗。
+ * 罗盘底衬的剖面是 sin^1.35（上一轮为可读性实测调出来的），线性近似会把两翼
+ * 压得明显更透 —— 边缘那些刻度本来就只有 35% 不透明度，再失去底衬就读不出来了。
+ *
+ * 实现上用 96 列顶点 + 逐顶点配色：值在每一个像素上连续，不会像"叠 N 条矩形"
+ * 那样在段边界硬跳变；同时又能表达任意形状的 alpha 剖面。
+ * 顶点之间是线性插值，会有斜率不连续 —— 但斜率不连续不会被看成条纹，
+ * 只有**取值跳变**才会。 */
+void Hud::grad_h(const Rect2 &r, const Color &rgb, float (*alpha_at)(float t)) {
+    constexpr int N = 96;
+    const float y0 = r.position.y;
+    const float y1 = r.position.y + r.size.y;
+
+    PackedVector2Array pts;
+    PackedColorArray cols;
+    // 上沿自左向右
+    for (int i = 0; i < N; ++i) {
+        const float t = (float)i / (float)(N - 1);
+        pts.push_back(Vector2(r.position.x + r.size.x * t, y0));
+        cols.push_back(Color(rgb.r, rgb.g, rgb.b, alpha_at(t)));
+    }
+    // 下沿自右向左，闭合多边形
+    for (int i = N - 1; i >= 0; --i) {
+        const float t = (float)i / (float)(N - 1);
+        pts.push_back(Vector2(r.position.x + r.size.x * t, y1));
+        cols.push_back(Color(rgb.r, rgb.g, rgb.b, alpha_at(t)));
+    }
+    draw_polygon(pts, cols);
+}
+
+/* 竖向渐变（t 从上沿 0 到下沿 1）。实现与 grad_h 同构：96 行顶点 + 逐顶点配色，
+ * 一次 draw_polygon 画完，值在每个像素上连续。
+ *
+ * 为什么必须有它，而不是"用一条 alpha 固定的矩形当底部衬底"：
+ * 固定 alpha 的矩形上沿就是一条**硬边**，在暗色的岩石/天空上会显出一条横线；
+ * 而拆成"N 条不同 alpha 的横向矩形"又会回到分段合成那套，在每条边界上取值跳变。
+ * 用竖向连续渐变就同时避开了这两个：上沿 alpha=0（看不出起点），
+ * 下沿落在屏幕底边（不产生新边界）。 */
+void Hud::grad_v(const Rect2 &r, const Color &rgb, float (*alpha_at)(float t)) {
+    constexpr int N = 96;
+    const float x0 = r.position.x;
+    const float x1 = r.position.x + r.size.x;
+
+    PackedVector2Array pts;
+    PackedColorArray cols;
+    // 左沿自上而下
+    for (int i = 0; i < N; ++i) {
+        const float t = (float)i / (float)(N - 1);
+        pts.push_back(Vector2(x0, r.position.y + r.size.y * t));
+        cols.push_back(Color(rgb.r, rgb.g, rgb.b, alpha_at(t)));
+    }
+    // 右沿自下而上，闭合多边形
+    for (int i = N - 1; i >= 0; --i) {
+        const float t = (float)i / (float)(N - 1);
+        pts.push_back(Vector2(x1, r.position.y + r.size.y * t));
+        cols.push_back(Color(rgb.r, rgb.g, rgb.b, alpha_at(t)));
+    }
+    draw_polygon(pts, cols);
+}
+
 void Hud::bar(const Rect2 &r, float t, const Color &fg, const Color &bg) {
     t = clampf_(t, 0.0f, 1.0f);
     if (bg.a > 0.001f) draw_rect(r, bg, true);
@@ -242,6 +370,22 @@ void Hud::update(double p_delta) {
     if (!layout()) { queue_redraw(); return; }
     const float d = clampf_((float)p_delta, 0.0f, 0.1f);   // 掉帧时不要一次跳掉整段动画
     clock_ += d;
+
+    /* 界面外壳期间只推进菜单自己的动画，完全不采样战局。
+       两个具体理由，都不是洁癖：
+         1) 采样会白吃 help_t_ —— 操作提示只在开局显示 18 秒（draw_help 里
+            a = (18 - help_t_)/3），玩家在菜单里坐一分钟，进战斗时提示已经过期，
+            等于"没教过操作"。
+         2) 采样会把瞬时元素提前消费掉 —— 例如"阶段变更"横幅是按
+            prev_phase_ != W.phase 触发的，在菜单里就会先弹一次，
+            等真正开打时反而没有那条横幅了。
+       返回前仍要 queue_redraw，菜单的悬停高亮和呼吸闪烁靠它才有动画。 */
+    if (shell_active()) {
+        if (screen_ == SCREEN_MENU)  menu_t_ += d;
+        if (screen_ == SCREEN_BRIEF) brief_t_ += d;
+        queue_redraw();
+        return;
+    }
 
     // 新一局：W.t 回退就是最可靠的信号（比监听 start_mission 更省事，
     // 而且不依赖调用顺序 —— reset_mission / start_mission 都会走这里）
@@ -370,6 +514,13 @@ void Hud::update(double p_delta) {
 // ===========================================================================
 void Hud::_draw() {
     if (!layout()) return;
+
+    // 界面外壳的前两屏是"独占屏"：它们自带全屏 key art 背景，
+    // 所以直接 return，底下的战术 HUD 一律不画 ——
+    // 否则罗盘、雷达会浮在菜单画面上，看起来像 bug。
+    if (screen_ == SCREEN_MENU)  { draw_menu();  return; }
+    if (screen_ == SCREEN_BRIEF) { draw_brief(); return; }
+
     const va::Unit *pl = va::W.player;
     if (pl == nullptr) return;
 
@@ -406,22 +557,22 @@ void Hud::draw_compass() {
     const float top = 8.0f * s_;
     const Rect2 r(cx - w * 0.5f, top, w, h);
 
-    // 底衬：中间厚两端透。draw_rect 没有横向渐变，用多段条带叠出同样的观感 ——
-    // 44 段在 1080p 下已经看不出台阶。
+    // 底衬：中间厚两端透，用逐顶点渐变画同一套 sin^1.35 剖面。
     //
     // 【alpha 为什么定这么高】第一版用的是 0.62 × sin^1.7 的深色底，
     // 实测 u=0.35 处整列亮度是 121~124 —— 几乎完全平坦，也就是刻度根本读不出来。
     // 原因是底衬在天空（亮度 200+）上只压到"中灰"，而刻度本身是接近白的暖白，
     // 白压在中灰上对比度不到 2:1。所以底衬必须压到接近黑（0.86），
     // 让刻度拿到足够的动态范围。这不是审美问题，是可读性问题。
-    const int bands = 44;
-    for (int i = 0; i < bands; ++i) {
-        const float t0 = (float)i / bands;
-        const float a = std::pow(std::sin(t0 * kPi), 1.35f);
-        draw_rect(Rect2(r.position.x + r.size.x * t0, r.position.y - 2.0f * s_,
-                        r.size.x / bands + 1.0f, r.size.y + 4.0f * s_),
-                  Color(0.015f, 0.020f, 0.028f, 0.86f * a), true);
-    }
+    //
+    // 【为什么不再是 44 段 draw_rect】原注释写着"44 段在 1080p 看不出台阶"，
+    // 这句是错的：段边界是**取值跳变**，相邻段 alpha 差够大就看得见。
+    // 罗盘这一处因为刻度线本身的高对比把它盖住，自相关测不够显著；
+    // 但同一类写法在压暗层上已经被量出周期 65.6px 的规则竖纹（见 grad_h 上方），
+    // 所以这里一并换掉，不留同类隐患。
+    grad_h(Rect2(r.position.x, r.position.y - 2.0f * s_, r.size.x, r.size.y + 4.0f * s_),
+           Color(0.015f, 0.020f, 0.028f),
+           [](float t) { return 0.86f * std::pow(std::sin(t * kPi), 1.35f); });
 
     const float hd = heading_deg();
     const float half = 60.0f;                       // 半视角（度）
@@ -452,16 +603,14 @@ void Hud::draw_compass() {
     }
 
     // ---- 上下两条细线，同样两端淡出 ----
-    for (int i = 0; i < bands; ++i) {
-        const float t0 = (float)i / bands;
-        const float a = std::pow(std::sin(t0 * kPi), 1.35f);
-        const float x0 = r.position.x + r.size.x * t0;
-        const float bw = r.size.x / bands + 1.0f;
-        draw_rect(Rect2(x0, r.position.y - 2.0f * s_, bw, 1.4f * s_),
-                  Color(0.92f, 0.95f, 0.98f, 0.34f * a), true);
-        draw_rect(Rect2(x0, r.position.y + r.size.y + 0.6f * s_, bw, 1.4f * s_),
-                  Color(0.92f, 0.95f, 0.98f, 0.34f * a), true);
-    }
+    // 也改用逐顶点渐变，不再分段叠矩形（理由同底衬）。
+    // 直接传无捕获 lambda：它可以隐式转成 float(*)(float)。
+    grad_h(Rect2(r.position.x, r.position.y - 2.0f * s_, r.size.x, 1.4f * s_),
+           Color(0.92f, 0.95f, 0.98f),
+           [](float t) { return 0.34f * std::pow(std::sin(t * kPi), 1.35f); });
+    grad_h(Rect2(r.position.x, r.position.y + r.size.y + 0.6f * s_, r.size.x, 1.4f * s_),
+           Color(0.92f, 0.95f, 0.98f),
+           [](float t) { return 0.34f * std::pow(std::sin(t * kPi), 1.35f); });
 
     // ---- 目标方位标记：本作的核心是"把车队堵在哪"，所以公路上的
     //      战术点、撤离点、玩家标记全都挂到罗盘上，抬头就知道往哪转 ----
@@ -1593,8 +1742,20 @@ void Hud::draw_end_panel() {
     const bool win = va::W.score.win;
     const Color accent = win ? Color(0.96f, 0.76f, 0.32f, 1.0f) : c_red();
 
-    // 全屏压暗
-    draw_rect(Rect2(0, 0, vp_.x, vp_.y), Color(0.015f, 0.020f, 0.026f, 0.78f * e), true);
+    /* 背景：胜负各一张 key art。
+       为什么成败要分开两张而不是同一张换标题字：结算这一刻玩家最先感知的是
+       "发生了什么"，不是文字。晨光下的雪原行军 vs 硝烟里跪着的背影，
+       一眼就分得出输赢；只换标题字的话得读一行小字才知道结果。
+       两张图都刻意把中央留空，正好给面板让位。 */
+    const Ref<Texture2D> bg = win ? art_win_ : art_lose_;
+    if (bg.is_valid()) {
+        draw_art_bg(bg, 0.86f, 0.42f);
+    } else {
+        // 素材缺失时退回原来的纯色压暗 —— 结算面板不能因为少一张图就整个消失
+        draw_rect(Rect2(0, 0, vp_.x, vp_.y), Color(0.015f, 0.020f, 0.026f, 0.90f * e), true);
+    }
+    // 再补一层均匀压暗，保证面板上的小字在任何画面上都读得出来
+    draw_rect(Rect2(0, 0, vp_.x, vp_.y), Color(0.015f, 0.020f, 0.026f, 0.46f * e), true);
 
     const float w = 700.0f * s_;
     const float h = 452.0f * s_;
@@ -1673,9 +1834,369 @@ void Hud::draw_end_panel() {
         tx_r(String::utf8(c2), x + w - 50.0f * s_, y + 358.0f * s_, 14,
              Color(0.80f, 0.84f, 0.88f, 0.80f * e));
 
-        tx_c(String::utf8("按 R 重新部署"), x + w * 0.5f, y + h - 26.0f * s_, 15,
+        tx_c(String::utf8("按 R 重新部署 · Esc 回主菜单"), x + w * 0.5f, y + h - 26.0f * s_, 15,
              Color(accent.r, accent.g, accent.b, 0.70f + 0.30f * std::sin(clock_ * 4.0f)));
     }
+}
+
+// ===========================================================================
+//  界面外壳：任务素材 / 主菜单 / 任务简报
+// ===========================================================================
+//
+// 【素材为什么走 Image::load_from_file，而不是 ResourceLoader】
+// 这五张 PNG 是运行时才落进工程 assets/art/ 的，从没经过编辑器的导入工序 ——
+// res:// 下不存在对应的 .import / .ctex。ResourceLoader 在非编辑器构建里
+// 只会去查导入缓存，找不到就报 "No loader found for resource"，纹理拿不到、
+// 背景一片黑。Image::load_from_file 读的是磁盘上的原始 PNG
+// （"直接跑工程目录"时 res:// 就是盘上的工程目录），绕开整套导入系统。
+// 反过来，如果哪天有人用编辑器打开过工程把图导入了，ResourceLoader 那条路
+// 更快也更省内存，所以两条都试、谁成用谁。
+Ref<Texture2D> Hud::load_tex(const char *p_res_path) {
+    const String path = String::utf8(p_res_path);
+    ResourceLoader *rl = ResourceLoader::get_singleton();
+    // 先 exists 再 load：直接 load 一个没导入过的路径，引擎会往 stderr
+    // 打一行 "No loader found for resource"。五张图就是五行假 ERROR ——
+    // 会污染日志，让"日志里有没有 ERROR"这个回归判据当场失效。
+    if (rl != nullptr && rl->exists(path)) {
+        Ref<Texture2D> t = rl->load(path);
+        if (t.is_valid()) return t;
+    }
+    const Ref<Image> img = Image::load_from_file(path);
+    if (img.is_valid() && !img->is_empty()) return ImageTexture::create_from_image(img);
+    UtilityFunctions::print("[ui] 素材载入失败：", path);
+    return Ref<Texture2D>();
+}
+
+void Hud::load_art() {
+    if (art_menu_.is_valid()) return;      // 只载一次
+    art_menu_    = load_tex("res://assets/art/art_menu_bg.png");
+    art_brief_   = load_tex("res://assets/art/art_briefing.png");
+    art_chapter_ = load_tex("res://assets/art/art_chapter.png");
+    art_win_     = load_tex("res://assets/art/art_end_win.png");
+    art_lose_    = load_tex("res://assets/art/art_end_lose.png");
+    UtilityFunctions::print("[ui] 任务素材 menu=", art_menu_.is_valid(),
+                            " brief=", art_brief_.is_valid(),
+                            " chapter=", art_chapter_.is_valid(),
+                            " win=", art_win_.is_valid(),
+                            " lose=", art_lose_.is_valid());
+}
+
+// 按「cover」铺满 + 横向渐变压暗。
+//   dim_edge   画面左右边缘的压暗量（标题 / 菜单项都在左侧，必须压下去）
+//   dim_center 画面中央的压暗量
+// 【为什么不能直接拉伸】素材是 16:9、设计视口也是 16:9，但窗口尺寸是玩家可改的，
+// 一旦比例变了，拉伸会让人脸和山脊一起变形。cover 是等比放大到刚好盖住，
+// 多出来的部分居中裁掉 —— 代价是极端比例下会裁掉边缘，「天空 + 山脊」的构图
+// 正好是最不怕裁的那一类。
+void Hud::draw_art_bg(const Ref<Texture2D> &tex, float dim_edge, float dim_center) {
+    if (tex.is_null()) return;
+    const Vector2 ts = tex->get_size();
+    if (ts.x < 1.0f || ts.y < 1.0f) return;
+
+    const float k = std::max(vp_.x / ts.x, vp_.y / ts.y);
+    const Vector2 sz = ts * k;
+    draw_texture_rect(tex, Rect2(vp_.x * 0.5f - sz.x * 0.5f, vp_.y * 0.5f - sz.y * 0.5f,
+                                 sz.x, sz.y), false);
+
+    // 横向渐变压暗。原来这里是「40 段不同 alpha 的 draw_rect」，
+    // 在 2560 宽下留下周期 65.6px 的规则竖纹（见 grad_h 上方的实测数据）。
+    // 换成逐顶点配色后是一整块连续渐变，没有段、没有边界。
+    const Color edge(0.010f, 0.014f, 0.020f, dim_edge);
+    const Color mid(0.010f, 0.014f, 0.020f, dim_center);
+    grad_h(Rect2(0.0f, 0.0f, vp_.x, vp_.y), edge, mid, edge);
+}
+
+// ---------------------------------------------------------------- 主菜单
+Rect2 Hud::menu_item_rect(int i) const {
+    return Rect2(150.0f * s_, (430.0f + (float)i * 56.0f) * s_, 420.0f * s_, 46.0f * s_);
+}
+
+int Hud::menu_hit(const Vector2 &p) const {
+    for (int i = 0; i < 3; ++i) {
+        if (menu_item_rect(i).has_point(p)) return i;
+    }
+    return -1;
+}
+
+void Hud::menu_activate(int i) {
+    if (i == 0)      start_req_ = true;          // 直接开打
+    else if (i == 1) set_screen(SCREEN_BRIEF);   // 先看简报
+    else if (i == 2) quit_req_ = true;
+    queue_redraw();
+}
+
+void Hud::draw_menu() {
+    draw_art_bg(art_menu_, 0.94f, 0.28f);
+
+    /* 底部渐浓的衬底。主菜单最下面两行是 13px 的辅助文字，压在这张 key art
+       的山体上本来就接近不可读（key art 越亮越糟）。用竖向渐变而不是
+       "一条固定 alpha 的矩形"：矩形上沿会留下一条横线，渐变的上沿 alpha=0，
+       看不出从哪开始。 */
+    grad_v(Rect2(0.0f, vp_.y - 210.0f * s_, vp_.x, 210.0f * s_),
+           Color(0.010f, 0.014f, 0.020f),
+           [](float t) { return 0.52f * t * t; });
+
+    const float x0 = 150.0f * s_;
+
+    // 顶部：战区标识
+    tx(String::utf8("V O L U N T E E R   A R M Y"), x0, 128.0f * s_, 13, c_shell_faint());
+    tx(String::utf8("中国人民志愿军 · 1951 · 朝鲜东线"), x0, 154.0f * s_, 15,
+       Color(0.88f, 0.91f, 0.94f, 0.70f));
+    // 一小段琥珀色的分隔短横：给标题区一个明确的起点
+    draw_rect(Rect2(x0, 172.0f * s_, 46.0f * s_, 2.0f * s_),
+              Color(0.96f, 0.68f, 0.26f, 0.90f), true);
+
+    // 主标题 + 副标题
+    tx(String::utf8("断 头 谷 公 路"), x0, 262.0f * s_, 76, c_text());
+    tx(String::utf8("第 一 人 称 伏 击 战"), x0, 302.0f * s_, 21,
+       Color(0.82f, 0.86f, 0.90f, 0.76f));
+
+    // 菜单项
+    const char *items[3] = { "开 始 行 动", "任 务 简 报", "退 出 游 戏" };
+    for (int i = 0; i < 3; ++i) {
+        const Rect2 r = menu_item_rect(i);
+        const bool sel = (i == menu_sel_);
+        if (sel) {
+            // 选中底板：从左边实、往右渐隐 —— 比整块实心底板轻，
+            // 不会把背后的 key art 压死。同样走逐顶点渐变（理由见 grad_h）：
+            // 分层数越少越容易看出条纹，这种"只有几十像素宽"的小底板尤其明显。
+            grad_h(r,
+                   Color(0.96f, 0.68f, 0.26f, 0.30f),
+                   Color(0.96f, 0.68f, 0.26f, 0.13f),
+                   Color(0.96f, 0.68f, 0.26f, 0.0f));
+            // 左侧实心标记条：使命召唤菜单最典型的选中标记，一眼就知道光标在哪
+            draw_rect(Rect2(r.position.x - 20.0f * s_, r.position.y + 7.0f * s_,
+                            4.0f * s_, r.size.y - 14.0f * s_),
+                      Color(0.96f, 0.68f, 0.26f, 0.95f), true);
+        }
+        const float pulse = sel ? (0.86f + 0.14f * std::sin(menu_t_ * 4.2f)) : 1.0f;
+        const Color col = sel ? Color(1.0f, 1.0f, 1.0f, pulse)
+                              : Color(0.84f, 0.88f, 0.92f, 0.74f);
+        tx_mid(String::utf8(items[i]), r.position.x, r.position.y + r.size.y * 0.5f,
+               sel ? 30 : 27, col);
+    }
+
+    // 底部：版本 + 操作提示
+    tx(String::utf8("VolunteerArmyPC · Godot 4.5 + C++17 GDExtension"),
+       x0, vp_.y - 34.0f * s_, 13, c_shell_faint());
+    tx_r(String::utf8("↑ ↓ 选择 · Enter 确认 · 也可直接用鼠标"),
+         vp_.x - x0, vp_.y - 34.0f * s_, 13, c_shell_faint());
+}
+
+// ---------------------------------------------------------------- 任务简报
+void Hud::draw_brief() {
+    draw_art_bg(art_brief_, 0.95f, 0.44f);
+
+    const float x0 = 150.0f * s_;
+    const float top = 108.0f * s_;
+
+    // 顶栏
+    tx(String::utf8("任 务 简 报"), x0, top, 34, c_text());
+    tx(String::utf8("行动代号 · 断头谷"), x0, top + 26.0f * s_, 15, c_shell_faint());
+    tx_r(String::utf8("机密 · 仅限参战人员"), vp_.x - x0, top, 13, c_red());
+    draw_rect(Rect2(x0, top + 46.0f * s_, vp_.x - 2.0f * x0, 1.0f * s_),
+              Color(0.86f, 0.90f, 0.94f, 0.22f), true);
+
+    // ---- 左栏：区域态势图 ----
+    const float iw = 620.0f * s_;
+    const float ih = iw * 9.0f / 16.0f;
+    const Rect2 ir(x0, top + 78.0f * s_, iw, ih);
+    if (art_chapter_.is_valid()) {
+        draw_texture_rect(art_chapter_, ir, false, Color(1.0f, 1.0f, 1.0f, 0.96f));
+    } else {
+        draw_rect(ir, Color(0.05f, 0.07f, 0.09f, 0.92f), true);
+    }
+    // 切角边框
+    {
+        const PackedVector2Array p = chamfer(ir.grow(1.0f), 14.0f * s_);
+        for (int i = 0; i < 8; ++i) draw_line(p[i], p[(i + 1) % 8], c_line(), 1.2f * s_, true);
+    }
+    // 四角标记：情报图的通用语汇，四笔就能把"这是一张图"说清楚
+    {
+        const Color cc = Color(0.96f, 0.68f, 0.26f, 0.85f);
+        const float L = 24.0f * s_;
+        const float w = 1.8f * s_;
+        const float l = ir.position.x, t = ir.position.y;
+        const float rr = ir.position.x + ir.size.x, bb = ir.position.y + ir.size.y;
+        draw_line(Vector2(l, t), Vector2(l + L, t), cc, w, true);
+        draw_line(Vector2(l, t), Vector2(l, t + L), cc, w, true);
+        draw_line(Vector2(rr, t), Vector2(rr - L, t), cc, w, true);
+        draw_line(Vector2(rr, t), Vector2(rr, t + L), cc, w, true);
+        draw_line(Vector2(l, bb), Vector2(l + L, bb), cc, w, true);
+        draw_line(Vector2(l, bb), Vector2(l, bb - L), cc, w, true);
+        draw_line(Vector2(rr, bb), Vector2(rr - L, bb), cc, w, true);
+        draw_line(Vector2(rr, bb), Vector2(rr, bb - L), cc, w, true);
+    }
+    tx(String::utf8("区域态势 · 断头谷公路"), x0, ir.position.y + ih + 26.0f * s_, 14,
+       c_shell_dim());
+    tx(String::utf8("车队自东沿公路进入伏击圈；河谷上的桥是敌退路，可炸。"),
+       x0, ir.position.y + ih + 48.0f * s_, 13, c_shell_faint());
+
+    // ---- 右栏：任务元信息 ----
+    const float rx = x0 + iw + 66.0f * s_;
+
+    /* 右栏衬底。这一栏的文字全都压在 key art 的中段上：暮色天空（亮）与
+       士兵剪影（近黑）正好在这里交界，任何"固定低不透明度"的小字都会在
+       交界处半截读不出来 —— 实测 (0/6) / (0/2) 两个计数器就落在这个交界上，
+       支线目标的字尾也被剪影吃掉。所以按"信息栏"的标准做法铺一层暗色衬底：
+         · 纵向铺满（0 到 vp_.y）→ 不会多出上/下沿的硬边；
+         · 横向是平顶剖面（两端各留 20% 羽化）→ 中间稳定压暗，
+           两端 alpha 收到 0，与画面的衔接看不出边界；
+         · 单次 draw_polygon 逐顶点配色 → 不引入分段合成的规则竖纹。 */
+    grad_h(Rect2(rx - 58.0f * s_, 0.0f, 620.0f * s_ + 116.0f * s_, vp_.y),
+           Color(0.010f, 0.014f, 0.020f),
+           [](float t) {
+               const float a = std::min(t / 0.20f, 1.0f);
+               const float b = std::min((1.0f - t) / 0.20f, 1.0f);
+               return 0.62f * (a * a * (3.0f - 2.0f * a)) * (b * b * (3.0f - 2.0f * b));
+           });
+
+    /* 底部渐浓的衬底。底部两行提示压在近黑岩石上：金色那行够亮，
+       13px 的"Esc 返回主菜单"原本用 c_faint()（alpha 0.26）几乎看不见。
+       这里补一条竖向渐变，并把两行的颜色换到外壳档。 */
+    grad_v(Rect2(0.0f, vp_.y - 200.0f * s_, vp_.x, 200.0f * s_),
+           Color(0.010f, 0.014f, 0.020f),
+           [](float t) { return 0.58f * t * t; });
+
+    float y = top + 78.0f * s_;
+
+    struct KV { const char *k; std::string v; };
+    const KV meta[4] = {
+        { "地点",   "朝鲜东线 · 断头谷公路" },
+        { "时间",   "1951 年 · 拂晓前" },
+        { "天气",   weather_cn(va::W.weather) },
+        { "撤离点", va::W.evac.name },
+    };
+    for (const KV &m : meta) {
+        tx(String::utf8(m.k), rx, y, 14, c_shell_dim());
+        tx(String::utf8(m.v.c_str()), rx + 92.0f * s_, y, 16, c_text());
+        y += 30.0f * s_;
+    }
+
+    // ---- 右栏：目标清单 ----
+    y += 18.0f * s_;
+    draw_rect(Rect2(rx, y - 16.0f * s_, 620.0f * s_, 1.0f * s_),
+              Color(0.86f, 0.90f, 0.94f, 0.30f), true);
+    y += 10.0f * s_;
+    tx(String::utf8("任 务 目 标"), rx, y, 17, c_text());
+    y += 28.0f * s_;
+
+    /* 清单直接读 va::W.objState —— 也就是战斗中目标横幅用的同一份数据。
+       好处是简报里写的就是实际会被判定的条目，不存在"简报说一套、判定另一套"。
+       （set_screen(SCREEN_BRIEF) 里会主动刷一次 check_objectives，
+         因为菜单期间逻辑冻结、没人驱动它。） */
+    for (size_t i = 0; i < va::W.objState.size(); ++i) {
+        const va::WorldState::Objective &o = va::W.objState[i];
+        const Color col = o.main ? c_amber() : Color(0.84f, 0.88f, 0.92f, 0.72f);
+        const Rect2 box(rx, y - 11.0f * s_, 11.0f * s_, 11.0f * s_);
+        // 主目标实心、支线空心：不必读字就能分辨
+        if (o.main) draw_rect(box, col, true);
+        else        draw_rect(box, col, false, 1.6f * s_);
+        tx(String::utf8(o.text.c_str()), rx + 24.0f * s_, y, o.main ? 17 : 16,
+           o.main ? c_text() : Color(0.88f, 0.91f, 0.94f, 0.88f));
+        if (!o.extra.empty()) {
+            tx_r(String::utf8(o.extra.c_str()), rx + 620.0f * s_, y, 14, c_shell_dim());
+        }
+        y += 27.0f * s_;
+    }
+
+    // ---- 底部：开始 / 返回 ----
+    const float pulse = 0.70f + 0.30f * std::sin(brief_t_ * 3.6f);
+    tx_c(String::utf8("按 Enter 或点击任意处开始行动"), vp_.x * 0.5f, vp_.y - 90.0f * s_, 22,
+         Color(0.96f, 0.68f, 0.26f, pulse));
+    tx_c(String::utf8("Esc 返回主菜单"), vp_.x * 0.5f, vp_.y - 60.0f * s_, 13, c_shell_faint());
+}
+
+// ---------------------------------------------------------------- 外壳状态机
+void Hud::set_screen(Screen s) {
+    if (s == screen_) return;
+    screen_ = s;
+    if (s == SCREEN_MENU) {
+        menu_sel_ = 0;
+        menu_t_ = 0.0f;
+    } else if (s == SCREEN_BRIEF) {
+        brief_t_ = 0.0f;
+        /* 简报要列目标，而 objState 是 check_objectives() 填的 ——
+           那一趟平时由 step_once 每帧驱动，而菜单/简报期间逻辑是冻结的、没人跑它。
+           所以进简报时主动刷一次。它是纯汇总（只读 W.stats、只写 W.objState），
+           在任何时刻调用都安全，不会推动战局。 */
+        va::check_objectives();
+    }
+    queue_redraw();
+}
+
+bool Hud::shell_key(int64_t p_keycode) {
+    if (!shell_active()) return false;
+    const Key k = (Key)p_keycode;
+
+    if (screen_ == SCREEN_MENU) {
+        if (k == Key::KEY_UP || k == Key::KEY_W) {
+            menu_sel_ = (menu_sel_ + 2) % 3;
+            queue_redraw();
+            return true;
+        }
+        if (k == Key::KEY_DOWN || k == Key::KEY_S) {
+            menu_sel_ = (menu_sel_ + 1) % 3;
+            queue_redraw();
+            return true;
+        }
+        if (k == Key::KEY_ENTER || k == Key::KEY_KP_ENTER || k == Key::KEY_SPACE) {
+            menu_activate(menu_sel_);
+            return true;
+        }
+        return true;   // 菜单里其它键一律吞掉：绝不让它们漏进逻辑层
+    }
+
+    // 简报
+    if (k == Key::KEY_ENTER || k == Key::KEY_KP_ENTER || k == Key::KEY_SPACE) {
+        start_req_ = true;
+        return true;
+    }
+    if (k == Key::KEY_ESCAPE) {
+        set_screen(SCREEN_MENU);
+        return true;
+    }
+    return true;
+}
+
+void Hud::shell_hover(const Vector2 &p) {
+    if (screen_ != SCREEN_MENU) return;
+    const int h = menu_hit(p);
+    if (h >= 0 && h != menu_sel_) {
+        menu_sel_ = h;
+        queue_redraw();
+    }
+}
+
+bool Hud::shell_click(const Vector2 &p) {
+    if (screen_ == SCREEN_MENU) {
+        const int h = menu_hit(p);
+        if (h >= 0) {
+            menu_sel_ = h;
+            menu_activate(h);
+            return true;
+        }
+        return false;
+    }
+    // 简报："点击任意处开始" —— 和屏幕下方那行提示一致。
+    // 不设按钮热区是因为简报整屏都是可点的，给个明确的文案比让玩家去找按钮更好。
+    if (screen_ == SCREEN_BRIEF) {
+        start_req_ = true;
+        return true;
+    }
+    return false;
+}
+
+bool Hud::take_start() {
+    if (!start_req_) return false;
+    start_req_ = false;
+    return true;
+}
+
+bool Hud::take_quit() {
+    if (!quit_req_) return false;
+    quit_req_ = false;
+    return true;
 }
 
 } // namespace volunteer_army

@@ -104,6 +104,66 @@ void WorldSim::_ready() {
     setup_runtime_ui();
     va_trace("_ready:ui ok");
 
+    /* 界面外壳的初始屏。
+       默认先进主菜单；但取证 / 回归必须直接进战斗 ——
+       截图探针是按「战局秒数」触发的（capture_step 依赖逻辑层 t 推进），
+       而菜单期间 t 是冻结的：不跳过菜单，所有截图都会拍到菜单，
+       整条取证管线会当场失效。所以 VA_CAPTURE 一出现就等价于 VA_SKIP_MENU。
+
+       VA_SCREEN=menu|brief|play 可以**显式**指定初始屏，且优先级高于上面的跳过规则。
+       加这个旋钮是因为否则新加的两屏根本无法取证：想看菜单就得跑 VA_CAPTURE，
+       而 VA_CAPTURE 又强制跳过菜单，形成死结。
+       菜单/简报期间截图改用墙钟驱动（见 shell_t_），所以照样能拍到。 */
+    if (hud_ != nullptr) {
+        hud_->load_art();
+        const char *scr = std::getenv("VA_SCREEN");
+        const bool have_scr = (scr != nullptr && *scr != '\0');
+        const bool skip = !have_scr && ((std::getenv("VA_SKIP_MENU") != nullptr)
+                                     || (std::getenv("VA_CAPTURE") != nullptr));
+        Hud::Screen s0 = Hud::SCREEN_PLAY;
+        if (have_scr) {
+            const std::string v(scr);
+            if (v == "menu")       s0 = Hud::SCREEN_MENU;
+            else if (v == "brief") s0 = Hud::SCREEN_BRIEF;
+        } else if (!skip) {
+            s0 = Hud::SCREEN_MENU;
+        }
+        hud_->set_screen(s0);
+        if (s0 != Hud::SCREEN_PLAY) {
+            Input *in = Input::get_singleton();
+            if (in != nullptr) in->set_mouse_mode(Input::MOUSE_MODE_VISIBLE);
+        }
+        UtilityFunctions::print("[ui] 初始屏 = ",
+                                String(s0 == Hud::SCREEN_MENU ? "MENU"
+                                       : (s0 == Hud::SCREEN_BRIEF ? "BRIEF" : "PLAY")));
+    }
+
+    /* VA_END=win|lose：直接把战局按指定结局收尾。
+       用途是给结算面板取证 —— 真打到结束要跑满一局（最长 10 分钟模拟时间），
+       无人值守下不可能反复跑。这里只设结果与统计，不碰逻辑判定，
+       所以看到的就是真实的 draw_end_panel，而不是另一个"预览版面板"。 */
+    if (const char *fe = std::getenv("VA_END"); fe != nullptr && *fe != '\0') {
+        const bool win = (std::string(fe) == "win");
+        va::MissionStats &s = va::W.stats;
+        if (win) {
+            s.tankKilled = true; s.boxTaken = true; s.boxEvacuated = true;
+            s.evacCount = 7; s.apcKilled = 3; s.enemyDead = 18;
+            s.allyDead = 1; s.allyDown = 2; s.tankShells = 2; s.minesUsed = 1;
+            s.cmdIssued = 9; s.cmdExec = 7; s.cmdRefused = 2;
+        } else {
+            s.tankKilled = false; s.boxTaken = false;
+            s.apcKilled = 1; s.enemyDead = 9;
+            s.allyDead = 4; s.allyDown = 1; s.evacCount = 2;
+            s.tankShells = 4; s.minesUsed = 0;
+            s.cmdIssued = 11; s.cmdExec = 4; s.cmdRefused = 7;
+        }
+        va::W.over = true;
+        va::W.overKind = win ? "成功" : "失败";
+        va::score_mission();
+        UtilityFunctions::print("[ui] VA_END 强制结局 = ", String(win ? "win" : "lose"),
+                                " 评级=", String::utf8(va::W.score.g.c_str()));
+    }
+
     // 第一人称相机
     cam_ = memnew(Camera3D);
     // FOV 65（垂直）→ 水平约 100°。
@@ -278,6 +338,28 @@ void WorldSim::sync_entity_nodes() {
 void WorldSim::_process(double p_delta) {
     if (cam_ == nullptr) return;
 
+    /* 界面外壳期间**冻结战局**：逻辑不步进、实体不同步、视图模型不更新。
+       玩家在菜单里按 WASD 不该把正在潜伏的小队推着走；
+       简报页上读到的目标清单必须是"还没开打"的那一份。
+       但 HUD 仍要 update —— 菜单的悬停高亮、闪烁提示都靠它推进动画。
+       注意这里直接 return 而不走下面的 capture_step：真跑取证时
+       VA_CAPTURE 会让初始屏直接是 PLAY（见 _ready），外壳根本不会激活。 */
+    if (shell_owns_input()) {
+        if (hud_ != nullptr) {
+            hud_->update(p_delta);
+            if (hud_->take_start()) { enter_play(); return; }
+            if (hud_->take_quit()) { get_tree()->quit(); return; }
+        }
+        /* 外壳期间逻辑层的 t 是冻结的，截图探针改由墙钟累计值驱动 ——
+           否则菜单 / 简报这两个新屏一张证据都拿不到。
+           （默认路径根本走不到这里：VA_CAPTURE 会让初始屏直接是 PLAY；
+             只有显式给了 VA_SCREEN=menu|brief 才会进来。） */
+        shell_t_ += p_delta;
+        cap_sim_t_ = shell_t_;
+        capture_step();
+        return;
+    }
+
     // 固定步长推进逻辑（网页版是「按需要拆成 <=0.022s 的小步」，这里等价处理）
     va_trace("_process:enter");
     const double H = 1.0 / 60.0;
@@ -344,6 +426,28 @@ void WorldSim::_input(const Ref<InputEvent> &p_event) {
     Input *in = Input::get_singleton();
     if (in == nullptr) return;
 
+    /* 界面外壳期间：键鼠整条链路转交界面，一点都不能漏进逻辑层。
+       漏的后果很具体：菜单里按 W 会写 va::IN.w，等玩家点"开始行动"进战斗时，
+       角色会带着这个残留的按键状态直接开跑 —— 表现成"一进场就自己往前走"。
+       所以这里在喂给逻辑层之前就整体 return。 */
+    if (shell_owns_input()) {
+        if (Ref<InputEventKey> k = p_event; k.is_valid()) {
+            if (k->is_pressed() && !k->is_echo()) hud_->shell_key((int64_t)k->get_keycode());
+            return;
+        }
+        if (Ref<InputEventMouseMotion> mm = p_event; mm.is_valid()) {
+            hud_->shell_hover(mm->get_position());
+            return;
+        }
+        if (Ref<InputEventMouseButton> mb = p_event; mb.is_valid()) {
+            if (mb->get_button_index() == MouseButton::MOUSE_BUTTON_LEFT && mb->is_pressed()) {
+                hud_->shell_click(mb->get_position());
+            }
+            return;
+        }
+        return;
+    }
+
     const bool captured = (in->get_mouse_mode() == Input::MOUSE_MODE_CAPTURED);
 
     if (Ref<InputEventMouseMotion> mm = p_event; mm.is_valid()) {
@@ -397,11 +501,38 @@ void WorldSim::_input(const Ref<InputEvent> &p_event) {
             case Key::KEY_Q:     if (down) { /* 指令面板（待接入） */ } break;
             case Key::KEY_Z:     if (down) va::IN.markerSet = true; break;
             case Key::KEY_ESCAPE:
-                if (down) in->set_mouse_mode(Input::MOUSE_MODE_VISIBLE);
+                if (down) {
+                    /* 结算界面上 Esc = 回主菜单；战斗中 Esc = 释放鼠标。
+                       和 R 键同一个思路：结算时"释放鼠标"毫无意义（已经没在瞄了），
+                       键位重叠不产生歧义。顺带让界面外壳成为一个闭环，
+                       而不是"进了战斗就再也回不到菜单"的单向门。 */
+                    if (hud_ != nullptr && hud_->mission_over()) {
+                        reset_mission();                    // 内部会把 W.over 清掉
+                        hud_->set_screen(Hud::SCREEN_MENU);
+                    }
+                    in->set_mouse_mode(Input::MOUSE_MODE_VISIBLE);
+                }
                 break;
             default: break;
         }
     }
+}
+
+// 从任务简报切进战斗。
+void WorldSim::enter_play() {
+    if (hud_ != nullptr) hud_->set_screen(Hud::SCREEN_PLAY);
+    Input *in = Input::get_singleton();
+    if (in != nullptr) in->set_mouse_mode(Input::MOUSE_MODE_CAPTURED);
+    /* 简报期间逻辑层一步都没走过，实体节点还停在 _ready 建出来的位置上。
+       这里对齐一次，并把视线重新指向公路来向 —— 保证"开打"这一帧画面就是对的，
+       而不是先闪一帧歪的。 */
+    aim_at_road();
+    sync_entity_nodes();
+    UtilityFunctions::print("[ui] 进入战斗");
+}
+
+bool WorldSim::shell_owns_input() const {
+    return hud_ != nullptr && hud_->shell_active();
 }
 
 void WorldSim::_notification(int p_what) {
