@@ -1,0 +1,266 @@
+# -*- coding: utf-8 -*-
+"""VolunteerArmyPC —— 批量图生3D：11 个角色立绘 → assets/art/char/model/<键>.glb
+
+【为什么要有这一层，而不是在 shell 里 for 循环】
+一次图生3D 是「提交 → 轮询 1~5 分钟 → 拿到 URL → 下载 42MB → 瘦身到 1.5MB」，
+四个环节各有各的失败方式（提交被限流、轮询超时、COS 链接断流、GLB 里 BIN 块没取到）。
+放进 shell 里意味着任何一个环节失败都只有一个 exit code，事后不知道卡在哪。
+这里把每一步的结果都落到 `sweep/gen3d/<键>.*`，失败也能从中断处单点重跑。
+
+【并发而不是串行】串行 11 个要 20~50 分钟，而且这期间没有任何产出。
+但服务端对 hy-3d 维度**只放 2 个并发槽位**，超了直接 429 拒绝，
+所以并发固定按 2 来（--jobs 可调，调大只会让多出来的任务去撞 429 然后退避等待，
+并不会更快）。遇到 429 会自动退避重试 —— 槽位是会自己空出来的，
+而"面数超限 / 图片过大"那类不可等，所以只对 429 重试，其余立刻报错退出。
+
+【为什么要去水印后再喂】输入用 `assets/art/char/<键>.png`（tools/prep_char.py 的产物），
+**不是** `assets/art/char/raw/` 里的原始立绘 —— 原始图上有半透明水印，
+图生3D 会把它当成服装上的图案烘进贴图，而建好的模型不会再走一遍去水印，错就错到底了。
+
+用法：
+    echo -n "<token>" | python tools/gen3d_batch.py [--jobs 4] [键 ...]
+
+    不给键就做全部 11 个；已存在 <键>.glb 且非空的**默认跳过**（--force 覆盖），
+    所以中断之后直接再跑一次就是"接着做没做完的"。
+"""
+
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SRC_DIR = os.path.join(ROOT, "assets", "art", "char")
+MODEL_DIR = os.path.join(SRC_DIR, "model")
+WORK = os.path.join(ROOT, "sweep", "gen3d")
+
+PY = sys.executable
+# 瘦身要 Pillow，而 Pillow 只装在隔离 venv 里（本项目唯一一个非纯 Python 的工具）。
+# 若该 venv 不存在，脚本会明确报出来而不是悄悄产出一个 42MB 的 GLB 进仓库。
+VENV_PY = ("C:/Users/lujiajing/.workbuddy/binaries/python/envs/default/Scripts/python.exe")
+
+# 键的顺序 = scene_builder.cpp 里 all_art_keys() 的顺序，方便两边对账
+KEYS = [
+    "char_leader", "char_rifleman", "char_mg", "char_sniper",
+    "char_at", "char_demo", "char_medic", "char_ammo",
+    "char_enemy_rifle", "char_enemy_mg", "char_enemy_officer",
+]
+
+# 与试接那次**完全一致**的参数。不给 --face-count / --result-format：
+# 前者会改服务端的面数档位（进而改积分），后者只是"额外再给一个格式"，
+# 而我们要的 glb 本来就在默认输出里。参数越多，批次之间越可能对不齐，
+# 而模型差异在几十像素高的战场上根本看不出来 —— 只会变成一笔对不上的账。
+GEN_ARGS = ["--enable-pbr", "--generate-type", "Normal"]
+
+LOG_LOCK = threading.Lock()
+
+# 服务端对 hy-3d 维度只放 2 个并发槽位，超了直接 429 拒绝（**不扣积分**）。
+# 所以并发默认就是 2：开 6 个不是"更快"，只是让 4 个任务在 15 秒内各报一次失败。
+#
+# 【为什么重试预算要给到 25 次而不是 8 次】实测这 2 个槽位**并不总是空着**：
+# 连续跑了 6 分钟、每次都是 429，而我方一个任务都没提交成功 ——
+# 说明占着槽位的东西不是我们自己（试接那次早就结束了）。
+# 这类共享维度的配额什么时候空出来是外部决定的，只能等。
+# 等不到就等不到，脚本会明确报"重试 N 次仍失败"，不会假装成功。
+SUBMIT_TRIES = 12
+SUBMIT_WAIT_CAP = 30        # 退避上限（秒）：token 只有 ~20 分钟寿命，等太久等于白等
+
+
+def _retryable(body):
+    b = body.lower()
+    return ("429" in b) or ("slot limit" in b) or ("concurrency" in b)
+
+
+def log(*a):
+    with LOG_LOCK:
+        print(*a)
+        sys.stdout.flush()
+
+
+def run_one(key, token, force):
+    tag = key
+
+    def say(msg):
+        log("[%s] %s" % (tag, msg))
+
+    out_json = os.path.join(WORK, key + ".json")
+    raw_glb = os.path.join(WORK, key + ".raw.glb")
+    dst_glb = os.path.join(MODEL_DIR, key + ".glb")
+
+    if not force and os.path.exists(dst_glb) and os.path.getsize(dst_glb) > 0:
+        say("已有成品 %.2f MB，跳过" % (os.path.getsize(dst_glb) / 2 ** 20))
+        return True
+
+    src = os.path.join(SRC_DIR, key + ".png")
+    if not os.path.isfile(src):
+        say("缺立绘 %s" % src)
+        return False
+
+    # ---- 0. 上次的 json 是"成功的"还是"失败留下的"？----
+    # 【为什么必须看内容而不是只看文件在不在】第一次跑（并发 6）11 个全被 429 拒了，
+    # 但每个都留下了一个**非空的** json（里面是错误对象）。只判"文件存在且非空"
+    # 就会把这一批全部当成"已完成"跳过 —— 脚本报一切正常，仓库里一个模型都没有。
+    # 所以判据是 json 里的状态是不是 DONE。
+    done_json = False
+    if not force and os.path.exists(out_json) and os.path.getsize(out_json) > 0:
+        try:
+            j = json.load(open(out_json, encoding="utf-8"))
+            done_json = (j.get("status") or j.get("raw_result", {}).get("Status")) == "DONE"
+        except Exception:
+            done_json = False
+
+    # ---- 1. 提交并轮询（gen3d.py 负责绕开命令行长度上限）----
+    if not done_json:
+        t0 = time.time()
+        say("提交中（输入 %.2f MB）…" % (os.path.getsize(src) / 2 ** 20))
+        # PYTHONIOENCODING：子进程的 stdout 是管道，Python 会按系统区域（GBK）编码它，
+        # 而父进程按 UTF-8 解 —— 不解这一下，日志里所有中文都是乱码，
+        # 而"哪一步说了什么"正是这个脚本存在的意义。
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        for attempt in range(1, SUBMIT_TRIES + 1):
+            p = subprocess.run(
+                [PY, os.path.join(ROOT, "tools", "gen3d.py"), src, out_json] + GEN_ARGS,
+                input=token + "\n", capture_output=True, text=True, encoding="utf-8",
+                errors="replace", cwd=ROOT, env=env,
+            )
+            if p.returncode == 0:
+                say("生成完成，用时 %.0fs" % (time.time() - t0))
+                break
+            # 提交阶段失败多半是并发槽位用满，服务端返回
+            #   {"error":"HTTP_ERROR","message":"concurrent slot limit exceeded (2) for
+            #    dimension hy-3d","http_status":429}
+            # 这是**可等**的：槽位会自己空出来。而"面数超限/图片过大"那种不可等，
+            # 所以只对 429 / slot limit 这类关键词重试，其余立刻放弃并把原因打出来，
+            # 免得把 11 个任务都拖成"重试 6 次 × 每次 1 分钟"却什么都没做。
+            body = ""
+            try:
+                body = open(out_json, encoding="utf-8").read()
+            except Exception:
+                pass
+            body = body or (p.stderr or "") + (p.stdout or "")
+            if not _retryable(body):
+                say("生成失败（不可重试）rc=%d：%s" % (p.returncode, body.strip()[:300]))
+                return False
+            if attempt < SUBMIT_TRIES:
+                wait = min(SUBMIT_WAIT_CAP, 15 * attempt)
+                say("槽位已满，%ds 后重试（第 %d/%d 次）" % (wait, attempt, SUBMIT_TRIES))
+                time.sleep(wait)
+            else:
+                say("槽位重试 %d 次仍失败：%s" % (SUBMIT_TRIES, body.strip()[:200]))
+                return False
+        else:
+            return False
+
+    # ---- 2. 从结果里取 GLB 链接 ----
+    try:
+        d = json.load(open(out_json, encoding="utf-8"))
+    except Exception as e:
+        say("结果 json 不可读：%r" % e)
+        return False
+
+    st = d.get("status") or d.get("raw_result", {}).get("Status")
+    if st != "DONE":
+        say("任务状态 %s，不是 DONE" % st)
+        return False
+
+    url = None
+    for f in d.get("raw_result", {}).get("ResultFile3Ds", []) or []:
+        if str(f.get("Type", "")).upper() == "GLB":
+            url = f.get("Url")
+            break
+    if not url:
+        say("结果里没有 GLB 链接")
+        return False
+    say("积分 %s" % d.get("raw_result", {}).get("ResultCreditConsumed"))
+
+    # ---- 3. 下载 ----
+    if not os.path.exists(raw_glb) or os.path.getsize(raw_glb) < 1024:
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import dl  # 复用它那套 Range 续传 + 退避重试
+        try:
+            dl.fetch(url, raw_glb)
+        except Exception as e:
+            say("下载失败：%r" % e)
+            return False
+
+    # ---- 4. 瘦身 ----
+    if not os.path.isfile(VENV_PY):
+        say("找不到带 Pillow 的隔离 venv：%s" % VENV_PY)
+        return False
+    p = subprocess.run(
+        [VENV_PY, os.path.join(ROOT, "tools", "slim_glb.py"),
+         "slim", raw_glb, dst_glb],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=ROOT,
+    )
+    if p.returncode != 0:
+        say("瘦身失败 rc=%d：%s" % (p.returncode, (p.stderr or p.stdout or "")[-400:]))
+        return False
+    say("成品 %.2f MB（原 %.2f MB）" % (
+        os.path.getsize(dst_glb) / 2 ** 20, os.path.getsize(raw_glb) / 2 ** 20))
+    return True
+
+
+def main():
+    argv = sys.argv[1:]
+    jobs = 2
+    force = False
+    keys = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--jobs":
+            jobs = int(argv[i + 1]); i += 2
+        elif argv[i] == "--force":
+            force = True; i += 1
+        else:
+            keys.append(argv[i]); i += 1
+
+    token = sys.stdin.readline().strip()
+    if not token:
+        print("stdin 没有拿到 token")
+        return 2
+    if not keys:
+        keys = list(KEYS)
+
+    os.makedirs(WORK, exist_ok=True)
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
+    log("批次：%d 个角色，并发 %d%s" % (len(keys), jobs, "，强制重做" if force else ""))
+
+    lock = threading.Lock()
+    todo = list(keys)
+    fail = []
+
+    def worker():
+        while True:
+            with lock:
+                if not todo:
+                    return
+                k = todo.pop(0)
+            try:
+                ok = run_one(k, token, force)
+            except Exception as e:      # 任何意外都不该带走整个批次
+                log("[%s] 异常 %r" % (k, e))
+                ok = False
+            if not ok:
+                with lock:
+                    fail.append(k)
+
+    ths = [threading.Thread(target=worker, daemon=True) for _ in range(max(1, jobs))]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join()
+
+    have = [k for k in keys if os.path.exists(os.path.join(MODEL_DIR, k + ".glb"))]
+    log("")
+    log("=== 齐备 %d / %d：%s" % (len(have), len(keys), ", ".join(have)))
+    if fail:
+        log("=== 失败：%s（重跑本脚本即可只补这些）" % ", ".join(fail))
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

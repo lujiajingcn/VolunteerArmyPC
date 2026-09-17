@@ -22,6 +22,8 @@
 #include <godot_cpp/classes/viewport.hpp>
 #include <godot_cpp/classes/viewport_texture.hpp>
 #include <godot_cpp/classes/window.hpp>
+#include <godot_cpp/variant/basis.hpp>
+#include <godot_cpp/variant/transform3d.hpp>
 #include <godot_cpp/core/memory.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
@@ -71,6 +73,161 @@ void WorldSim::aim_at_road() {
     va::W.player->facing = a;
     yaw_ = -a - 1.5707963267948966f;
     pitch_ = -0.04f;
+}
+
+/* ----------------------------------------------------- 角色模型检阅台（取证）
+   两种模式，都由 VA_UNIT_SHOW 选：
+     VA_UNIT_SHOW=1 | row        陈列排：11 个角色等距摆两排，看彼此差异与整体齐备度
+     VA_UNIT_SHOW=one:<键>[:<度>]  近景单体：把<键>那个模型单独摆到镜头前 5 米，
+                                  看朝向 / 脚底 / 比例（可加第三段临时偏航角度）
+
+   为什么需要它：把角色换成三维模型之后，"朝向校对了没有 / 身高比例对不对 /
+   脚是踩在地上还是悬空 / 倒地的姿态是躺下还是穿模"这四件事，**战场截图一件都答不了**。
+   场上每个单位在 2560 宽的画面上只有几十像素高，还大半时间背对镜头或被掩体挡住；
+   上一轮看 cap_40s.png 只能得出"那是个人形"，朝向对不对完全看不出来。
+
+   与战场共用同一套 make_unit_node_by_key / unit_transform，
+   所以这里看到的**就是**战场上那个模型，不是另做的一份预览 ——
+   预览和实物分家的话，这里全对、场上全错，是最坏的情况。
+
+   【先近景单体、再批量生成】近景单体存在的第一个理由是**省钱**：
+   朝向标定如果错了，整批模型都要重做（单张 40 积分 × 11）。所以流程是
+   "生成 1 张 → 近景确认朝向 → 确认无误 → 再批量"。这一条是实打实踩出来的，
+   不是预防性的教条。
+
+   逻辑层全程冻结（_process 里 show_mode_ 直接早退），原因有两个：
+     1. 敌人会走进陈列排里，把"第几个是谁"搅得读不出来；
+     2. 停摆之后一帧不用算 AI，取证速度快一个数量级。            */
+void WorldSim::build_unit_showcase() {
+    const char *e = std::getenv("VA_UNIT_SHOW");
+    if (e == nullptr || *e == '\0') return;
+    const va::Unit *p = va::W.player;
+    if (p == nullptr) return;
+    const std::string mode(e);
+    if (mode == "0") return;
+    show_mode_ = true;
+
+    // 相机前方 / 右方（逻辑层 2D）。
+    // 推导：相机 rotation.y = yaw_ = -a - π/2，Godot 里偏航 θ 的相机朝 -Z 旋转后
+    // 前方 = (-sinθ, 0, -cosθ)；代入 θ 得 (cos a, 0, sin a) ——
+    // 即逻辑层的 (cos a, sin a)。右方 = (cosθ, 0, -sinθ) → 逻辑层 (-sin a, cos a)。
+    // aim_at_road() 已经把 a 写进 player->facing，直接读回来，不再算第二遍。
+    const float a = p->facing;
+    const float fx = std::cos(a), fy = std::sin(a);      // 前
+    const float rx = -fy,        ry = fx;                // 右
+    constexpr float U = 20.0f;   // 逻辑层 1 米 = 20 单位（to3 里乘 S=0.05 之前的那套坐标）
+    constexpr float PI = 3.14159265358979323846f;
+
+    Node3D *stage = memnew(Node3D);
+    stage->set_name("UnitShowcase");
+    add_child(stage);
+
+    // 枪模是相机的子节点，不藏的话会横在画面正中挡住人
+    if (vm_.root != nullptr) vm_.root->set_visible(false);
+
+    if (mode.rfind("one:", 0) == 0) {
+        // ---- 近景单体：<键>[:<临时偏航角>] ----
+        std::string rest = mode.substr(4);
+        std::string key = rest, yaw_s;
+        const size_t c = rest.find(':');
+        if (c != std::string::npos) { key = rest.substr(0, c); yaw_s = rest.substr(c + 1); }
+        float dyaw = 0.0f;
+        if (!yaw_s.empty()) dyaw = (float)std::strtod(yaw_s.c_str(), nullptr) * PI / 180.0f;
+
+        constexpr float DIST_M = 4.8f;
+        constexpr float CAM_H  = 1.05f;
+        Node3D *nd = make_unit_node_by_key(key, refs_.units);
+        if (nd == nullptr) {
+            UtilityFunctions::print("[show] 近景：没有模型 ", String::utf8(key.c_str()));
+        } else {
+            const float lx = p->x + fx * DIST_M * U;
+            const float ly = p->y + fy * DIST_M * U;
+            nd->set_transform(unit_transform(lx, ly, a + PI + dyaw, false));
+            stage->add_child(nd);
+        }
+        /* 取景推导（这几行数字不是拍的，是算的，改之前先算一遍）：
+             相机高 1.05（**不是** 1.65 眼高）—— 眼高平视时人身只占画高 26%，
+             因为要同时容纳脚下 1.65 m 与头顶 0.03 m，垂直半视场被迫开到 ±1.9 m，
+             1.68/3.8 = 44% 就是上限，实际还更小。把相机降到 1.05 再微微抬头，
+             包围盒变成 [-1.05, +0.63]，同样的半视场能装下的"人"就大得多。
+             FOV 32（垂直半角 16°，tan=0.2867）、距离 4.8 m ⇒ 半视场 1.376 m：
+               脚底 -1.05 → 在框内，且**脚下还留 0.33 m 地面**（"脚有没有踩在地上"
+               全靠这条地面余量，压到 0 就看不出来了）；
+               头顶 +0.63 → 在框内，人身占画高 1.68/2.752 = 61%。
+             抬头 0.04 rad ≈ 2.3°：人身中心在 0.84 m，比相机低 0.21 m，
+             atan(0.21/4.8)=2.5°，抬回来正好把人居中。 */
+        cam_->set_position(to3(p->x, p->y, CAM_H));
+        cam_->set_rotation(Vector3(0.04f, yaw_, 0));
+        // VA_FOV 显式给了就以它为准（想试别的取景时不必改代码）
+        if (std::getenv("VA_FOV") == nullptr) cam_->set_fov(32.0f);
+        UtilityFunctions::print("[show] 近景 ", String::utf8(key.c_str()),
+                                " 距离 ", DIST_M, "m 机高 ", CAM_H,
+                                " 临时偏航 ", dyaw * 180.0f / PI, " 度");
+        if (refs_.units != nullptr) refs_.units->set_visible(false);
+        return;
+    }
+
+    // ---- 陈列排 ----
+    const std::vector<std::string> &keys = all_art_keys();
+    // 末位那一个是**倒在地上的步枪手** —— 倒地姿态只有摆出来才能确认，
+    // 而战场上要等到有人被打倒才看得到，取证时等不起（也未必等得到）。
+    const int n = (int)keys.size() + 1;
+
+    constexpr float GAP_M   = 1.40f;   // 同排间距
+    constexpr float ROW0_M  = 6.50f;   // 前排距离
+    constexpr float ROW1_M  = 9.20f;   // 后排距离（错开半格，避免前排挡住后排）
+    constexpr int   PER_ROW = 6;
+
+    int built = 0;
+    for (int i = 0; i < n; ++i) {
+        const int row = i / PER_ROW;
+        const int col = i % PER_ROW;
+        const int row_cnt = (row == 0) ? PER_ROW : (n - PER_ROW);
+        // 每排各自以相机中轴居中；后排再右移半格，让后一排的人落在前一排的空隙里
+        const float off_m = (col - (row_cnt - 1) * 0.5f) * GAP_M + (row == 0 ? 0.0f : GAP_M * 0.5f);
+        const float dep_m = (row == 0) ? ROW0_M : ROW1_M;
+
+        const bool downed = (i == n - 1);
+        const std::string key = downed ? std::string("char_rifleman") : keys[(size_t)i];
+
+        Node3D *nd = make_unit_node_by_key(key, refs_.units);
+        if (nd == nullptr) {
+            // 模型缺失时**留一格空位**并打一行日志，而不是把后面的往前挪 ——
+            // 挪位之后"第 4 格是医疗兵"这种读图方式就失效了，
+            // 而"少一个模型"恰恰是最需要一眼看出来的事。
+            UtilityFunctions::print("[show] 缺模型，第 ", i, " 格（",
+                                    String::utf8(key.c_str()), "）空置");
+            continue;
+        }
+        const float lx = p->x + fx * dep_m * U + rx * off_m * U;
+        const float ly = p->y + fy * dep_m * U + ry * off_m * U;
+        // 正面朝向相机：模型前方 = (cos f, sin f)，要指向相机就得取 a + π。
+        // 倒地的那一个额外叠 84° 侧翻（unit_transform 内部处理），
+        // 让他**沿排面**倒下（facing 与同排一致），躺姿才读得出来。
+        nd->set_transform(unit_transform(lx, ly, a + PI, downed));
+        stage->add_child(nd);
+        ++built;
+    }
+
+    /* 相机与视图模型。
+       复用第一人称相机（_process 里 show_mode_ 早退，不会再被 sync 覆盖回玩家身上），
+       不另立一台 —— 多一台相机就多一处"哪台是 current"的隐性状态，
+       而本工程已经被"这块黑东西到底属于哪一层"坑过一次。 */
+    cam_->set_position(to3(p->x, p->y, 1.65f));
+    cam_->set_rotation(Vector3(pitch_, yaw_, 0));
+
+    UtilityFunctions::print("[show] 检阅台：陈列 ", built, "/", n, " 个模型，间距 ",
+                            GAP_M, "m，前排 ", ROW0_M, "m 后排 ", ROW1_M, "m");
+
+    /* 藏掉场上**真单位**、以及**道具层**。
+       真单位用的是同一批模型，又正好冻在出生点（大多就在玩家身边几米内），
+       同框会读不出"这一排到底几个、第几格是谁"—— 而这恰恰是检阅台唯一要回答的问题。
+       道具层是同一个道理的另一半：上一版就这么拍了一张，
+       一根树干**正好立在视线中轴**上，把中间两格劈成两半。
+       道具在陈列排这种"整排平铺"的取景里没有净收益（尺寸参照用不上整排），
+       要参照尺寸请走近景单体模式，那里背景道具是保留的。 */
+    if (refs_.units != nullptr) refs_.units->set_visible(false);
+    if (refs_.props != nullptr) refs_.props->set_visible(false);
 }
 
 void WorldSim::_ready() {
@@ -191,6 +348,10 @@ void WorldSim::_ready() {
     sync_entity_nodes();
     va_trace("_ready:sync ok");
 
+    // 检阅台必须在 cam_ 与 vm_ 都建好之后（它要摆相机、要藏枪模），
+    // 也必须在 aim_at_road 之后（它读 player->facing 当排面朝向）。
+    build_unit_showcase();
+
     capture_setup();
 
     UtilityFunctions::print("[VolunteerArmyPC] ", get_diag());
@@ -275,7 +436,7 @@ void WorldSim::setup_runtime_ui() {
 
 void WorldSim::spawn_entity_nodes() {
     for (auto &u : va::W.units) {
-        Node3D *n = make_soldier_node(u.team == va::Team::Enemy, u.downed);
+        Node3D *n = make_unit_node(u, refs_.units);
         refs_.units->add_child(n);
         unit_nodes_.push_back(n);
     }
@@ -293,7 +454,7 @@ void WorldSim::sync_entity_nodes() {
         for (auto *n : unit_nodes_) n->queue_free();
         unit_nodes_.clear();
         for (auto &u : va::W.units) {
-            Node3D *n = make_soldier_node(u.team == va::Team::Enemy, u.downed);
+            Node3D *n = make_unit_node(u, refs_.units);
             refs_.units->add_child(n);
             unit_nodes_.push_back(n);
         }
@@ -316,9 +477,16 @@ void WorldSim::sync_entity_nodes() {
         Node3D *n = unit_nodes_[i];
         if (u.dead) { n->set_visible(false); continue; }
         n->set_visible(true);
-        n->set_position(to3(u.x, u.y, u.downed ? 0.0f : 0.0f));
-        // 模型前方 = +X（与逻辑层一致），绕 Y 旋转角 = -facing
-        n->set_rotation(Vector3(0, -u.facing, 0));
+        // 姿态由 scene_builder 的 unit_transform 统一给出（偏航 + 倒地侧翻）。
+        //
+        // 【为什么姿态必须在这里施加】这段原来只写 position/rotation，而倒地姿态是在
+        // make_soldier_node 里设的 —— 于是被这里的赋值逐帧覆盖，**倒地的士兵一直站着**，
+        // 那段代码从未生效。现在两条渲染路径（图元士兵 / 三维模型）共用这一套姿态。
+        //
+        // 【为什么抽成公共函数】检阅台（VA_UNIT_SHOW）建节点时也要施加同一姿态。
+        // 这里再抄一份的话，两处迟早出现"战场上倒下、检阅台上还站着"的偏差 ——
+        // 而这类偏差极难在截图上发现，因为两条路径从不出现在同一张图里。
+        n->set_transform(unit_transform(u.x, u.y, u.facing, u.downed));
     }
     for (size_t i = 0; i < va::W.vehicles.size(); ++i) {
         const va::Vehicle &v = va::W.vehicles[i];
@@ -356,6 +524,19 @@ void WorldSim::_process(double p_delta) {
              只有显式给了 VA_SCREEN=menu|brief 才会进来。） */
         shell_t_ += p_delta;
         cap_sim_t_ = shell_t_;
+        capture_step();
+        return;
+    }
+
+    /* 检阅台：逻辑层完全冻结（不步进、不同步实体、不更新枪模）。
+       代价是逻辑层的 t 停在 0，截图探针按 t 触发就永远不会响 ——
+       所以这里和外壳期用同一招：改用墙钟 show_t_ 驱动。
+       HUD 一并藏掉：这是给美术看的陈列照，罗盘/雷达/弹药板只会挡住下半排的脚，
+       而"脚有没有踩在地上"正是要看的第一件事。 */
+    if (show_mode_) {
+        if (hud_ != nullptr) hud_->set_visible(false);
+        show_t_ += p_delta;
+        cap_sim_t_ = show_t_;
         capture_step();
         return;
     }

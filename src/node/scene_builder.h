@@ -10,6 +10,9 @@
 #include <godot_cpp/classes/material.hpp>
 #include <godot_cpp/classes/texture2d.hpp>
 
+#include <string>
+#include <vector>
+
 #include "sim/va_world.h"
 
 // 只用到指针，前向声明即可，不必把 environment.hpp / directional_light3d.hpp 拉进头文件
@@ -63,6 +66,50 @@ void apply_weather(SceneRefs &refs);
 godot::Node3D *make_soldier_node(bool enemy, bool downed);
 godot::Node3D *make_vehicle_node(const std::string &type);
 godot::Node3D *make_box_node();
+
+// ---- 角色三维模型（图生3D 产物，tools/gen3d.py + tools/slim_glb.py）----
+//
+// 约定：assets/art/char/model/<键>.glb。键由 unit_model_key() 从 Unit 导出。
+// 载入失败（文件缺失 / 解析失败 / 场景为空 / 没有网格）一律回退到 make_soldier_node ——
+// 少一个模型文件不该让战场上少一个人。
+//
+// 返回的是**外层节点**：摆位与偏航由 sync_entity_nodes 负责，模型自身的
+// 缩放/脚底归零/朝向校正放在内层，免得被每帧的覆盖写掉。
+//
+// p_proto_parent 是模型**原型**的挂载点（传场景里已有的容器节点，如 units 层）。
+// 原型必须挂进场景树，不能只 memnew 后存在静态 map 里 —— 那样它持有的
+// mesh / material / 3 张贴图在进程退出时会被 Godot 报成
+// "RID allocations ... leaked at exit" 共 8 条 ERROR，而"日志里有没有 ERROR"
+// 正是本工程的回归判据，被这种假错误污染之后真问题就看不见了。
+godot::Node3D *make_unit_node(const va::Unit &u, godot::Node *p_proto_parent);
+
+// 按美术键直接建（检阅台 VA_UNIT_SHOW 用：手里只有键，没有 Unit）。
+// make_unit_node 内部就是先 unit_model_key(u) 再转到这里。
+godot::Node3D *make_unit_node_by_key(const std::string &p_key, godot::Node *p_proto_parent);
+
+// 单位在场景里的姿态：偏航（模型前方 = +X，故绕 Y 转 -facing）+ 倒地时绕**自身前方轴**
+// 的 84° 侧翻；p_x / p_y 是逻辑层的 2D 坐标。
+//
+// 【为什么抽成公共函数】这个姿态现在有**两个**施加者：sync_entity_nodes 每帧施加，
+// 检阅台（VA_UNIT_SHOW）建节点时就施加。两处各写一份，迟早出现"战场上倒下、
+// 检阅台上还站着"这种只改了一边的偏差 —— 而这类偏差在截图上极难发现，
+// 因为两条路径从不出现在同一张图里。
+godot::Transform3D unit_transform(float p_x, float p_y, float p_facing, bool p_downed);
+
+// 角色美术键：三维模型文件名与胸像纹理名**共用同一个键**（char_*）。
+// 拆成"按 id"和"按军官/机枪标志"两个入口，是因为两个调用方拿到的东西不同：
+//   · sync_entity_nodes 手里是 Unit（含 id / officer / mg）
+//   · 简报名册手里是花名册的 id 字符串
+// 两处各写一份映射迟早会漂移，所以只有这里一份真值。
+std::string ally_art_key(const std::string &p_id);
+std::string enemy_art_key(bool p_officer, bool p_mg);
+
+// 全部 11 个美术键，顺序 = 检阅台的陈列顺序（我方 8 种职务 → 敌方 3 种）。
+// 检阅台与"模型是否齐备"的自检都用它，避免再抄一遍键名列表。
+const std::vector<std::string> &all_art_keys();
+
+// Unit -> 模型键
+std::string unit_model_key(const va::Unit &u);
 
 // 程序化纹理（保持"零外部资源"）
 godot::Ref<godot::Texture2D> tex_grass();

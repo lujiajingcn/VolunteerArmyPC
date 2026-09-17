@@ -68,6 +68,10 @@ private:
     void capture_step();
     void capture_setup();
     void aim_at_road();
+    // 角色模型检阅台（取证）：VA_UNIT_SHOW 时把 11 个角色的三维模型
+    // 等距、正面摆成两排在玩家起点前方，供近景取证朝向 / 比例 / 脚底落地 / 倒地姿态。
+    // 战场截图判不了这些 —— 单位在画面里只有几十像素高，还大半时间背对或被掩体挡住。
+    void build_unit_showcase();
 
     SceneRefs refs_;
     godot::Camera3D *cam_ = nullptr;
@@ -104,6 +108,11 @@ private:
     // 所以菜单/简报里改用这个墙钟累计值来驱动截图 —— 否则新加的这两屏
     // 一条证据都拿不到，只能靠"我看着是对的"。
     double shell_t_ = 0.0;
+
+    // 角色模型检阅台（VA_UNIT_SHOW）。逻辑层同样冻结（否则敌人会走进陈列排里，
+    // 把"谁是谁"搅得读不出来），所以截图也按墙钟驱动，和外壳期同一套办法。
+    bool   show_mode_ = false;
+    double show_t_ = 0.0;
 
     // UI：全套使命召唤风格 HUD，手绘在一个 Control 里（见 node/hud.h）
     Hud *hud_ = nullptr;

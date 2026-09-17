@@ -5,11 +5,16 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <string>
 #include <vector>
 
 #include <godot_cpp/classes/box_mesh.hpp>
 #include <godot_cpp/classes/cylinder_mesh.hpp>
 #include <godot_cpp/classes/directional_light3d.hpp>
+#include <godot_cpp/classes/file_access.hpp>
+#include <godot_cpp/classes/gltf_document.hpp>
+#include <godot_cpp/classes/gltf_state.hpp>
 #include <godot_cpp/classes/light3d.hpp>
 #include <godot_cpp/classes/environment.hpp>
 #include <godot_cpp/classes/array_mesh.hpp>
@@ -25,6 +30,7 @@
 #include <godot_cpp/classes/sky.hpp>
 #include <godot_cpp/classes/sphere_mesh.hpp>
 #include <godot_cpp/classes/standard_material3d.hpp>
+#include <godot_cpp/classes/visual_instance3d.hpp>
 #include <godot_cpp/classes/world_environment.hpp>
 #include <godot_cpp/core/memory.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
@@ -341,11 +347,229 @@ Node3D *make_soldier_node(bool enemy, bool downed) {
     gun->set_size(Vector3(0.62f, 0.06f, 0.055f));
     add_mesh(n, gun, Vector3(0.20f, 1.10f, 0.10f), mat_solid(Color(0.11f, 0.11f, 0.12f), 0.55f, 0.6f));
 
-    if (downed) {
-        n->set_rotation_degrees(Vector3(0, 0, 84));
-        n->set_position(Vector3(0, 0.28f, 0));
-    }
+    // 倒地姿态**不在这里设**。
+    // 原来这里有一段 `if (downed) { set_rotation_degrees(84); set_position(0,0.28,0); }`，
+    // 但它从来没有生效过：sync_entity_nodes 每帧都会重写这个节点的
+    // position/rotation，建节点时写进去的姿态在第一帧就被覆盖掉了 ——
+    // 也就是说**倒地的士兵一直站着**。现在倒地姿态改由 sync_entity_nodes
+    // 用「偏航 × 侧翻」合成基施加，两条渲染路径（图元 / 三维模型）共用同一套逻辑。
+    (void)downed;
     return n;
+}
+
+// ---------------------------------------------- 角色三维模型（图生3D 产物）
+//
+// 数据来源与尺寸：见 tools/gen3d.py（图生三维）与 tools/slim_glb.py（贴图瘦身）。
+// 生成器给的 GLB 单张 42.78MB，其中 41.3MB 是三张 4096² 贴图；
+// 收到 512² 之后是 1.56MB，网格 5 万面不动。这个比例是必须的 ——
+// 士兵在画面上通常只有几十到两百像素高。
+
+// 目标身高（节点单位，与图元士兵一致：头盔顶 y≈1.64，见 make_soldier_node）
+constexpr float UNIT_MODEL_H = 1.68f;
+
+// 朝向校正：glTF 模型的正面普遍朝 +Z，而本工程的契约是"模型前方 = +X"
+// （逻辑层的 facing 与实体节点的偏航都按这个来）。绕 Y 转 +90° 正好把 +Z 转到 +X：
+// 绕 Y 转 θ 把 (0,0,1) 映到 (sinθ, 0, cosθ)，θ=90° 即 (1,0,0)。
+// 留 VA_MODEL_YAW 旋钮覆盖，是为了万一某批模型朝向不同，能靠截图量出来改，
+// 而不是靠重编译猜。
+constexpr float UNIT_MODEL_YAW_DEG = 90.0f;
+
+static std::map<std::string, Node3D *> s_unit_proto;   // 键 -> 外层原型（含完整的归一化子树）
+static std::map<std::string, bool> s_unit_failed;      // 失败过就别每个单位再试一次
+
+static void collect_aabb(Node *p_node, const Transform3D &p_xf, AABB &p_box, bool &p_has) {
+    Transform3D xf = p_xf;
+    Node3D *n3 = Object::cast_to<Node3D>(p_node);
+    if (n3 != nullptr) {
+        xf = p_xf * n3->get_transform();
+    }
+    VisualInstance3D *vi = Object::cast_to<VisualInstance3D>(p_node);
+    if (vi != nullptr) {
+        const AABB b = xf.xform(vi->get_aabb());
+        if (!p_has) {
+            p_box = b;
+            p_has = true;
+        } else {
+            p_box.merge_with(b);
+        }
+    }
+    const int nc = p_node->get_child_count();
+    for (int i = 0; i < nc; ++i) {
+        collect_aabb(p_node->get_child(i), xf, p_box, p_has);
+    }
+}
+
+std::string ally_art_key(const std::string &p_id) {
+    // 我方按花名册 id 查表（va_config.cpp 的 ROSTER）。
+    // 用 id 而不是 role 字符串：role 有"弹药/支援"这种带斜杠的写法，
+    // 而且铁头的 role 是"弹药/支援"但武器是步枪，按武器分档会把他错认成步枪手。
+    if (p_id == "player")  return "char_leader";
+    if (p_id == "laozhou") return "char_mg";
+    if (p_id == "xiaoxia") return "char_sniper";
+    if (p_id == "shitou" || p_id == "houzi") return "char_at";
+    if (p_id == "laobai")  return "char_demo";
+    if (p_id == "xiaoman") return "char_medic";
+    if (p_id == "tietou")  return "char_ammo";
+    return "char_rifleman";        // ajie / daliu / alan 与一切未登记的
+}
+
+std::string enemy_art_key(bool p_officer, bool p_mg) {
+    if (p_officer) return "char_enemy_officer";
+    if (p_mg)      return "char_enemy_mg";
+    return "char_enemy_rifle";
+}
+
+const std::vector<std::string> &all_art_keys() {
+    // 顺序 = 检阅台（VA_UNIT_SHOW）的陈列顺序，也是 hud.cpp 名册的职务顺序：
+    // 我方 8 种职务，再到敌方 3 种。
+    // 【为什么要有一份总表】检阅台要按固定顺序摆一遍、"模型齐备"的自检要遍历一遍，
+    // 两处各抄一遍键名，加第 12 个角色时必然漏掉其中一处 —— 而漏掉的那一处
+    // 只会表现为"检阅台上少一个人"，不会报错。
+    static const std::vector<std::string> k = {
+        "char_leader", "char_rifleman", "char_mg", "char_sniper",
+        "char_at", "char_demo", "char_medic", "char_ammo",
+        "char_enemy_rifle", "char_enemy_mg", "char_enemy_officer",
+    };
+    return k;
+}
+
+std::string unit_model_key(const va::Unit &u) {
+    if (u.team == va::Team::Enemy) {
+        return enemy_art_key(u.officer, u.mg);
+    }
+    return ally_art_key(u.id);
+}
+
+static Node3D *load_unit_proto(const std::string &p_key, Node *p_parent) {
+    auto it = s_unit_proto.find(p_key);
+    if (it != s_unit_proto.end()) {
+        return it->second;
+    }
+    if (s_unit_failed.count(p_key) != 0) {
+        return nullptr;
+    }
+
+    const String path = String("res://assets/art/char/model/") +
+                        String::utf8(p_key.c_str()) + String(".glb");
+    // 先判存在再解析：直接解析一个不存在的路径会在 stderr 打一行 ERROR，
+    // 而"日志里有没有 ERROR"是本工程的回归判据之一，不能被这种假错误污染。
+    if (!FileAccess::file_exists(path)) {
+        s_unit_failed[p_key] = true;
+        return nullptr;
+    }
+
+    Ref<GLTFDocument> doc;
+    doc.instantiate();
+    Ref<GLTFState> st;
+    st.instantiate();
+    if (doc.is_null() || st.is_null()) {
+        UtilityFunctions::print("[unit] GLTFDocument 不可用，全部回退图元士兵");
+        s_unit_failed[p_key] = true;
+        return nullptr;
+    }
+
+    const Error err = doc->append_from_file(path, st);
+    if (err != OK) {
+        UtilityFunctions::print("[unit] 模型解析失败 ", path, " err=", (int)err);
+        s_unit_failed[p_key] = true;
+        return nullptr;
+    }
+    Node *scene = doc->generate_scene(st);
+    Node3D *raw = Object::cast_to<Node3D>(scene);
+    if (raw == nullptr) {
+        UtilityFunctions::print("[unit] 模型没有可用的场景根 ", path);
+        s_unit_failed[p_key] = true;
+        return nullptr;
+    }
+
+    // 量包围盒。glTF 的节点自带 +90°绕X（Z-up → Y-up），
+    // 所以这里量到的就是引擎空间的尺寸，不必再自己转。
+    AABB box;
+    bool has = false;
+    collect_aabb(raw, Transform3D(), box, has);
+    if (!has || box.size.y <= 1e-5f) {
+        UtilityFunctions::print("[unit] 模型没有网格 ", path);
+        raw->queue_free();
+        s_unit_failed[p_key] = true;
+        return nullptr;
+    }
+
+    const float k = UNIT_MODEL_H / box.size.y;
+
+    float yaw_deg = UNIT_MODEL_YAW_DEG;
+    if (const char *e = std::getenv("VA_MODEL_YAW")) {
+        yaw_deg = (float)std::atof(e);
+    }
+
+    Node3D *outer = memnew(Node3D);
+    Node3D *norm = memnew(Node3D);
+    // 变换：绕 Y 转 yaw，再等比缩放到目标身高，最后把脚底挪到 y=0、水平居中到原点。
+    // 用 set_transform 一次给全，不分成 set_scale + set_rotation 两步 ——
+    // 那两步在 Node3D 里靠内部缓存的 euler/scale 重新合成基，顺序与语义都要额外确认，
+    // 而这里是要一次性表达一个明确的仿射变换。
+    Basis b(Vector3(0.0f, 1.0f, 0.0f), yaw_deg * 3.14159265358979323846f / 180.0f);
+    b.scale(Vector3(k, k, k));
+    const Vector3 c = box.get_center();
+    norm->set_transform(Transform3D(b, Vector3(-c.x * k, -box.position.y * k, -c.z * k)));
+    norm->add_child(raw);
+    outer->add_child(norm);
+
+    // 原型挂进场景树并隐藏，生命周期交给场景树。
+    // 若不挂（只放到静态 map 里），它持有的 mesh / material / 3 张贴图
+    // 会在进程退出时被 Godot 报成 8 条 "leaked at exit" 的 ERROR ——
+    // 数量精确对得上：1 mesh / 1 material / 1 shader / 3 texture / 1 instance。
+    if (p_parent != nullptr) {
+        p_parent->add_child(outer);
+        outer->set_visible(false);
+    } else {
+        UtilityFunctions::print("[unit] 警告：没有原型挂载点，模型资源会在退出时报泄漏");
+    }
+
+    UtilityFunctions::print("[unit] 模型 ", String::utf8(p_key.c_str()),
+                            " 原始包围盒 ", box.size,
+                            " 缩放 ", k, " yaw ", yaw_deg);
+    s_unit_proto[p_key] = outer;
+    return outer;
+}
+
+Node3D *make_unit_node_by_key(const std::string &p_key, Node *p_proto_parent) {
+    Node3D *proto = load_unit_proto(p_key, p_proto_parent);
+    if (proto != nullptr) {
+        Node *dup = proto->duplicate();
+        Node3D *n = Object::cast_to<Node3D>(dup);
+        if (n != nullptr) {
+            // duplicate() 会把 visible=false 一起复制过来（原型是隐藏的），
+            // 这里显式打开，否则整支小队在画面上集体消失。
+            n->set_visible(true);
+            return n;
+        }
+        if (dup != nullptr) {
+            dup->queue_free();
+        }
+    }
+    return nullptr;
+}
+
+Node3D *make_unit_node(const va::Unit &u, Node *p_proto_parent) {
+    Node3D *n = make_unit_node_by_key(unit_model_key(u), p_proto_parent);
+    if (n != nullptr) return n;
+    // 没有模型就退回图元士兵 —— 少一个模型文件不该让战场上少一个人。
+    return make_soldier_node(u.team == va::Team::Enemy, u.downed);
+}
+
+Transform3D unit_transform(float p_x, float p_y, float p_facing, bool p_downed) {
+    // 模型前方 = +X（与逻辑层一致），绕 Y 旋转角 = -facing；
+    // 倒地再叠一个绕 Z 的 84° 侧翻。
+    //
+    // 【合成顺序：先偏航、再侧翻】b = yaw * roll —— 这样侧翻绕的是**模型自身的
+    // 前方轴**，人朝哪边倒都跟自身朝向一致。反过来写（roll * yaw）得到的是
+    // 绕**世界 Z** 侧翻，人转向哪边都会往同一个世界方向倒。
+    // roll 的符号取 +84°（+Y 绕 +Z 转 84° 后倒向 -X，即向后倒）。
+    Basis b(Vector3(0.0f, 1.0f, 0.0f), -p_facing);
+    if (p_downed) {
+        b = b * Basis(Vector3(0.0f, 0.0f, 1.0f), 84.0f * 3.14159265358979323846f / 180.0f);
+    }
+    return Transform3D(b, to3(p_x, p_y));
 }
 
 Node3D *make_vehicle_node(const std::string &type) {

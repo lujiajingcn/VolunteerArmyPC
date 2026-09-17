@@ -52,6 +52,14 @@ public:
         SCREEN_PLAY = 2,
     };
 
+    // 小队名册的格数 = 玩家 + ROSTER 里的 10 人。
+    // 【为什么放 public】hud.cpp 的匿名命名空间里有一张同长度的 id 表
+    // （kRosterIds），两边靠 static_assert 互锁。放在 private 里时
+    // 那张表连长度都申请不下来（C2248），只能各写一个字面量 11 ——
+    // 而"同一个数字写两遍"正是日后加人时漏改一处的来源。
+    // 现在任一处不同步都是**编译期**报错，不是运行期看走眼。
+    static constexpr int kRosterMax = 11;
+
     Hud();
     ~Hud() override;
 
@@ -141,13 +149,16 @@ private:
     void tx_r(const godot::String &t, float rx, float baseline, int size, const godot::Color &c);
 
     // ======================================================== 界面外壳
-    godot::Ref<godot::Texture2D> load_tex(const char *p_res_path);
+    godot::Ref<godot::Texture2D> load_tex(const godot::String &p_res_path);
     // 按「cover」铺满：等比放大到刚好盖住视口，多出来的居中裁掉。
     // 不能用拉伸 —— 素材是 16:9、视口也是 16:9，但窗口尺寸可被玩家改，
     // 一旦比例变了拉伸就会把人脸拉扁。
     void draw_art_bg(const godot::Ref<godot::Texture2D> &tex, float dim_center, float dim_edge);
     void draw_menu();             // 主菜单
     void draw_brief();            // 任务简报
+    // 小队名册：11 张人物胸像 + 姓名 / 职务 / 血条。
+    // 胸像由 tools/prep_char.py 从全身立绘里自动裁出，数据直读 va::W.units。
+    void draw_roster(float p_cx, float p_baseline);
     godot::Rect2 menu_item_rect(int i) const;
     int   menu_hit(const godot::Vector2 &p) const;
     void  menu_activate(int i);
@@ -157,6 +168,9 @@ private:
     godot::Ref<godot::Texture2D> art_chapter_;  // 区域态势（俯瞰公路）
     godot::Ref<godot::Texture2D> art_win_;      // 结算 · 成功
     godot::Ref<godot::Texture2D> art_lose_;     // 结算 · 失败
+    // 11 张队员胸像，下标与 hud.cpp 里的 kRosterIds 一一对应
+    // （长度取自 public 的 kRosterMax，见类首的说明）
+    godot::Ref<godot::Texture2D> art_port_[kRosterMax];
 
     Screen screen_ = SCREEN_PLAY;
     int    menu_sel_ = 0;         // 当前菜单项

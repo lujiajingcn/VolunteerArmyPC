@@ -16,6 +16,7 @@
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include "sim/va_world.h"
+#include "node/scene_builder.h"   // ally_art_key：名册胸像与三维模型共用同一套键
 
 using namespace godot;
 
@@ -1851,8 +1852,22 @@ void Hud::draw_end_panel() {
 // （"直接跑工程目录"时 res:// 就是盘上的工程目录），绕开整套导入系统。
 // 反过来，如果哪天有人用编辑器打开过工程把图导入了，ResourceLoader 那条路
 // 更快也更省内存，所以两条都试、谁成用谁。
-Ref<Texture2D> Hud::load_tex(const char *p_res_path) {
-    const String path = String::utf8(p_res_path);
+// 小队名册的显示顺序与对应的 Unit id。
+// 玩家排第一（他不在 ROSTER 里 —— 那是 va_config.cpp 的 PLAYER_DEF），
+// 其余 10 人按花名册原序。下标与 Hud::art_port_ 一一对应。
+constexpr int kRosterN = Hud::kRosterMax;
+static const char *const kRosterIds[kRosterN] = {
+    "player", "ajie", "laozhou", "xiaoxia", "daliu",
+    "alan", "shitou", "houzi", "laobai", "xiaoman", "tietou",
+};
+// 这张表与 Hud::art_port_ 是按**下标**配对的（负载时同一个下标、绘制时同一个下标），
+// 所以两边的长度必须严格相等，而且顺序改动也要同步。
+// 长度不等会在越界读胸像之前就先编译失败，比运行期看出"第 9 格是空的"早得多。
+static_assert(sizeof(kRosterIds) / sizeof(kRosterIds[0]) == (size_t)kRosterN,
+              "kRosterIds 长度必须等于 Hud::kRosterMax");
+
+Ref<Texture2D> Hud::load_tex(const String &p_res_path) {
+    const String &path = p_res_path;
     ResourceLoader *rl = ResourceLoader::get_singleton();
     // 先 exists 再 load：直接 load 一个没导入过的路径，引擎会往 stderr
     // 打一行 "No loader found for resource"。五张图就是五行假 ERROR ——
@@ -1874,11 +1889,21 @@ void Hud::load_art() {
     art_chapter_ = load_tex("res://assets/art/art_chapter.png");
     art_win_     = load_tex("res://assets/art/art_end_win.png");
     art_lose_    = load_tex("res://assets/art/art_end_lose.png");
+
+    // 队员胸像。路径由 ally_art_key() 导出 —— 与三维角色模型用的是**同一套键**，
+    // 所以以后加一个角色只有一处映射要改，不会出现"模型换了、胸像还是旧的"。
+    int n_ok = 0;
+    for (int i = 0; i < kRosterN; ++i) {
+        art_port_[i] = load_tex(String("res://assets/art/char/portrait/") +
+                                String::utf8(ally_art_key(kRosterIds[i]).c_str()) + ".png");
+        if (art_port_[i].is_valid()) ++n_ok;
+    }
     UtilityFunctions::print("[ui] 任务素材 menu=", art_menu_.is_valid(),
                             " brief=", art_brief_.is_valid(),
                             " chapter=", art_chapter_.is_valid(),
                             " win=", art_win_.is_valid(),
-                            " lose=", art_lose_.is_valid());
+                            " lose=", art_lose_.is_valid(),
+                            " 胸像=", n_ok, "/", kRosterN);
 }
 
 // 按「cover」铺满 + 横向渐变压暗。
@@ -1984,6 +2009,108 @@ void Hud::draw_menu() {
 }
 
 // ---------------------------------------------------------------- 任务简报
+/* 小队名册：11 格「胸像 + 姓名 / 职务 + 血条」。
+ *
+ * 【为什么是一横条而不是列表】简报的上半部分已经被态势图（左栏）与
+ * 元信息 + 目标清单（右栏）占满：右栏到 y≈524 就结束了，而底部提示从 990 起 ——
+ * 中间是一条约 285px 高的**整宽空带**。横向排开 11 格正好落在这条带里；
+ * 而且"一队人一字排开"本来就是军事简报的通用语汇，不需要发明新布局。
+ *
+ * 【p_cx 是整条的中轴，不是左边缘】第一版传的是左边距 x0(=150)，
+ * 结果右边空出 253px、左边只有 150px，一眼就看出偏。改成按视口中轴对齐之后，
+ * 和顶栏那条分隔线（同样关于视口中轴对称）落在同一根轴上。
+ * 不用左栏的 x0 也不右栏的 rx —— 那两栏是"分栏内容"的边界，不是页面的轴。
+ *
+ * 【竖直位置是怎么定出来的】把三处边界算出来再居中，不靠贴图试：
+ *   · 上方边界 = 区域态势图说明第二行的基线 582.75（第一版摆 590，
+ *     和它只差 7px，两行字直接叠在一起 —— 截图上"小队名册"压在
+ *     "……河谷上的桥是敌退路，可炸。"上）；
+ *   · 下方边界 = 底部渐浓衬底的起点 880（那之上 alpha 还是 0，压不到也不显边）；
+ *   · 名册自身高度 = 标题 15 + 28 + 胸像 153 + 姓名 20 + 职务 18 + 血条 3 ≈ 235。
+ * 于是居中解出基线 626，实测块占 611~861，上下各留 23 / 19px。
+ *
+ * 【为什么状态读 va::W.units，而姓名/职务读编制表】编制表（va::ROSTER）是静态的，
+ * 而简报可能在打完一局之后再次打开（结算 → Esc 回主菜单 → 任务简报），
+ * 那时名单上该显示的是**这一局的实际伤亡**。所以：身份取编制表，状态取战局。
+ */
+void Hud::draw_roster(float p_cx, float p_baseline) {
+    const float tw = 122.0f * s_;                 // 格子宽
+    const float gap = 30.0f * s_;
+    const float ph = tw * 332.0f / 256.0f;        // 胸像高（源图固定 256x332）
+    const float strip_w = kRosterN * tw + (kRosterN - 1) * gap;
+    const float p_x = p_cx - strip_w * 0.5f;
+    const float p_y = p_baseline;
+
+    tx(String::utf8("小 队 名 册"), p_x, p_y, 17, c_text());
+    tx_r(String::utf8("编制 11 人 · 1组 / 2组 / 支援组"), p_x + strip_w, p_y, 12, c_shell_dim());
+
+    const float y = p_y + 28.0f * s_;
+    for (int i = 0; i < kRosterN; ++i) {
+        const float x = p_x + i * (tw + gap);
+
+        // ---- 身份：编制表 ----
+        const bool is_player = (i == 0);
+        std::string nm_s = "你（队长）";
+        std::string role_s = "队长";
+        if (!is_player) {
+            const va::RosterDef *d = va::roster_of(kRosterIds[i]);
+            if (d != nullptr) { nm_s = d->name; role_s = d->role; }
+        }
+
+        // ---- 状态：战局 ----
+        const va::Unit *u = nullptr;
+        for (const auto &cand : va::W.units) {
+            if (cand.team == va::Team::Ally && cand.id == kRosterIds[i]) { u = &cand; break; }
+        }
+        const bool dead = (u != nullptr && u->dead);
+        const bool down = (u != nullptr && u->downed && !u->dead);
+
+        // ---- 胸像 ----
+        const Rect2 pr(x, y, tw, ph);
+        const Ref<Texture2D> &tex = art_port_[i];
+        if (tex.is_valid()) {
+            draw_texture_rect(tex, pr, false, Color(1.0f, 1.0f, 1.0f, dead ? 0.32f : 1.0f));
+        } else {
+            draw_rect(pr, Color(0.06f, 0.08f, 0.10f, 0.90f), true);
+        }
+        // 压暗一层。胸像上半是亮天空、下半是近黑剪影，不压的话姓名与状态
+        // 在深色胸像上会读不出来 —— 和右栏衬底是同一个理由。
+        draw_rect(pr, Color(0.010f, 0.014f, 0.020f, dead ? 0.60f : 0.20f), true);
+
+        // ---- 边框：玩家用琥珀、阵亡用暗红、其余冷白细描边 ----
+        const Color fc = dead ? Color(0.62f, 0.16f, 0.14f, 0.85f)
+                              : (is_player ? c_amber() : Color(0.86f, 0.90f, 0.94f, 0.34f));
+        const PackedVector2Array fp = chamfer(pr.grow(1.0f), 9.0f * s_);
+        for (int k = 0; k < 8; ++k) {
+            draw_line(fp[k], fp[(k + 1) % 8], fc, (is_player ? 1.8f : 1.1f) * s_, true);
+        }
+
+        // ---- 姓名 ----
+        tx_c(String::utf8(nm_s.c_str()), x + tw * 0.5f, y + ph + 20.0f * s_, 16,
+             dead ? Color(0.72f, 0.74f, 0.76f, 0.55f) : c_text());
+
+        // ---- 职务 / 状态。字幕位置固定，避免不同长度文本让整排高低不齐 ----
+        String sub = String::utf8(role_s.c_str());
+        Color sc = c_shell_dim();
+        if (dead)      { sub = String::utf8("阵亡"); sc = Color(0.88f, 0.34f, 0.30f, 0.95f); }
+        else if (down) { sub = String::utf8("待救"); sc = c_amber(); }
+        tx_c(sub, x + tw * 0.5f, y + ph + 38.0f * s_, 12, sc);
+
+        // ---- 血条：3px。只在"已知且活着"时画，未部署/阵亡不画假数据 ----
+        if (u != nullptr && !dead) {
+            const float bw = tw * 0.78f;
+            const float bx = x + (tw - bw) * 0.5f;
+            const float by = y + ph + 46.0f * s_;
+            const float t = std::max(0.0f, std::min(1.0f, u->hp / std::max(u->maxHp, 1.0f)));
+            const Color hc = (t > 0.60f) ? Color(0.44f, 0.78f, 0.38f, 0.92f)
+                                         : (t > 0.30f ? c_amber()
+                                                      : Color(0.88f, 0.28f, 0.22f, 0.95f));
+            draw_rect(Rect2(bx, by, bw, 3.0f * s_), Color(0.86f, 0.90f, 0.94f, 0.16f), true);
+            draw_rect(Rect2(bx, by, bw * t, 3.0f * s_), hc, true);
+        }
+    }
+}
+
 void Hud::draw_brief() {
     draw_art_bg(art_brief_, 0.95f, 0.44f);
 
@@ -2099,6 +2226,9 @@ void Hud::draw_brief() {
         }
         y += 27.0f * s_;
     }
+
+    // ---- 下部：小队名册（填满左右两栏之下的整宽空带，关于视口中轴对称）----
+    draw_roster(vp_.x * 0.5f, 626.0f * s_);
 
     // ---- 底部：开始 / 返回 ----
     const float pulse = 0.70f + 0.30f * std::sin(brief_t_ * 3.6f);
