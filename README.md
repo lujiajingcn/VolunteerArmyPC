@@ -64,10 +64,17 @@ VolunteerArmyPC/
 │   ├── node/                 桥接层：唯一接触引擎的部分
 │   │   ├── world_sim.*           Node3D 主体：输入 → step_once → 同步场景节点
 │   │   ├── scene_builder.*       程序化建场景：地形、天空、光照、大气、掩体、士兵、载具
+│   │   ├── hud.*                 全套 COD 风格 HUD + 界面外壳（主菜单 / 简报 / 结算），全手绘
 │   │   └── viewmodel.*           第一人称武器视图模型（sway / 后坐 / 呼吸 / 开镜 / 换弹）
 │   └── register_types.cpp
+├── assets/art/               美术素材
+│   ├── art_*.png                 任务素材（主菜单 / 简报 / 区域态势 / 结算两张）
+│   └── char/                     角色素材（见「角色形象」一节）
+│       ├── char_<键>.png             清理版全身立绘（图生3D 与胸像裁切的输入）
+│       ├── portrait/char_<键>.png    256×332 胸像（简报名册用）
+│       └── model/char_<键>.glb       三维模型（运行时 GLTFDocument 载入）
 ├── scenes/Main.tscn          主场景（Node3D "Main" + WorldSim）
-├── tools/                    开发工具（截图取证 / PNG 分析 / 环境搭建）
+├── tools/                    开发工具（截图取证 / PNG 分析 / 素材预处理 / 3D 生成）
 ├── docs/                     README 配图
 ├── ext/godot-cpp/            submodule：C++ 绑定，固定在 godot-4.5-stable
 ├── sdk/godot/                本地 Godot 编辑器（**不入库**，需自行放置）
@@ -171,6 +178,13 @@ sdk\godot\Godot_v4.5-stable_win64.exe --path .
 | `VA_FOV` | 世界相机视场角（默认 65，垂直） |
 | `VA_ADS` | 强制进入开镜状态（截图取证用） |
 | `VA_CAPTURE` / `VA_CAPTURE_DIR` | 到指定战局秒数自动截图，全部拍完自动退出 |
+| `VA_SCREEN` | 指定初始屏 `menu` / `brief` / `play`（优先级高于"取证模式自动跳过前奏"，否则新屏永远拍不到） |
+| `VA_SKIP_MENU` | 跳过主菜单直接开打 |
+| `VA_END` | 把战局按指定结局收尾 `win` / `lose`（给结算面板取证，不必真跑满一局） |
+| `VA_UNIT_SHOW` | **角色模型检阅台**：`1`/`row` 陈列排、`one:<键>[:<度>]` 近景单体（见下） |
+| `VA_MODEL_YAW` | 覆盖三维模型的朝向校正角（默认 90°），现场调朝向用 |
+| `VA_HIDE_HUD` `VA_HIDE_PROPS` `VA_HIDE_UNITS` `VA_HIDE_VEH` | 分层消融：判定"画面上这块到底属于谁"（**归属问题一律用消融答，不用眼睛答**） |
+| `VA_NO_AO` / `VA_NO_SHADOW` | 关掉环境光遮蔽 / 阴影，量化各层对画面的贡献 |
 | `VA_TONEMAP` | 色调映射：`aces`（默认）/ `agx` / `filmic` / `reinhardt` |
 | `VA_EXPOSURE` `VA_SUN` `VA_FILL` `VA_BOUNCE` `VA_AMBIENT` `VA_FOG` `VA_LUT` | 曝光 / 主光 / 补光 / 弹光 / 环景光 / 雾 / 色调分级 LUT 的倍率（默认 1.0 = 完全按天气配方） |
 | `VA_VMK` `VA_VMF` | 枪模关键灯 / 侧补光的能量倍率 |
@@ -184,19 +198,66 @@ sdk\godot\Godot_v4.5-stable_win64.exe --path .
 VA_SEED=3 sdk/godot/Godot_v4.5-stable_win64.exe --path .
 ```
 
+## 角色形象（立绘 → 胸像 → 三维模型）
+
+11 个角色：我方 8 种职务 + 敌方 3 种。键名（`char_*`）在**三维模型文件名、
+胸像纹理名、代码里的映射表**三处是同一个，只有一处真值（`scene_builder.cpp`
+的 `all_art_keys()` / `ally_art_key()` / `enemy_art_key()`）。
+
+| 任务简报 · 小队名册 | 三维模型近景（正面） | 三维模型近景（侧面） |
+|---|---|---|
+| ![名册](docs/char_roster.png) | ![正面](docs/char_model.png) | ![侧面](docs/char_model_side.png) |
+
+近景两张同时说明了三件事：模型**朝向**标定正确（正面能看到胸挂 / 水壶 / 双脚正对镜头，
+侧面是干净的侧影）、**比例**为 1.68 m、**脚底**踩在地面上（靴底与草地相交，
+脚下还留了一段地面）。
+
+```bash
+# 1) 立绘去水印 + 规范命名 + 自动裁 256×332 胸像
+python tools/prep_char.py
+python tools/montage_char.py          # 拼联络表 —— 并排才看得出切歪
+
+# 2) 图生3D（先只做 1 个，近景确认朝向，再批量 —— 顺序错了整批返工）
+python tools/gen3d_batch.py                     # 会跳过已有成品，中断后可直接续跑
+#    产物 42.78MB → 瘦身到 1.56MB（网格 5 万面不动，只降内嵌 4K 贴图 → 512²）
+python tools/gen3d_batch.py --force char_mg     # 指定重做某一个
+```
+
+**检阅台**（`VA_UNIT_SHOW`）是模型接进去之后唯一能回答"朝向 / 比例 / 脚底落地 /
+倒地姿态"的通道 —— 战场截图里单位只有几十像素高，答不了这四件事。
+它与战场共用同一套建节点与姿态代码，所以看到的**就是**战场上那个模型：
+
+```bash
+# 陈列排：11 格等距两排 + 一个倒地姿态，看整体齐备度与彼此差异
+VA_UNIT_SHOW=1 VA_CAPTURE=1 VA_CAPTURE_DIR=res://sweep/show \
+  sdk/godot/Godot_v4.5-stable_win64_console.exe --path .
+
+# 近景单体：正/侧/背三张对照即可钉死朝向标定
+VA_UNIT_SHOW=one:char_rifleman       VA_CAPTURE=1 ...   # 正面
+VA_UNIT_SHOW=one:char_rifleman:90    VA_CAPTURE=1 ...   # 侧面
+VA_UNIT_SHOW=one:char_rifleman:180   VA_CAPTURE=1 ...   # 背面
+```
+
+判朝向用**身体**（胸挂 / 背囊 / 脚），不要用脸 —— 面部姿态常常是烧进网格的
+（立绘里头只占很小一块，生成器会把微侧 / 低头一起烘进去）。
+
 ## 开发工具
 
-`tools/` 下的脚本都是零依赖的纯 Python（不依赖 PIL / numpy，自己实现 PNG 编解码）：
+`tools/` 下的脚本基本都是零依赖的纯 Python（不依赖 PIL / numpy，自己实现 PNG 编解码）：
 
 | 脚本 | 用途 |
 |---|---|
-| `capture.sh` | 无人值守截图取证：设好 `VA_CAPTURE` 后启动引擎，到点存图并自动退出 |
+| `capture.sh` / `capture_ui.sh` | 无人值守截图取证：设好 `VA_CAPTURE` 后启动引擎，到点存图并自动退出。`capture_ui.sh` 走五屏（菜单 / 简报 / 结算胜负 / 战斗） |
 | `probe_png.py` | 客观量测画面：分区域报平均 RGB、亮度、饱和度、过曝率（判断"画面发灰"必须靠数据，不能靠肉眼） |
 | `crop_png.py` | 裁剪 + 整数放大 + 叠加 NDC 网格，让"某物在屏幕的哪一行哪一列"直接读成数字 |
 | `vm_eval.py` | 按颜色掩码提取枪模各部件像素，统计亮度分布（死黑 / 正常 / 过曝占比） |
 | `diff_png.py` | 两图逐像素求差，定位某个物体实际占据的屏幕区域 |
+| `period_probe.py` | 去趋势 + 自相关，判定画面里的规律条纹（**肉眼看不出合成出来的周期条纹**） |
+| `prep_art.py` / `prep_char.py` | 任务素材 / 角色立绘预处理：去半透明水印、规范命名、自动裁胸像 |
+| `montage_char.py` | 把 11 张胸像拼成联络表（**并排才看得出切歪**） |
+| `gen3d.py` / `gen3d_batch.py` | 图生3D 单张 / 批量编排（绕命令行长度上限、按服务端并发配额限流、断点续跑） |
+| `slim_glb.py` | GLB 瘦身：只替换内嵌贴图的 bufferView，不动网格（**仅这一步需要 Pillow**） |
 | `downscale_png.py` | 盒式降采样，生成 README 配图 |
-| `setup_env.py` | 环境搭建辅助 |
 | `patch_*.py` | 开发过程中的一次性补丁脚本（已全部应用完毕，保留仅作历史记录，**不要重复执行**） |
 
 ## 当前进度
@@ -208,16 +269,21 @@ VA_SEED=3 sdk/godot/Godot_v4.5-stable_win64.exe --path .
 - 光照与大气：三套天气配方、ACES 色调映射、三点布光 + 环景光 + SSAO/SSIL、体积雾、色调分级 3D LUT
 - 掩体建模：岩石（低模不规则多面体）、树（高干 + 分枝 + 多球簇树冠）、灌木
 - 第一人称武器视图模型：投影反推标定姿态、五盏独立打光、导轨齿/散热孔/抛壳口等分件、红点瞄具、换弹动画
-- 可复现取证链路：固定种子 + 定时截图 + 客观像素量测
+- **界面外壳**：主菜单 / 任务简报（区域态势图 + 任务目标 + **小队名册 11 格胸像**）/ 结算面板，全部手绘
+- **战斗 HUD**：罗盘、雷达、任务目标横幅、警报、击杀回执、小队状态板、弹药与装备、指挥链路、无线电字幕、动态准星、命中标记、受击方位弧、击杀飘字、倒地倒计时、受伤暗角
+- **角色形象**：11 个角色的立绘 + 256×332 胸像 + 三维模型（42.78MB → 1.56MB 瘦身），
+  按美术键在运行时载入，载入失败自动回退到程序化图元（少一个模型文件不该少一个人）
+- 可复现取证链路：固定种子 + 定时截图 + 客观像素量测 + 分层消融 + 角色模型检阅台
 
 **待办**
 
-- 士兵与载具模型精致化（目前仍是块状体，是战场画面的主体）
+- **补齐其余 10 个角色的三维模型**（链路已跑通、朝向已标定；生成服务对 3D 维度
+  只放 2 个并发槽位，被外部占满时会返回 429，稍后重跑 `tools/gen3d_batch.py` 即可，会自动续跑）
+- 载具模型精致化（目前仍是块状体）
 - 特效层：曳光弹、爆炸、弹壳抛出、烟尘
-- 完整 HUD：任务提示、雷达、小队状态、弹药、字幕、受伤反馈（目前仅 4 个基础 Label）
 - 音频层（网页版有 62 个程序化音效 id，PC 版尚未接入）
 - 语音指挥：计划走 **SAPI 识别 + TTS 回话 + 面板兜底**
-- 玩法平衡调整
+- 玩法平衡调整（10 种子扫描胜率 4/10，车顶机枪占我方伤亡 33%–59%）
 
 ## 许可
 
