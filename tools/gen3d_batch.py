@@ -67,16 +67,34 @@ LOG_LOCK = threading.Lock()
 SUBMIT_TRIES = 12
 SUBMIT_WAIT_CAP = 30        # 退避上限（秒）：token 只有 ~20 分钟寿命，等太久等于白等
 
+# 429 有**两种含义完全不同**的 429，必须分开对待 —— 这是本轮花掉 10 分钟才看出来的：
+#   "concurrent slot limit exceeded (2) for dimension hy-3d"  → 并发槽位被占，**可等**，槽位会空出来
+#   "daily submit limit exceeded (5/5) for dimension hy-3d"   → **当日提交配额用尽**，
+#                                                              同一个 token / 同一天内重试多少次都是白等
+# 第一版把两者都当"可等"，于是日配额用尽之后仍然老老实实重试 12 次 × 最多 30s，
+# 而且每次都打印"槽位已满"——把真正的结论（今天做不了了）盖在噪音底下。
+RETRYABLE_KEYS = ("slot limit", "concurrency")
+FATAL_KEYS = ("daily submit limit", "quota", "daily limit")
 
-def _retryable(body):
+
+def _classify(body):
+    """把一次提交失败分成 'retry'(可等) / 'fatal'(今天别再试) / 'other'(不可重试)。"""
     b = body.lower()
-    return ("429" in b) or ("slot limit" in b) or ("concurrency" in b)
+    if any(k in b for k in FATAL_KEYS):
+        return "fatal"
+    if any(k in b for k in RETRYABLE_KEYS):
+        return "retry"
+    return "other"
 
 
 def log(*a):
     with LOG_LOCK:
         print(*a)
         sys.stdout.flush()
+
+
+class QuotaExhausted(Exception):
+    """当日提交配额用尽。**整批必须立刻停**，不是这一个键失败。"""
 
 
 def run_one(key, token, force):
@@ -140,7 +158,15 @@ def run_one(key, token, force):
             except Exception:
                 pass
             body = body or (p.stderr or "") + (p.stdout or "")
-            if not _retryable(body):
+            kind = _classify(body)
+            if kind == "fatal":
+                # 当日配额用尽：**继续重试是纯粹浪费时间**，而且会把真正的结论
+                # （"今天做不了了"）盖在"槽位已满"的噪音底下。直接终止整个批次 ——
+                # 剩下的键今天也不会有结果，让脚本立刻以明确的结论退出，
+                # 而不是再花 10 分钟逐个报"失败"。
+                say("当日提交配额已用尽，终止整批：%s" % body.strip()[:200])
+                raise QuotaExhausted(body.strip()[:300])
+            if kind != "retry":
                 say("生成失败（不可重试）rc=%d：%s" % (p.returncode, body.strip()[:300]))
                 return False
             if attempt < SUBMIT_TRIES:
@@ -231,15 +257,25 @@ def main():
     lock = threading.Lock()
     todo = list(keys)
     fail = []
+    quota = []          # 一旦非空，说明当日配额用尽，整批停
 
     def worker():
         while True:
             with lock:
-                if not todo:
+                if not todo or quota:
                     return
                 k = todo.pop(0)
             try:
                 ok = run_one(k, token, force)
+            except QuotaExhausted as e:
+                # 整批停：把剩下的任务全部记为未完成，各线程看 quota 非空就会退出。
+                # 这里不把 quota 当作"异常"往上抛 —— 它是**一个明确的业务结论**，
+                # 不是脚本坏了，所以走正常收尾路径把话说清楚。
+                with lock:
+                    quota.append(str(e))
+                    fail.extend(todo)
+                    todo.clear()
+                return
             except Exception as e:      # 任何意外都不该带走整个批次
                 log("[%s] 异常 %r" % (k, e))
                 ok = False
@@ -252,6 +288,12 @@ def main():
         t.start()
     for t in ths:
         t.join()
+
+    if quota:
+        log("")
+        log("=== 结论：当日图生3D 提交配额已用尽，剩余 %d 个今天做不了 ===" % len(fail))
+        log("=== 原文：%s" % quota[0])
+        log("=== 明天直接重跑本脚本即可，已完成的会自动跳过 ===")
 
     have = [k for k in keys if os.path.exists(os.path.join(MODEL_DIR, k + ".glb"))]
     log("")
