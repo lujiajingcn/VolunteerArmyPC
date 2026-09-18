@@ -17,17 +17,19 @@
 **不是** `assets/art/char/raw/` 里的原始立绘 —— 原始图上有半透明水印，
 图生3D 会把它当成服装上的图案烘进贴图，而建好的模型不会再走一遍去水印，错就错到底了。
 
-【两个后端，靠 VA_GEN3D_BACKEND 切换】
+【三个后端，靠 VA_GEN3D_BACKEND 切换】
     builtin（默认）: tools/gen3d.py     → 内置多模态通道，**限 5 次提交/天且当天不重置**
-    tc            : tools/gen3d_tc.py  → 腾讯云混元生3D 官方 API 直连，无每日提交限制
-                    （同一个模型，参数对齐 Model 3.1 / Normal / EnablePBR / FaceCount 50000）
-    两个后端的**结果 JSON 格式相同**，所以下面的下载 / 瘦身 / 续跑逻辑完全共用。
-    走 tc 时不需要 stdin 的 token，凭据由 gen3d_tc.py 自己从环境变量或
-    ~/.workbuddy/tencentcloud.json 读；并发可以按官方的 3 来（builtin 只有 2）。
+    tc            : tools/gen3d_tc.py  → 腾讯云混元生3D 官方 API 直连（CAM 签名，要 SecretId/SecretKey）
+    hy            : tools/gen3d_hy.py  → 混元生3D（TokenHub），**只要一把 sk- 开头的 API Key**（Bearer），
+                                        默认 3 并发、无每日提交限制 —— 目前门槛最低的一条路
+    三者**结果 JSON 格式相同**，所以下面的下载 / 瘦身 / 续跑逻辑完全共用。
+    tc / hy 都不需要 stdin 的 token（凭据由各自脚本读环境变量或 ~/.workbuddy/ 下的文件）；
+    并发可以按官方的 3 来（builtin 只有 2）。
 
 用法：
     echo -n "<token>" | python tools/gen3d_batch.py [--jobs 4] [键 ...]      # builtin
     python tools/gen3d_batch.py --jobs 3 [键 ...]                            # VA_GEN3D_BACKEND=tc
+    python tools/gen3d_batch.py --jobs 3 [键 ...]                            # VA_GEN3D_BACKEND=hy
 
     不给键就做全部 11 个；已存在 <键>.glb 且非空的**默认跳过**（--force 覆盖），
     所以中断之后直接再跑一次就是"接着做没做完的"。
@@ -77,11 +79,12 @@ GEN_ARGS = ["--enable-pbr", "--generate-type", "Normal", "--face-count", str(FAC
 
 # ---- 后端选择 ----
 # builtin：内置多模态通道（gen3d.py），限 5 次提交/天，且**同一天内不重置**。
-# tc     ：腾讯云混元生3D 官方 API 直连（gen3d_tc.py），同一个模型、无每日提交限制，
-#          官方默认 3 并发、每秒 20 请求上限。凭据由 gen3d_tc.py 自己读，不走 stdin。
+# tc     ：腾讯云混元生3D 官方 API 直连（gen3d_tc.py），CAM 签名，要 SecretId/SecretKey。
+# hy     ：混元生3D（TokenHub，gen3d_hy.py），Bearer 认证，只要一把 sk- API Key，
+#          默认 3 并发、无每日提交限制。凭据由后端脚本自己读，不走 stdin。
 BACKEND = os.environ.get("VA_GEN3D_BACKEND", "builtin").strip().lower()
-if BACKEND not in ("builtin", "tc"):
-    raise SystemExit("VA_GEN3D_BACKEND 只能是 builtin 或 tc，当前为 %r" % BACKEND)
+if BACKEND not in ("builtin", "tc", "hy"):
+    raise SystemExit("VA_GEN3D_BACKEND 只能是 builtin / tc / hy，当前为 %r" % BACKEND)
 
 
 LOG_LOCK = threading.Lock()
@@ -116,11 +119,21 @@ MAX_TRIS_OK = 120000
 RETRYABLE_KEYS = (
     "slot limit", "concurrency",
     "requestlimitexceeded", "limitexceeded", "internalerror",
+    "ratelimit", "toomanyrequests", "servererror",
 )
+# 【为什么"超时"故意不列进可重试】提交是**非幂等**的：一个超时的提交可能已经在服务端
+# 排上了队。自动重试 = 同一个角色提交两次 = 双倍积分，而且两个模型只有一个能被采用。
+# 超时归到 other（不重试、如实报失败），由人决定要不要重跑 —— 这时才该去看
+# sweep/gen3d/<键>.json 里有没有已经拿到的任务 id（有就 query 补下载，别重新提交）。
 FATAL_KEYS = (
     "daily submit limit", "quota", "daily limit",
-    "insufficientbalance", "resourceinsufficient",
+    "insufficientbalance", "resourceinsufficient", "arrears",
     "authfailure", "secretidnotfound", "unauthorizedoperation",
+    "invalid_api_key", "incorrect api key", "unauthorized", "forbidden",
+    # TokenHub 的无效 Key 报的是 401002「The API Key does not exist or signature
+    # verification failed…」—— 既不含 invalid_api_key 也不含 unauthorized，
+    # 实测漏判过一次（于是坏 Key 会让每个键各自失败一遍而不是立刻停整批）。
+    "api key", "401002",
 )
 
 
@@ -221,6 +234,12 @@ def run_one(key, token, force):
             # 腾讯云直连不吃 stdin：凭据由 gen3d_tc.py 自己从环境变量或
             # ~/.workbuddy/tencentcloud.json 读（不落命令行、不进仓库）。
             cmd = [PY, os.path.join(ROOT, "tools", "gen3d_tc.py"), "submit",
+                   src, out_json, "--face-count", str(FACE_COUNT)]
+            stdin_text = None
+        elif BACKEND == "hy":
+            # TokenHub 同理：凭据由 gen3d_hy.py 读环境变量 TOKENHUB_API_KEY 或
+            # ~/.workbuddy/va_3d_api_key.txt。面数走同一个 FACE_COUNT 真值来源。
+            cmd = [PY, os.path.join(ROOT, "tools", "gen3d_hy.py"), "submit",
                    src, out_json, "--face-count", str(FACE_COUNT)]
             stdin_text = None
         else:
@@ -347,7 +366,7 @@ def main():
         else:
             keys.append(argv[i]); i += 1
 
-    # tc 后端凭据由 gen3d_tc.py 自己读，不吃 stdin（所以这里不检查、也不阻塞等待）。
+    # tc / hy 后端的凭据由各自脚本自己读，不吃 stdin（所以这里不检查、也不阻塞等待）。
     token = ""
     if BACKEND == "builtin":
         token = sys.stdin.readline().strip()
@@ -405,12 +424,13 @@ def main():
         log("")
         log("=== 结论：提交无法继续（配额 / 凭据 / 余额），剩余 %d 个没做成 ===" % len(fail))
         log("=== 原文：%s" % quota[0])
-        if BACKEND == "tc":
-            log("=== 提示：tc 后端没有每日提交上限；若是余额或凭据问题，"
-                "处理后在控制台确认即可重跑（已完成的会自动跳过）===")
+        if BACKEND in ("tc", "hy"):
+            log("=== 提示：%s 后端没有每日提交上限；若是余额或凭据问题，"
+                "处理后在控制台确认即可重跑（已完成的会自动跳过）===" % BACKEND)
         else:
             log("=== 提示：内置通道按天限 5 次提交且当天不重置，明天直接重跑本脚本即可 ===")
-        log("=== 也可以换后端：VA_GEN3D_BACKEND=tc 走腾讯云官方 API（无每日提交限制）===")
+        log("=== 也可以换后端：VA_GEN3D_BACKEND=hy（TokenHub，一把 sk- Key 即可）"
+            " 或 tc（CAM 签名，要 SecretId/SecretKey）===")
 
     have = [k for k in keys if os.path.exists(os.path.join(MODEL_DIR, k + ".glb"))]
     log("")
