@@ -54,3 +54,7 @@ run_ui_*.log.*
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# --- Python 字节码缓存（tools/ 下的纯 Python 工具跑一次就会生成）---
+__pycache__/
+*.pyc

@@ -17,8 +17,17 @@
 **不是** `assets/art/char/raw/` 里的原始立绘 —— 原始图上有半透明水印，
 图生3D 会把它当成服装上的图案烘进贴图，而建好的模型不会再走一遍去水印，错就错到底了。
 
+【两个后端，靠 VA_GEN3D_BACKEND 切换】
+    builtin（默认）: tools/gen3d.py     → 内置多模态通道，**限 5 次提交/天且当天不重置**
+    tc            : tools/gen3d_tc.py  → 腾讯云混元生3D 官方 API 直连，无每日提交限制
+                    （同一个模型，参数对齐 Model 3.1 / Normal / EnablePBR / FaceCount 50000）
+    两个后端的**结果 JSON 格式相同**，所以下面的下载 / 瘦身 / 续跑逻辑完全共用。
+    走 tc 时不需要 stdin 的 token，凭据由 gen3d_tc.py 自己从环境变量或
+    ~/.workbuddy/tencentcloud.json 读；并发可以按官方的 3 来（builtin 只有 2）。
+
 用法：
-    echo -n "<token>" | python tools/gen3d_batch.py [--jobs 4] [键 ...]
+    echo -n "<token>" | python tools/gen3d_batch.py [--jobs 4] [键 ...]      # builtin
+    python tools/gen3d_batch.py --jobs 3 [键 ...]                            # VA_GEN3D_BACKEND=tc
 
     不给键就做全部 11 个；已存在 <键>.glb 且非空的**默认跳过**（--force 覆盖），
     所以中断之后直接再跑一次就是"接着做没做完的"。
@@ -61,7 +70,18 @@ KEYS = [
 # 所以「积分对不上」其实是面数档位不一致的先兆，不只是计价差异。
 # 教训：这里原本写着"与试接那次完全一致"，但试接显式带了 50000 ——
 # **"参数一致"必须以双方的实际请求体为准，不能凭记忆断言**。
-GEN_ARGS = ["--enable-pbr", "--generate-type", "Normal", "--face-count", "50000"]
+# 面数只在这一个地方写死 —— 内置后端的命令行参数与腾讯云后端的 --face-count
+# 都引用它（"同一个数字出现两遍就一定会漏改一处"）。
+FACE_COUNT = 50000
+GEN_ARGS = ["--enable-pbr", "--generate-type", "Normal", "--face-count", str(FACE_COUNT)]
+
+# ---- 后端选择 ----
+# builtin：内置多模态通道（gen3d.py），限 5 次提交/天，且**同一天内不重置**。
+# tc     ：腾讯云混元生3D 官方 API 直连（gen3d_tc.py），同一个模型、无每日提交限制，
+#          官方默认 3 并发、每秒 20 请求上限。凭据由 gen3d_tc.py 自己读，不走 stdin。
+BACKEND = os.environ.get("VA_GEN3D_BACKEND", "builtin").strip().lower()
+if BACKEND not in ("builtin", "tc"):
+    raise SystemExit("VA_GEN3D_BACKEND 只能是 builtin 或 tc，当前为 %r" % BACKEND)
 
 
 LOG_LOCK = threading.Lock()
@@ -89,8 +109,19 @@ MAX_TRIS_OK = 120000
 #                                                              同一个 token / 同一天内重试多少次都是白等
 # 第一版把两者都当"可等"，于是日配额用尽之后仍然老老实实重试 12 次 × 最多 30s，
 # 而且每次都打印"槽位已满"——把真正的结论（今天做不了了）盖在噪音底下。
-RETRYABLE_KEYS = ("slot limit", "concurrency")
-FATAL_KEYS = ("daily submit limit", "quota", "daily limit")
+# 两个后端的失败语义都在这一处归类（先判 fatal，再判 retry）：
+#   内置通道： concurrent slot limit（可等） / daily submit limit（当日终止）
+#   腾讯云官方：RequestLimitExceeded、LimitExceeded、InternalError（可等）
+#               InsufficientBalance、AuthFailure.*、UnauthorizedOperation（重试无意义）
+RETRYABLE_KEYS = (
+    "slot limit", "concurrency",
+    "requestlimitexceeded", "limitexceeded", "internalerror",
+)
+FATAL_KEYS = (
+    "daily submit limit", "quota", "daily limit",
+    "insufficientbalance", "resourceinsufficient",
+    "authfailure", "secretidnotfound", "unauthorizedoperation",
+)
 
 
 def _classify(body):
@@ -113,6 +144,27 @@ class QuotaExhausted(Exception):
     """当日提交配额用尽。**整批必须立刻停**，不是这一个键失败。"""
 
 
+def _probe_tris(glb):
+    """读一个 GLB 的三角面数；读不出来返回 None（视为"规格未知"）。
+
+    【为什么要把它接进续跑判据】2026-09-18 的一次真实事故：那批 50 万面的成品被移走后，
+    结果 JSON 与 raw 还在，于是脚本按"json 里 status==DONE"判定 char_leader 已完成，
+    **跳过提交、直接拿旧 URL 重新瘦身** —— 又把一个 15MB / 50 万面的模型放回了模型目录。
+    只判"任务成功"是不够的：产物规格也是完成度的一部分。
+    """
+    if not os.path.isfile(VENV_PY) or not os.path.isfile(glb):
+        return None
+    try:
+        p = subprocess.run(
+            [VENV_PY, os.path.join(ROOT, "tools", "slim_glb.py"), "probe", glb],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=ROOT,
+        )
+        m = re.search(r"三角面\s*(\d+)", p.stdout or "")
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
 def run_one(key, token, force):
     tag = key
 
@@ -124,8 +176,13 @@ def run_one(key, token, force):
     dst_glb = os.path.join(MODEL_DIR, key + ".glb")
 
     if not force and os.path.exists(dst_glb) and os.path.getsize(dst_glb) > 0:
-        say("已有成品 %.2f MB，跳过" % (os.path.getsize(dst_glb) / 2 ** 20))
-        return True
+        tris = _probe_tris(dst_glb)
+        if tris is None or tris <= MAX_TRIS_OK:
+            say("已有成品 %.2f MB%s，跳过"
+                % (os.path.getsize(dst_glb) / 2 ** 20,
+                   "" if tris is None else "（%d 面）" % tris))
+            return True
+        say("已有成品但规格不对（%d 面 > %d），重做" % (tris, MAX_TRIS_OK))
 
     src = os.path.join(SRC_DIR, key + ".png")
     if not os.path.isfile(src):
@@ -144,19 +201,34 @@ def run_one(key, token, force):
             done_json = (j.get("status") or j.get("raw_result", {}).get("Status")) == "DONE"
         except Exception:
             done_json = False
+        # 光"任务成功"不算完成：成品必须在、且规格正确。
+        # 否则一份旧 JSON（比如规格错的那批）会让后续每一次续跑都"跳过提交、
+        # 拿旧结果重新瘦身"，把错误规格一次次复活。见 _probe_tris 的注释。
+        if done_json:
+            tris = _probe_tris(dst_glb) if os.path.exists(dst_glb) else None
+            if tris is None or tris > MAX_TRIS_OK:
+                done_json = False
 
-    # ---- 1. 提交并轮询（gen3d.py 负责绕开命令行长度上限）----
+    # ---- 1. 提交并轮询（交给各自的后端脚本；两者都改用进程内 argv 绕开命令行长度上限）----
     if not done_json:
         t0 = time.time()
-        say("提交中（输入 %.2f MB）…" % (os.path.getsize(src) / 2 ** 20))
+        say("提交中（输入 %.2f MB，后端 %s）…" % (os.path.getsize(src) / 2 ** 20, BACKEND))
         # PYTHONIOENCODING：子进程的 stdout 是管道，Python 会按系统区域（GBK）编码它，
         # 而父进程按 UTF-8 解 —— 不解这一下，日志里所有中文都是乱码，
         # 而"哪一步说了什么"正是这个脚本存在的意义。
         env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        if BACKEND == "tc":
+            # 腾讯云直连不吃 stdin：凭据由 gen3d_tc.py 自己从环境变量或
+            # ~/.workbuddy/tencentcloud.json 读（不落命令行、不进仓库）。
+            cmd = [PY, os.path.join(ROOT, "tools", "gen3d_tc.py"), "submit",
+                   src, out_json, "--face-count", str(FACE_COUNT)]
+            stdin_text = None
+        else:
+            cmd = [PY, os.path.join(ROOT, "tools", "gen3d.py"), src, out_json] + GEN_ARGS
+            stdin_text = token + "\n"
         for attempt in range(1, SUBMIT_TRIES + 1):
             p = subprocess.run(
-                [PY, os.path.join(ROOT, "tools", "gen3d.py"), src, out_json] + GEN_ARGS,
-                input=token + "\n", capture_output=True, text=True, encoding="utf-8",
+                cmd, input=stdin_text, capture_output=True, text=True, encoding="utf-8",
                 errors="replace", cwd=ROOT, env=env,
             )
             if p.returncode == 0:
@@ -168,29 +240,33 @@ def run_one(key, token, force):
             # 这是**可等**的：槽位会自己空出来。而"面数超限/图片过大"那种不可等，
             # 所以只对 429 / slot limit 这类关键词重试，其余立刻放弃并把原因打出来，
             # 免得把 11 个任务都拖成"重试 6 次 × 每次 1 分钟"却什么都没做。
-            body = ""
+            # 【为什么把两处输出拼起来而不是二选一】内置后端的错误体写在结果 JSON 里
+            # （它无论如何都会落盘）；tc 后端的错误只打在 stdout/stderr（失败时不写 JSON）。
+            # 只读一边，另一边后端的失败原因就会"看起来像空字符串"而被归成 other。
+            body = (p.stderr or "") + (p.stdout or "")
             try:
-                body = open(out_json, encoding="utf-8").read()
+                body += open(out_json, encoding="utf-8").read()
             except Exception:
                 pass
-            body = body or (p.stderr or "") + (p.stdout or "")
             kind = _classify(body)
             if kind == "fatal":
                 # 当日配额用尽：**继续重试是纯粹浪费时间**，而且会把真正的结论
                 # （"今天做不了了"）盖在"槽位已满"的噪音底下。直接终止整个批次 ——
                 # 剩下的键今天也不会有结果，让脚本立刻以明确的结论退出，
                 # 而不是再花 10 分钟逐个报"失败"。
-                say("当日提交配额已用尽，终止整批：%s" % body.strip()[:200])
+                say("不可恢复的提交失败（当日配额 / 凭据 / 余额），终止整批：%s"
+                    % body.strip()[:200])
                 raise QuotaExhausted(body.strip()[:300])
             if kind != "retry":
                 say("生成失败（不可重试）rc=%d：%s" % (p.returncode, body.strip()[:300]))
                 return False
             if attempt < SUBMIT_TRIES:
                 wait = min(SUBMIT_WAIT_CAP, 15 * attempt)
-                say("槽位已满，%ds 后重试（第 %d/%d 次）" % (wait, attempt, SUBMIT_TRIES))
+                say("提交被拒（可重试：并发槽位 / 限频），%ds 后重试（第 %d/%d 次）"
+                    % (wait, attempt, SUBMIT_TRIES))
                 time.sleep(wait)
             else:
-                say("槽位重试 %d 次仍失败：%s" % (SUBMIT_TRIES, body.strip()[:200]))
+                say("提交重试 %d 次仍失败：%s" % (SUBMIT_TRIES, body.strip()[:200]))
                 return False
         else:
             return False
@@ -243,22 +319,17 @@ def run_one(key, token, force):
         os.path.getsize(dst_glb) / 2 ** 20, os.path.getsize(raw_glb) / 2 ** 20))
 
     # ---- 5. 规格校验：面数是不是我们要的那一档 ----
-    # 【为什么值得单独查一次】`--face-count` 给了不等于服务端照做，而"面数不对"
-    # 在战场上完全看不出来（单位只有几十像素高），只有体积和帧率会说话 ——
+    # 【为什么值得单独查一次】"参数给了"不等于"服务端照做了"，而面数不对在战场上
+    # 完全看不出来（单位只有几十像素高），只有体积和帧率会说话 ——
     # 等到 11 个模型全接进场景才发现规格不齐，代价是重做一整天。
-    # 这里只报警不判失败：参数是固定的，报警意味着服务端行为变了，该由人来判断。
-    try:
-        pp = subprocess.run(
-            [VENV_PY, os.path.join(ROOT, "tools", "slim_glb.py"), "probe", dst_glb],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=ROOT,
-        )
-        m = re.search(r"三角面\s*(\d+)", pp.stdout or "")
-        if m:
-            tris = int(m.group(1))
-            say("三角面 %d%s" % (tris, "" if tris <= MAX_TRIS_OK else
-                                "  ← 警告：超过预期上限 %d，规格与已接入模型不一致" % MAX_TRIS_OK))
-    except Exception as e:
-        say("规格校验跳过：%r" % e)
+    # 这里只报警不判失败：参数是固定的，报警意味着服务端行为变了，该由人来判断；
+    # 而"续跑判据"那边（见 _probe_tris 与 done_json）会直接把不合格的成品重做。
+    tris = _probe_tris(dst_glb)
+    if tris is None:
+        say("规格校验跳过（读不出三角面数）")
+    else:
+        say("三角面 %d%s" % (tris, "" if tris <= MAX_TRIS_OK else
+                            "  ← 警告：超过预期上限 %d，规格与已接入模型不一致" % MAX_TRIS_OK))
     return True
 
 
@@ -276,17 +347,21 @@ def main():
         else:
             keys.append(argv[i]); i += 1
 
-    token = sys.stdin.readline().strip()
-    if not token:
-        print("stdin 没有拿到 token")
-        return 2
+    # tc 后端凭据由 gen3d_tc.py 自己读，不吃 stdin（所以这里不检查、也不阻塞等待）。
+    token = ""
+    if BACKEND == "builtin":
+        token = sys.stdin.readline().strip()
+        if not token:
+            print("stdin 没有拿到 token")
+            return 2
     if not keys:
         keys = list(KEYS)
 
     os.makedirs(WORK, exist_ok=True)
     os.makedirs(MODEL_DIR, exist_ok=True)
 
-    log("批次：%d 个角色，并发 %d%s" % (len(keys), jobs, "，强制重做" if force else ""))
+    log("批次：%d 个角色，并发 %d，后端 %s%s"
+        % (len(keys), jobs, BACKEND, "，强制重做" if force else ""))
 
     lock = threading.Lock()
     todo = list(keys)
@@ -307,6 +382,9 @@ def main():
                 # 不是脚本坏了，所以走正常收尾路径把话说清楚。
                 with lock:
                     quota.append(str(e))
+                    # 触发终止的那个键也要记进去：它在 pop 时就离开了 todo，
+                    # 只 extend(todo) 会把它漏掉，结论行就会少报一个。
+                    fail.append(k)
                     fail.extend(todo)
                     todo.clear()
                 return
@@ -325,9 +403,14 @@ def main():
 
     if quota:
         log("")
-        log("=== 结论：当日图生3D 提交配额已用尽，剩余 %d 个今天做不了 ===" % len(fail))
+        log("=== 结论：提交无法继续（配额 / 凭据 / 余额），剩余 %d 个没做成 ===" % len(fail))
         log("=== 原文：%s" % quota[0])
-        log("=== 明天直接重跑本脚本即可，已完成的会自动跳过 ===")
+        if BACKEND == "tc":
+            log("=== 提示：tc 后端没有每日提交上限；若是余额或凭据问题，"
+                "处理后在控制台确认即可重跑（已完成的会自动跳过）===")
+        else:
+            log("=== 提示：内置通道按天限 5 次提交且当天不重置，明天直接重跑本脚本即可 ===")
+        log("=== 也可以换后端：VA_GEN3D_BACKEND=tc 走腾讯云官方 API（无每日提交限制）===")
 
     have = [k for k in keys if os.path.exists(os.path.join(MODEL_DIR, k + ".glb"))]
     log("")
