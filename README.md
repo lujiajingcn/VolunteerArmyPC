@@ -115,6 +115,41 @@ sdk\godot\Godot_v4.5-stable_win64.exe --path .
 
 构建产物固定输出到 `bin/volunteer_army_pc.dll`，文件名由 `VolunteerArmyPC.gdextension` 引用，**不要改名**。
 
+### 导出可执行程序（Windows）
+
+```bash
+# 前置：本机要有 Godot 4.5 的导出模板（见下"模板从哪来"）
+sdk/godot/Godot_v4.5-stable_win64_console.exe --headless --path . \
+    --export-release "Windows Desktop" dist/VolunteerArmyPC.exe
+```
+
+产物是 `dist/` 下的**两个文件，一起拷走就能玩**：
+
+| 文件 | 说明 |
+|---|---|
+| `VolunteerArmyPC.exe` | 约 165 MB。导出模板（92 MB）+ 内嵌 pck（`binary_format/embed_pck=true`） |
+| `volunteer_army_pc.dll` | GDExtension 库。Godot **不会**把 dll 嵌进 exe，必须与 exe 同目录 |
+
+导出配置 `export_presets.cfg` 已入库，其中 `exclude_filter` 排掉了 `ext/`（godot-cpp 几万文件）、
+`sweep/`、`captures/`、`docs/`、`tools/`、`build/` —— 不排的话 pck 会被撑爆。
+
+**模板从哪来。** 导出模板不在仓库里（整包 **1294 MB**），而本机 GitHub release 资产
+（走 `objects.githubusercontent.com`）实测 45 秒零字节、完全不通。可用的做法是
+**只取需要的那一个条目**：ZIP 的中央目录在文件末尾，配合 HTTP Range 就能先读目录、
+再精确拉 `templates/windows_release_x86_64.exe` 的数据段（压缩 33.8 MB，占整包 2.6%），
+inflate 后放进 `%APPDATA%\Godot\export_templates\4.5.stable\`。
+
+```bash
+python tools/fetch_export_template.py --list   # 先看远端有什么
+python tools/fetch_export_template.py          # 下载并装 Windows Release 模板
+```
+
+三个坑都写进了脚本注释，这里只点最要紧的：**下载要交给 curl，别用 Python 的 urllib** ——
+同一偏移同一镜像，curl 稳定 206 + 精确字节数，urllib 会把整个 1.29 GB 吞进内存
+（进程涨到 1.7 GB 且永不返回）。另外加速站要**横向测速**：本机实测
+`gh.xxooo.cf` 2.5 MB/s、`gitproxy.mrhjx.cn` 1.8 MB/s，而 `ghproxy.net` 只有 88 KB/s、
+`gh-proxy.com` 干脆忽略 Range（任何分段请求都回 200 + 全量）。
+
 ### 离线跑逻辑层（`va_sweep`）
 
 CMake 里还有一个**不链接引擎**的目标 `va_sweep`：把 `src/sim/*` 直接编进一个控制台程序，

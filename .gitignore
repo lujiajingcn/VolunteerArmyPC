@@ -48,6 +48,8 @@
 /captures/*
 !/captures/.gdignore
 *.log
+# --- 导出的可执行程序（约 165 MB，随时可用 README 的导出命令重新生成）---
+/dist/
 # tools/capture_ui.sh 会把五屏取证的日志按屏分开写（run_ui_ui3.log.menu 这种
 # 名字不匹配上面的 *.log，所以单独补一条；只放行 assets 下的正式素材）
 run_ui_*.log.*
