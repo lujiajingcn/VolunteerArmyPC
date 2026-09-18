@@ -26,6 +26,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -48,11 +49,20 @@ KEYS = [
     "char_enemy_rifle", "char_enemy_mg", "char_enemy_officer",
 ]
 
-# 与试接那次**完全一致**的参数。不给 --face-count / --result-format：
-# 前者会改服务端的面数档位（进而改积分），后者只是"额外再给一个格式"，
-# 而我们要的 glb 本来就在默认输出里。参数越多，批次之间越可能对不齐，
-# 而模型差异在几十像素高的战场上根本看不出来 —— 只会变成一笔对不上的账。
-GEN_ARGS = ["--enable-pbr", "--generate-type", "Normal"]
+# 【`--face-count 50000` 必须显式给，这不是可选项】
+# buddy-cloud.py 的 `--face-count` 默认值是 **500000**（10 万~150 万区间），
+# 不传就等于向服务端要 50 万面。实测后果（2026-09-18 第二批 5 个）：
+#   50 万面 → 单模型 15MB、三角面 500,000（网格自己就占掉约 13.5MB，
+#             与贴图无关，瘦身工具压不动）
+#   5 万面  → 单模型 1.56MB、三角面 50,162（= 已接入的 char_rifleman 规格）
+# 10 倍面数对「1.7 米的人站在 110 米战场上只占几十像素」毫无收益，
+# 却让 11 个角色的仓库体积从 17MB 涨到 165MB，并让同屏几何量翻十倍。
+# 旁证：两者积分档位不同（5 万面 40 分 / 50 万面 30 分），
+# 所以「积分对不上」其实是面数档位不一致的先兆，不只是计价差异。
+# 教训：这里原本写着"与试接那次完全一致"，但试接显式带了 50000 ——
+# **"参数一致"必须以双方的实际请求体为准，不能凭记忆断言**。
+GEN_ARGS = ["--enable-pbr", "--generate-type", "Normal", "--face-count", "50000"]
+
 
 LOG_LOCK = threading.Lock()
 
@@ -66,6 +76,12 @@ LOG_LOCK = threading.Lock()
 # 等不到就等不到，脚本会明确报"重试 N 次仍失败"，不会假装成功。
 SUBMIT_TRIES = 12
 SUBMIT_WAIT_CAP = 30        # 退避上限（秒）：token 只有 ~20 分钟寿命，等太久等于白等
+
+# 产物规格上限（三角面）。已接入的 char_rifleman = 50,162 面，
+# 而"没给 --face-count"时服务端会给 500,000 面 —— 两者相差 10 倍，
+# 肉眼在战场上分辨不出，但体积差 10 倍、同屏几何量差 10 倍。
+# 所以宁可让日志把这件事喊出来，也不要等到 11 个模型都接进场景才发现规格不齐。
+MAX_TRIS_OK = 120000
 
 # 429 有**两种含义完全不同**的 429，必须分开对待 —— 这是本轮花掉 10 分钟才看出来的：
 #   "concurrent slot limit exceeded (2) for dimension hy-3d"  → 并发槽位被占，**可等**，槽位会空出来
@@ -225,6 +241,24 @@ def run_one(key, token, force):
         return False
     say("成品 %.2f MB（原 %.2f MB）" % (
         os.path.getsize(dst_glb) / 2 ** 20, os.path.getsize(raw_glb) / 2 ** 20))
+
+    # ---- 5. 规格校验：面数是不是我们要的那一档 ----
+    # 【为什么值得单独查一次】`--face-count` 给了不等于服务端照做，而"面数不对"
+    # 在战场上完全看不出来（单位只有几十像素高），只有体积和帧率会说话 ——
+    # 等到 11 个模型全接进场景才发现规格不齐，代价是重做一整天。
+    # 这里只报警不判失败：参数是固定的，报警意味着服务端行为变了，该由人来判断。
+    try:
+        pp = subprocess.run(
+            [VENV_PY, os.path.join(ROOT, "tools", "slim_glb.py"), "probe", dst_glb],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=ROOT,
+        )
+        m = re.search(r"三角面\s*(\d+)", pp.stdout or "")
+        if m:
+            tris = int(m.group(1))
+            say("三角面 %d%s" % (tris, "" if tris <= MAX_TRIS_OK else
+                                "  ← 警告：超过预期上限 %d，规格与已接入模型不一致" % MAX_TRIS_OK))
+    except Exception as e:
+        say("规格校验跳过：%r" % e)
     return True
 
 
