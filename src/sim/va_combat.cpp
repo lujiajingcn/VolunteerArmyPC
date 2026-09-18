@@ -121,7 +121,7 @@ void spawn_tank_mg(Vehicle *v, float tx, float ty) {
     p.kind = ProjKind::TankMG;
     p.x = v->x + std::cos(base) * 30; p.y = v->y + std::sin(base) * 30;
     p.vx = std::cos(base) * 950; p.vy = std::sin(base) * 950;
-    p.dmg = v->spec->mg_dmg; p.pen = 0.12f;
+    p.dmg = v->spec->mg_dmg * BAL.veh_mg_dmg; p.pen = 0.12f;
     p.team = v->team; p.ownerVeh = v; p.ownerT = Target(v);
     p.life = 0.6f; p.t = 0; p.sup = v->spec->mg_sup;
     W.projectiles.push_back(p);
@@ -194,7 +194,10 @@ void update_projectiles(float dt) {
                    步兵判定半径 5.2+3=8.2px 与子步长同量级，只判终点会让掠射弹整段漏检（命中率被腰斩） */
                 if (segCircle(px, py, p.x, p.y, u.x, u.y, u.radius + 3)) {
                     if (p.kind == ProjKind::Rocket) explosion(p.x, p.y, p.splash, p.dmgInf, p.team, "rocket");
-                    else damage_unit(&u, p.dmg, p.owner, "bullet");
+                    /* 车载机枪的弹丸只挂 ownerVeh（不挂 owner），这里把它的武器规格
+                       一并传下去 —— 否则"这次伤亡是不是车顶机枪造成的"在数据上根本分不出来。 */
+                    else damage_unit(&u, p.dmg, p.owner, "bullet",
+                                     p.ownerVeh != nullptr ? p.ownerVeh->spec : nullptr);
                     if (p.owner && p.owner->team == Team::Ally) p.owner->hits++;
                     if (p.owner && p.owner->isPlayer) sfx("hit", 0, 0, -1.0f, true);
                     { FxItem f; f.type = "spark"; f.x = p.x; f.y = p.y; f.life = 0.16f; f.b = 1; fx_push(f); }

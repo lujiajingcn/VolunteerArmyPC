@@ -102,6 +102,15 @@ public:
     // 结算面板是否正在显示（world_sim 据此允许 R 重开）
     bool mission_over() const;
 
+    // ---- 战斗事件取证（VA_CAPTURE_EV）----
+    /* 命中标记只亮 0.24 秒、击杀飘字 1.5 秒，靠"按战局秒数定时截图"去撞它们
+       必然要碰运气 —— 上一轮这三条路径就是因为撞不上，一直挂着"未验证"。
+       这里换个方向：**由事件的产生者声明"该留一张证据了"**，由桥接层落盘。
+       不让 HUD 自己截图的原因很具体：它每帧重画，拿不到"相机变换已生效"的
+       时机保证，而立即读视口纹理只会拿到上一帧（没有标记的那一帧）。 */
+    enum EvShot { EVSHOT_NONE = 0, EVSHOT_HIT, EVSHOT_KILL, EVSHOT_ALLY, EVSHOT_DOWN };
+    EvShot take_ev_shot();          // 消费一次（同时只允许一张在途）
+
 protected:
     static void _bind_methods() {}
 
@@ -235,6 +244,16 @@ private:
     std::string prev_phase_;
     std::vector<unsigned char> obj_done_;
     float last_t_ = -1.0f;
+
+    // VA_HUD_EV：把三条「需要特定战斗事件才会出现」的路径（命中标记 / 击杀飘字 /
+    // 倒地倒计时）的**触发时刻**打点到控制台。
+    // 用途是把"事件什么时候发生"变成可读的数字 —— 截图探针按战局秒数触发，
+    // 没有这个就只能靠密集截图碰运气，而这三条路径里最短的命中标记只亮 0.24 秒。
+    bool  ev_log_ = false;
+
+    // 事件取证的待办槽位（见 EvShot 的说明）
+    EvShot pending_shot_ = EVSHOT_NONE;
+    bool   ev_cap_ = false;      // VA_CAPTURE_EV：事件当帧自动落盘
 };
 
 } // namespace volunteer_army

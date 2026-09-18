@@ -110,6 +110,9 @@ const WeaponSpec *weapon_of(const std::string &key) {
 const RocketSpec ROCKET{ "火箭弹", 900, 340, 70, 84, 5.5f, 3, 4.0f, 640 };
 const ShellSpec  SHELL { "坦克主炮", 640, 190, 96, 11.0f, 1.6f };
 
+// 平衡旋钮的运行时实例（默认值见 va_config.h；1.0 = 网页版原值）
+BalanceCfg BAL;
+
 // 注意 armor 语义：子弹穿透系数 = v.armor，数值越大越软。
 namespace {
 const VehicleSpec V_jeep  { "吉普",   150, 46, 24, 78, 0.30f, 2, 0, true,  7, 480, 0.13f, 0.100f, 16, false };

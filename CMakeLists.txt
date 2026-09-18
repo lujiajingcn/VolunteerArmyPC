@@ -80,9 +80,40 @@ if(MSVC)
         VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
+# ---------------------------------------------------------------------------
+# 离线平衡扫描工具（可选）
+#   逻辑层零引擎依赖（src/sim/ 不 include 任何 godot 头），所以它能不链接
+#   godot-cpp 单独编成控制台程序 —— 这既是 README 里「逻辑层可脱离引擎单独跑」
+#   那句话的**可执行证据**，也是平衡调整的能量化前提：
+#   跑一局要 620 秒模拟时间，10 个种子 × 6 套对照只能靠它。
+#   从 VA_SOURCES 里按前缀挑出逻辑层，避免维护第二份文件清单（会漂）。
+# ---------------------------------------------------------------------------
+set(VA_SIM_SOURCES "")
+foreach(f ${VA_SOURCES})
+    if(f MATCHES "^src/sim/")
+        list(APPEND VA_SIM_SOURCES ${f})
+    endif()
+endforeach()
+
+option(VA_BUILD_SIM_SWEEP "构建离线平衡扫描工具 va_sweep（纯逻辑层，不链接引擎）" ON)
+if(VA_BUILD_SIM_SWEEP AND VA_SIM_SOURCES)
+    add_executable(va_sweep tools/va_sweep.cpp ${VA_SIM_SOURCES})
+    target_include_directories(va_sweep PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    # 产物落在 sweep/（.gitignore 已忽略）—— 可再生成的工具不入库
+    foreach(cfg "" _DEBUG _RELEASE _RELWITHDEBINFO _MINSIZEREL)
+        set_target_properties(va_sweep PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY${cfg} "${CMAKE_CURRENT_SOURCE_DIR}/sweep/sim")
+    endforeach()
+    if(MSVC)
+        target_compile_options(va_sweep PRIVATE /utf-8 /MP)
+        target_compile_definitions(va_sweep PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    endif()
+endif()
+
 message(STATUS "──────────────────────────────────────────────")
 message(STATUS " VolunteerArmyPC  ·  Godot 4.5 + C++ GDExtension")
 message(STATUS "   godot-cpp target : ${GODOTCPP_TARGET}")
 message(STATUS "   源文件           : ${VA_EXISTING}")
 message(STATUS "   输出目录         : ${CMAKE_CURRENT_SOURCE_DIR}/bin")
+message(STATUS "   离线扫描 va_sweep: ${VA_BUILD_SIM_SWEEP}（产物 -> sweep/sim/）")
 message(STATUS "──────────────────────────────────────────────")

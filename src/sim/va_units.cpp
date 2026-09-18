@@ -181,7 +181,8 @@ void update_vehicles(float dt) {
                     [](Unit *x) { return !x->dead && !x->downed; });
                 if (t && distf(v->x, v->y, t->x, t->y) < sp->mg_range && !los_fire(v->x, v->y, t->x, t->y)) {
                     spawn_tank_mg(v, t->x, t->y);
-                    v->wpnCd = sp->mg_rof * (float)ri(2, 5);
+                    // veh_mg_gap 只缩放"打完之后隔多久再打"，不动一轮几发（ri 的调用次序不变）
+                    v->wpnCd = sp->mg_rof * BAL.veh_mg_gap * (float)ri(2, 5);
                 } else {
                     v->wpnCd = 0.6f;
                 }

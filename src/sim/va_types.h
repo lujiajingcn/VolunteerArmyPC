@@ -219,6 +219,12 @@ struct Unit {
     float secReport = 0, speakCd = 0, reportCd = 0;
     Unit *lastHurtBy = nullptr;
     float lastHurtT = -1000.0f;
+    /* 最后打中我的是哪一型车载武器（步兵子弹 / 爆炸为 nullptr）。
+       为什么要单独一个字段而不是复用 lastHurtBy：车载机枪的弹丸不挂 owner（挂的是
+       ownerVeh），所以 lastHurtBy 恒为 nullptr —— 于是"我方伤亡里有多少是车顶机枪
+       打出来的"这个问题按现有字段根本答不出来，而它恰恰是平衡调整要盯的那个数。
+       存 spec 而不是 Vehicle*：spec 指向静态常量表，不存在悬垂。 */
+    const VehicleSpec *lastHurtVehSpec = nullptr;
     bool  evacuated = false;       // 已抵达撤离点并计数
     bool  boxTask = false;         // 被指派去捡密码箱
     bool  hasSpec = false;         // 占位：网页版用 u.spec 区分载具，步兵恒 false

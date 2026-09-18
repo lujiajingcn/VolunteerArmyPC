@@ -188,7 +188,10 @@ bool  way_point_at(float d, float &ox, float &oy, float &oa);
 void  update_evac_marker();
 
 // --------------------------------------------------------------- 伤害 / 死亡
-void  damage_unit(Unit *u, float dmg, Unit *src, const std::string &kind);
+// srcVeh：伤害是否来自车载武器（车载机枪的弹丸不挂 owner，只挂 ownerVeh）。
+// 只为平衡扫描的伤亡归因服务，传 nullptr 与旧行为完全一致。
+void  damage_unit(Unit *u, float dmg, Unit *src, const std::string &kind,
+                  const VehicleSpec *srcVeh = nullptr);
 void  kill_unit(Unit *u, Unit *src);
 void  down_player(Unit *u);
 void  handover();

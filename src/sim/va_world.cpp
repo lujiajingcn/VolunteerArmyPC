@@ -288,7 +288,11 @@ Unit *make_unit(const RosterDef &def, float x, float y, Team team, bool isPlayer
     u.team = team;
     u.x = x; u.y = y;
     u.radius = 5.2f;
-    u.hp = 100; u.maxHp = 100; u.morale = 78;
+    /* 队友耐久旋钮（BAL.ally_hp）只作用于我方**非玩家**单位 ——
+       "提高队友耐久"这条方案的落点是队友，玩家的手感与容错是另一条设计线，
+       不该被一次平衡调整顺手改掉。 */
+    const float hpBase = 100.0f * ((team == Team::Ally && !isPlayer) ? BAL.ally_hp : 1.0f);
+    u.hp = hpBase; u.maxHp = hpBase; u.morale = 78;
     u.weaponKey = def.weapon;
     u.wpn = w;
     u.ammo = w->ammo; u.magAmmo = w->mag;

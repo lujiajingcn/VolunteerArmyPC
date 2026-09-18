@@ -246,6 +246,32 @@ void WorldSim::_ready() {
     va::W.deployDone = true;
     mission_started_ = true;
     force_ads_ = (std::getenv("VA_ADS") != nullptr);
+    autoplay_  = (std::getenv("VA_AUTO") != nullptr);
+    if (const char *dt = std::getenv("VA_DOWN_AT"); dt != nullptr && *dt != '\0') {
+        down_at_ = std::atof(dt);
+    }
+    /* 快进（VA_FF）。加它的原因是实测：一次"打到交火"的取证跑图 = 300 秒真实时间，
+       因为逻辑层按真实经过时间推进，而车队要等到 CFG.convoyIn = 175 秒才进地图
+       —— 在那之前战场上一个人都没有（这一点是本轮踩到的：t=50 的取证跑图里
+       一条命中都没有，不是自动战斗坏了，是那时还没敌人）。 */
+    if (const char *v = std::getenv("VA_FF"); v != nullptr && *v != '\0') {
+        int k = std::atoi(v);
+        if (k < 1) k = 1;
+        if (k > 32) k = 32;          // 上限只为防手滑，正常用 4~8
+        ff_ = k;
+    }
+    if (autoplay_ || down_at_ >= 0.0 || ff_ > 1) {
+        UtilityFunctions::print("[combat-ev] 取证注入：自动战斗=", autoplay_ ? "开" : "关",
+                                "  强制击倒时刻=", down_at_ >= 0.0 ? String::num(down_at_, 1) : String("-"),
+                                "  快进=", ff_, "x");
+    }
+    /* 剧本 A（VA_SCRIPT_A）：与 tools/va_sweep.cpp 的 SCRIPT_A 逐条对应。
+       没有它就跑不到交火 —— 见 world_sim.h 里的说明（伏击由第一枪触发，
+       而"有没有第一枪"取决于车队有没有进射界，这不是自动战斗能保证的事）。 */
+    if (std::getenv("VA_SCRIPT_A") != nullptr) {
+        script_a_ = true;
+        UtilityFunctions::print("[combat-ev] 启用剧本 A（与离线扫描同一套口令/触发条件）");
+    }
     va_trace("_ready:init_world ok");
 
     build_scene(this, refs_);
@@ -378,6 +404,26 @@ void WorldSim::capture_setup() {
     UtilityFunctions::print("[VA_CAPTURE] 计划在 ", (int)cap_times_.size(), " 个时刻截图");
 }
 
+// 把当前视口存成 PNG。两条取证通道共用：
+//   ① capture_step —— 按「战局秒数」定时拍（看战场整体长什么样）
+//   ② 战斗事件取证 —— 事件发生那一刻拍（命中标记只活 0.24 秒，定时拍撞不上）
+void WorldSim::save_shot(const godot::String &tag) {
+    const char *dir_env = std::getenv("VA_CAPTURE_DIR");
+    const std::string dir = dir_env && *dir_env ? std::string(dir_env) : std::string("res://captures");
+    const godot::String gdir = godot::String::utf8(dir.c_str());
+    DirAccess::make_dir_recursive_absolute(gdir);
+
+    const Viewport *vp = get_viewport();
+    if (vp == nullptr) return;
+    const Ref<ViewportTexture> tex = vp->get_texture();
+    if (!tex.is_valid()) return;
+    const Ref<Image> img = tex->get_image();
+    if (!img.is_valid()) return;
+    const godot::String path = gdir + godot::String("/cap_") + tag + godot::String(".png");
+    const Error err = img->save_png(path);
+    UtilityFunctions::print("[VA_CAPTURE] ", path, err == OK ? " OK" : " FAILED");
+}
+
 void WorldSim::capture_step() {
     if (!cap_enabled_ || cap_i_ >= (int)cap_times_.size()) return;
     if (cap_sim_t_ < cap_times_[(size_t)cap_i_]) return;
@@ -385,30 +431,117 @@ void WorldSim::capture_step() {
     if (cap_frame_skip_ < 2) { cap_frame_skip_++; return; }
     cap_frame_skip_ = 0;
 
-    const char *dir_env = std::getenv("VA_CAPTURE_DIR");
-    const std::string dir = dir_env && *dir_env ? std::string(dir_env) : std::string("res://captures");
-    const godot::String gdir = godot::String::utf8(dir.c_str());
-    DirAccess::make_dir_recursive_absolute(gdir);
-
-    const Viewport *vp = get_viewport();
-    if (vp != nullptr) {
-        const Ref<ViewportTexture> tex = vp->get_texture();
-        if (tex.is_valid()) {
-            const Ref<Image> img = tex->get_image();
-            if (img.is_valid()) {
-                const int t = (int)cap_times_[(size_t)cap_i_];
-                const godot::String path = gdir + godot::String("/cap_") + godot::String::num_int64(t)
-                                         + godot::String("s.png");
-                const Error err = img->save_png(path);
-                UtilityFunctions::print("[VA_CAPTURE] ", path, err == OK ? " OK" : " FAILED");
-            }
-        }
-    }
+    save_shot(godot::String::num_int64((int)cap_times_[(size_t)cap_i_]) + godot::String("s"));
     cap_i_++;
     if (cap_i_ >= (int)cap_times_.size()) {
         UtilityFunctions::print("[VA_CAPTURE] 全部完成，退出");
         get_tree()->quit();
     }
+}
+
+// ------------------------------------------- 剧本 A（VA_SCRIPT_A）
+/* 逐条对应 tools/va_sweep.cpp 的 SCRIPT_A：同一套口令、同一触发条件、
+   同一个"先 step 再下命令"的次序。
+
+   两边唯一的差别是步长：离线扫描用 dt=0.05（为了与网页版 sweep.js 对齐），
+   渲染端是固定 1/60。所以"同一局"指的是同一场景、同一阈值，
+   不是逐位相同的轨迹 —— 要点在于**伏击由位置触发**（先头车 x < 1180），
+   而不是像 VA_AUTO 那样押注"玩家恰好有射界开出第一枪"。 */
+void WorldSim::script_a_step() {
+    if (!script_a_) return;
+
+    const va::Vehicle *lead = va::W.vehicles.empty() ? nullptr : &va::W.vehicles[0];
+    const float T = va::W.triggerT;
+    const int   i = script_cmd_;
+
+    std::string out;
+    bool fired = false;
+
+    if (i == 0 && va::W.t > 5.0f) {
+        out = "全体，隐蔽"; fired = true;
+    } else if (i == 1 && lead != nullptr && lead->x < 1180.0f) {
+        va::trigger_ambush("mine");          // 起爆在前、喊话在后 —— 与离线扫描一致
+        out = "老白，起爆"; fired = true;
+    } else if (i <= 1 && va::W.triggered) {
+        /* 玩家抢在剧本之前开了第一枪（VA_AUTO 会这么干）。
+           这时第 0/1 条已无意义，直接跳过，否则序号会永远卡在 1
+           而后面 8 条口令一条都发不出去。 */
+        script_cmd_ = 2;
+        return;
+    } else if (!va::W.triggered) {
+        return;                              // 伏击还没开始，后面的指令都不到点
+    } else if (i == 2 && va::W.t > T + 14.0f)  { out = "全体，开火"; fired = true; }
+    else if (i == 3 && va::W.t > T + 34.0f)   { out = "反坦克组，打坦克"; fired = true; }
+    else if (i == 4 && va::W.t > T + 56.0f)   { out = "老周，压制"; fired = true; }
+    else if (i == 5 && va::W.t > T + 78.0f)   {
+        out = (va::W.boxWhere == "truck") ? "全体，打卡车"
+            : (va::W.boxWhere == "apc"   ? "反坦克组，打装甲车" : "全体，打军官");
+        fired = true;
+    }
+    else if (i == 6 && va::W.t > T + 110.0f)  { out = "铁头，搬密码箱"; fired = true; }
+    else if (i == 7 && va::W.t > T + 200.0f)  { out = "小满，救伤员"; fired = true; }
+    else if (i == 8 && va::W.t > T + 230.0f)  { out = "全体，撤离"; fired = true; }
+
+    if (!fired) return;
+    va::run_command_text(out, "voice", true);
+    ++script_cmd_;
+}
+
+// ------------------------------------------- 战斗事件取证（VA_AUTO / VA_DOWN_AT）
+void WorldSim::autoplay_step() {
+    if (!autoplay_) return;
+    va::Unit *p = va::W.player;
+    if (p == nullptr || p->dead || p->downed) return;
+
+    /* 选目标分两档：
+         ① 有射界的**已下车**敌人 —— 只有打他们才会产生 `hits`（车上的人被
+            弹道直接跳过），命中标记靠的就是它；
+         ② 没有①时退而打**车上**的敌人：这是玩家开局会做的事（朝车队开枪），
+            也是本局"伏击开始"的触发条件（`update_player` 里首发即 trigger_ambush）。
+       少了②就没法自然起手 —— 伏击不触发，车队一路开出西侧，全场一枪不发。 */
+    va::Unit *best = nullptr, *bestMounted = nullptr;
+    float bd = 1e18f, bdM = 1e18f;
+    for (auto &u : va::W.units) {
+        if (u.team != va::Team::Enemy || u.dead || u.downed) continue;
+        if (va::los_fire(p->x, p->y, u.x, u.y)) continue;    // los_fire 返回 true = 被挡住
+        const float d = va::distf(p->x, p->y, u.x, u.y);
+        if (u.mount) { if (d < bdM) { bdM = d; bestMounted = &u; } }
+        else         { if (d < bd)  { bd  = d; best = &u; } }
+    }
+    if (best == nullptr) best = bestMounted;
+    if (best == nullptr) return;
+
+    // 与 _input 里鼠标视角那一条同源写法：yaw_ → player->facing
+    const float a = std::atan2(best->y - p->y, best->x - p->x);
+    yaw_ = -a - 1.5707963267948966f;
+    // 俯仰归零：逻辑层按 viewPitch 折算有效射程，抬头会让子弹够不到地面目标
+    pitch_ = 0.0f;
+    va::W.viewPitch = 0.0f;
+    p->facing = a;
+    va::IN.fire = true;
+    va::IN.w = va::IN.a = va::IN.s = va::IN.d = false;
+}
+
+void WorldSim::hud_down_inject() {
+    if (down_at_ < 0.0 || down_done_) return;
+    if ((double)va::W.t < down_at_) return;
+    va::Unit *p = va::W.player;
+    if (p == nullptr) return;
+    down_done_ = true;
+    if (p->downed || p->dead) return;
+
+    /* 走真实的伤害入口（含掩体减伤 → down_player），而不是直接把 downed 置 true。
+       这样验证的是"HUD 在真实倒地事件下画得对不对"，而不是"置了标志位以后画得对不对"。 */
+    va::Unit *src = nullptr;
+    float bd = 1e18f;
+    for (auto &u : va::W.units) {
+        if (u.team != va::Team::Enemy || u.dead || u.downed) continue;
+        const float d = va::distf(p->x, p->y, u.x, u.y);
+        if (d < bd) { bd = d; src = &u; }
+    }
+    UtilityFunctions::print("[combat-ev] t=", String::num((double)va::W.t, 2),
+                            " 注入致命伤（真实 damage_unit）→ 击倒玩家");
+    va::damage_unit(p, 5000.0f, src, "bullet");
 }
 
 void WorldSim::setup_runtime_ui() {
@@ -544,14 +677,24 @@ void WorldSim::_process(double p_delta) {
     // 固定步长推进逻辑（网页版是「按需要拆成 <=0.022s 的小步」，这里等价处理）
     va_trace("_process:enter");
     const double H = 1.0 / 60.0;
-    acc_ += p_delta;
+    const int step_cap = 8 * ff_;
+    acc_ += p_delta * (double)ff_;     // VA_FF 只放大"喂进来的时间"，步长仍是 1/60
     int n = 0;
-    while (acc_ >= H && n < 8) {
+    while (acc_ >= H && n < step_cap) {
+        /* 战斗事件取证注入（VA_AUTO / VA_DOWN_AT）放在**每个固定步之前**。
+           原先放在循环外，快进时会出现"一帧跨过 0.13×ff 秒，枪口还停在上一帧的
+           目标上"；放进循环里，瞄准的更新频率就与逻辑步一致 ——
+           这样 VA_FF 才真的只是"跑得快"，而不是"跑得不一样"。
+           放在 step 之前也保证了本次注入/瞄准在本步立即生效，
+           下面的 hud_->update 才采样得到。 */
+        autoplay_step();
+        hud_down_inject();
         va::step_once((float)H);
+        script_a_step();      // 次序与 va_sweep 一致：先 step，再判该不该下命令
         acc_ -= H;
         ++n;
     }
-    if (n == 8) acc_ = 0.0;   // 掉帧时放弃追帧，避免螺旋
+    if (n == step_cap) acc_ = 0.0;   // 掉帧时放弃追帧，避免螺旋
     va_trace("_process:step ok");
 
     sync_entity_nodes();
@@ -575,7 +718,50 @@ void WorldSim::_process(double p_delta) {
 
     // HUD：采样世界状态 + 推进动画。整屏内容一次 _draw() 画完，
     // 所以这里只需每帧调一次 update（它内部会 queue_redraw）。
-    if (hud_ != nullptr) hud_->update(p_delta);
+    if (hud_ != nullptr) {
+        hud_->update(p_delta);
+
+        /* 战斗事件取证（VA_CAPTURE_EV）：HUD 声明"刚才发生了命中/击杀/倒地"，
+           由本层落盘。隔三帧再存 —— 本帧的 _draw 还没跑，
+           立刻读视口纹理只会拿到上一帧，也就是**没有那个标记的那一帧**。
+           在途期间只允许**更罕有**的事件抢位（击杀 > 倒地 > 队友阵亡 > 命中）：
+           命中每 0.1~0.7 秒一次，全收会一直排队存不完；
+           但一刀切地"在途就丢"会把击杀整条丢掉 —— 实测就是这么丢的：
+           日志里 `t=228.52 击杀 (kills=1)` 明明发生了，截图目录里一张 ev_kill 都没有。 */
+        const Hud::EvShot ev = hud_->take_ev_shot();
+        bool ev_just_set = false;
+        if (ev != Hud::EVSHOT_NONE) {
+            int pri = 1;                                  // 默认按"命中"算
+            switch (ev) {
+                case Hud::EVSHOT_KILL: pri = 4; break;
+                case Hud::EVSHOT_DOWN: pri = 3; break;
+                case Hud::EVSHOT_ALLY: pri = 2; break;
+                default:               pri = 1; break;     // HIT
+            }
+            if (ev_wait_ < 0 || pri > ev_prio_) {
+                switch (ev) {
+                    case Hud::EVSHOT_HIT:  ev_tag_ = "ev_hit";     break;
+                    case Hud::EVSHOT_KILL: ev_tag_ = "ev_kill";    break;
+                    case Hud::EVSHOT_ALLY: ev_tag_ = "ev_allycas"; break;
+                    case Hud::EVSHOT_DOWN: ev_tag_ = "ev_down";    break;
+                    default: break;
+                }
+                ev_tag_ += godot::String("_t") + godot::String::num((double)va::W.t, 1);
+                ev_prio_ = pri;
+                ev_wait_ = 2;                              // 抢位也重新等三帧：要拍"这一次"的 _draw
+                ev_just_set = true;
+            }
+        }
+        if (!ev_just_set) {
+            if (ev_wait_ > 0) {
+                ev_wait_--;
+            } else if (ev_wait_ == 0) {
+                save_shot(ev_tag_);
+                ev_wait_ = -1;
+                ev_prio_ = 0;
+            }
+        }
+    }
 
     // 视图模型：只读逻辑层的状态，反过来不影响逻辑
     {

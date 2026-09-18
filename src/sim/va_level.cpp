@@ -13,8 +13,13 @@ static void decal_rgba(float x, float y, float r, int cr, int cg, int cb, float 
 }
 
 // ------------------------------------------------------------------ 步兵伤害
-void damage_unit(Unit *u, float dmg, Unit *src, const std::string &kind) {
+void damage_unit(Unit *u, float dmg, Unit *src, const std::string &kind,
+                 const VehicleSpec *srcVeh) {
     if (!u || u->dead || u->downed) return;
+    /* 记录来源供平衡扫描归因。**每次伤害都整个赋值**（不写成"非空才覆盖"）——
+       步兵子弹与爆炸传的是 nullptr，正好把上一次残留下来的载具来源清掉，
+       否则挨过一枪机枪之后，后面所有阵亡都会被算成机枪打死的。 */
+    u->lastHurtVehSpec = srcVeh;
     /* 依托掩体最多减伤 70%：伏击方在工事里、进攻方在开阔地推进，
        这个差距是文档「掩体评分」体系成立的前提（否则 AI 抢掩体毫无意义）。 */
     dmg *= 1.0f - cover_protect(*u) * 0.70f;

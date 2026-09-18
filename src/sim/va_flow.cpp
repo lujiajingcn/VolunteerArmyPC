@@ -74,8 +74,12 @@ void check_objectives() {
     };
     add("摧毁坦克", s.tankKilled, true, "");
     add("获取密码箱", s.boxTaken, true, "");
-    add("至少 6 人撤离到 " + W.evac.name, s.evacCount >= 6, true,
-        "(" + std::to_string(s.evacCount) + "/6)");
+    /* 撤离门槛出自 BAL.evac_need（"降低撤离门槛"这条方案的落点）。
+       文案与判据必须共用同一个数 —— 否则改了门槛之后简报仍写"至少 6 人"、
+       而 5 人就过关，这种自相矛盾是玩家最直接的不信任来源。 */
+    const std::string need = std::to_string(BAL.evac_need);
+    add("至少 " + need + " 人撤离到 " + W.evac.name, s.evacCount >= BAL.evac_need, true,
+        "(" + std::to_string(s.evacCount) + "/" + need + ")");
     add("摧毁 2 辆装甲车", s.apcKilled >= 2, false, "(" + std::to_string(s.apcKilled) + "/2)");
     add("救回所有伤员（无阵亡/无遗留）",
         (!s.allyDead && downed_allies().empty() && W.t > 60), false, "");
@@ -88,7 +92,7 @@ void check_objectives() {
 void check_end() {
     if (W.over) return;
     const MissionStats &s = W.stats;
-    if (s.tankKilled && s.boxTaken && s.evacCount >= 6 && !W.convoyEscaped) {
+    if (s.tankKilled && s.boxTaken && s.evacCount >= BAL.evac_need && !W.convoyEscaped) {
         end_game("成功", "伏击成功：坦克被摧毁，密码箱到手，" + std::to_string(s.evacCount)
                          + " 人从 " + W.evac.name + " 撤离。");
         return;
@@ -99,8 +103,9 @@ void check_end() {
         up++;
         if (!u.evacuated) allIn = 0;
     }
-    if (up > 0 && allIn && W.triggered && W.evacArmed && s.evacCount < 6) {
-        end_game("失败", "撤离人数不足 6 人（实际 " + std::to_string(s.evacCount) + " 人），任务失败。");
+    if (up > 0 && allIn && W.triggered && W.evacArmed && s.evacCount < BAL.evac_need) {
+        end_game("失败", "撤离人数不足 " + std::to_string(BAL.evac_need) + " 人（实际 "
+                         + std::to_string(s.evacCount) + " 人），任务失败。");
     }
 }
 
@@ -114,7 +119,7 @@ void update_phase_name() {
     else if (t - W.triggerT < 40) n = "爆发";
     else if (t - W.triggerT < 130) n = "混战";
     else n = "清剿";
-    if (W.stats.boxTaken && W.stats.evacCount < 6) n = "撤离";
+    if (W.stats.boxTaken && W.stats.evacCount < BAL.evac_need) n = "撤离";
     if (t >= W.reinforceT && W.reinforceDone) n = "紧急撤离";
     W.phaseName = n;
 }

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 #include <godot_cpp/classes/image.hpp>
@@ -109,6 +110,12 @@ Hud::~Hud() = default;
 
 void Hud::_notification(int p_what) { (void)p_what; }
 
+Hud::EvShot Hud::take_ev_shot() {
+    const EvShot s = pending_shot_;
+    pending_shot_ = EVSHOT_NONE;      // 同时只留一张在途，避免事件密集时刷屏
+    return s;
+}
+
 bool Hud::mission_over() const { return va::W.over; }
 
 // 相机朝向 → 罗盘度数（0=正北，顺时针）。
@@ -151,6 +158,12 @@ bool Hud::layout() {
     s_ = clampf_(vp_.y / 1080.0f, 0.62f, 2.20f);
 
     if (font_.is_null()) {
+        // 事件打点开关只读一次（VA_HUD_EV）。读在这里是因为 layout() 一定早于
+        // 任何采样 —— 放在构造函数里则要把它从 `= default` 改回手写。
+        static const bool s_ev_log = (std::getenv("VA_HUD_EV") != nullptr);
+        static const bool s_ev_cap = (std::getenv("VA_CAPTURE_EV") != nullptr);
+        ev_log_ = s_ev_log;
+        ev_cap_ = s_ev_cap;
         // 字体来源两条路：
         //  1) ThemeDB 的 fallback font —— 就是默认主题给所有 Label 用的那个，
         //     所以 HUD 的字和原先 Label 的字完全一致（含中文回退链）。
@@ -417,8 +430,20 @@ void Hud::update(double p_delta) {
     // ---- 命中：hits 计数跳变（只读，不侵入逻辑层）----
     if (pl->hits > seen_hits_) {
         hit_t_ = 0.24f;
+        if (ev_cap_) pending_shot_ = EVSHOT_HIT;
+        if (ev_log_) {
+            UtilityFunctions::print("[hud-ev] t=", String::num((double)va::W.t, 2),
+                                    " 命中 +", pl->hits - seen_hits_, " (hits=", pl->hits,
+                                    ") → 命中标记 hit_t_=0.24");
+        }
         if (pl->kills > seen_kills_) {
             hit_kill_t_ = 0.40f;
+            if (ev_cap_) pending_shot_ = EVSHOT_KILL;   // 覆盖同帧的 HIT：击杀更难得
+            if (ev_log_) {
+                UtilityFunctions::print("[hud-ev] t=", String::num((double)va::W.t, 2),
+                                        " 击杀 (kills=", pl->kills,
+                                        ") → 击杀标记 hit_kill_t_=0.40 + 飘字「+1 击杀」");
+            }
             Popup p;
             p.text = "+1 击杀";
             p.col = c_amber();
@@ -451,6 +476,12 @@ void Hud::update(double p_delta) {
     // ---- 倒地 ----
     if (pl->downed && !prev_down_) {
         toasts_.push_back({ "你已倒地 · 等待队友救援", 0.0f, true });
+        if (ev_cap_) pending_shot_ = EVSHOT_DOWN;
+        if (ev_log_) {
+            UtilityFunctions::print("[hud-ev] t=", String::num((double)va::W.t, 2),
+                                    " 玩家倒地 (downTimer=", String::num(pl->downTimer, 1),
+                                    ") → draw_downed 接管中央（倒计时环 + 大字）");
+        }
     }
     prev_down_ = pl->downed;
 
@@ -491,6 +522,14 @@ void Hud::update(double p_delta) {
             p.col = c_red();
             p.t = 0.0f;
             popups_.push_back(p);
+            // 不覆盖同帧更罕有的事件（玩家倒地 / 击杀）；队友阵亡局局都有，不抢槽位
+            if (ev_cap_ && pending_shot_ == EVSHOT_NONE) pending_shot_ = EVSHOT_ALLY;
+            if (ev_log_) {
+                UtilityFunctions::print("[hud-ev] t=", String::num((double)va::W.t, 2),
+                                        " 阵亡播报 ", String::utf8(p.text.c_str()),
+                                        " (凶手=", String::utf8(it.killer.c_str()),
+                                        ") → 飘字 1.5s");
+            }
         }
         while (feed_.size() > 5) feed_.pop_back();
     }
