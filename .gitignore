@@ -22,8 +22,29 @@
 !/sdk/.gdignore
 /.godot/
 
+# --- Godot 的导入产物（与 .godot/ 同理：源码入库，导入产物不入库）---
+# 每次启动项目、或跑一次 `godot --headless --import`，Godot 都会给每个被导入的
+# 资源在**源码旁边**写一个 `<文件>.import`。它只记录"用什么参数导入 + 产物校验和"，
+# 删掉不会有任何损失 —— 下次启动会照原样重新扫出来。
+# 本仓库从第一天起就没入库过它们（历史提交里一个 .import 都没有），
+# 但之前没写规则，于是跑一次 --import 就会在 git status 里冒出 100+ 个未跟踪文件，
+# 把真正的改动（比如一个新模型）淹掉。这里把这条既有约定显式化。
+*.import
+# 附带一个转瞬即逝的中间文件（导入进行中才存在，名字形如 xxx.import123456.tmp）
+*.import[0-9]*.tmp
+
+# gltf 导入默认会把 **GLB 内嵌的贴图抽成同级 jpg**
+# （gltf/embedded_image_handling 默认为 Extract，本项目没改过），
+# 于是 model/ 下每个 .glb 旁边会长出 3 个 jpg（基础色 / 法线 / 金属-粗糙）。
+# 它们与 .glb 内容重复，且同样可以重新生成 —— 入库只会让 11 个模型
+# 平白多出 33 个重复贴图文件。
+/assets/art/char/model/*_texture_pbr_*.jpg
+
 # --- 开发期取证截图与运行日志（体积大，随时可用 tools/capture.sh 重新生成）---
-/sweep/
+# 写成 "/sweep/*" + 反选而不是 "/sweep/"：目录本身若被排除，里面的
+# .gdignore 就永远反选不回来（gitignore 的父目录优先规则）。
+/sweep/*
+!/sweep/.gdignore
 /captures/*
 !/captures/.gdignore
 *.log
