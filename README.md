@@ -221,6 +221,14 @@ python tools/montage_char.py          # 拼联络表 —— 并排才看得出�
 python tools/gen3d_batch.py                     # 会跳过已有成品，中断后可直接续跑
 #    产物 42.78MB → 瘦身到 1.56MB（网格 5 万面不动，只降内嵌 4K 贴图 → 512²）
 python tools/gen3d_batch.py --force char_mg     # 指定重做某一个
+
+# 生成通道可切换（三条路的产物规格一致，都是 5 万面 / 1.5MB）：
+#   默认（不设变量）   内置通道，平台侧每天 5 次提交且当天不重置
+#   VA_GEN3D_BACKEND=hy   TokenHub 直连（一把 sk- 开头的 API Key，无每日提交上限）
+#   VA_GEN3D_BACKEND=tc   腾讯云 CAM 签名直连（要 SecretId/SecretKey）
+# 换型号档位用 VA_GEN3D_MODEL（默认 hy-3d-3.1）：TokenHub 的免费额度是**按模型**给的，
+# 3.1 用尽后同族的 3.0 还能接着做 —— 换相邻版本号是零风格风险的做法。
+VA_GEN3D_BACKEND=hy VA_GEN3D_MODEL=hy-3d-3.0 python tools/gen3d_batch.py char_medic
 ```
 
 **检阅台**（`VA_UNIT_SHOW`）是模型接进去之后唯一能回答"朝向 / 比例 / 脚底落地 /
