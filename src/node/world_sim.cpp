@@ -272,6 +272,14 @@ void WorldSim::_ready() {
         script_a_ = true;
         UtilityFunctions::print("[combat-ev] 启用剧本 A（与离线扫描同一套口令/触发条件）");
     }
+    /* VA_CAPTURE_EV 的本层开关。HUD 侧读同一个变量（决定要不要把事件报上来），
+       这里再读一次只为能打印 "[capture-ev] 落盘 …" 那行时序自证 ——
+       没有它，下次再遇到"截不到某条路径"，就只能靠猜是帧率问题还是标记寿命问题。 */
+    ev_cap_ = (std::getenv("VA_CAPTURE_EV") != nullptr);
+    if (ev_cap_) {
+        UtilityFunctions::print("[combat-ev] 启用事件当帧落盘（VA_CAPTURE_EV）："
+                                "等 0.05 秒墙钟 + 至少跨 1 帧，与帧率解耦");
+    }
     va_trace("_ready:init_world ok");
 
     build_scene(this, refs_);
@@ -722,12 +730,14 @@ void WorldSim::_process(double p_delta) {
         hud_->update(p_delta);
 
         /* 战斗事件取证（VA_CAPTURE_EV）：HUD 声明"刚才发生了命中/击杀/倒地"，
-           由本层落盘。隔三帧再存 —— 本帧的 _draw 还没跑，
+           由本层落盘。**当帧不能存** —— 本帧的 _draw 还没跑，
            立刻读视口纹理只会拿到上一帧，也就是**没有那个标记的那一帧**。
+           等多久见 world_sim.h 的 ev_wait_sec_：按**墙钟**等，不按帧数。
            在途期间只允许**更罕有**的事件抢位（击杀 > 倒地 > 队友阵亡 > 命中）：
            命中每 0.1~0.7 秒一次，全收会一直排队存不完；
            但一刀切地"在途就丢"会把击杀整条丢掉 —— 实测就是这么丢的：
            日志里 `t=228.52 击杀 (kills=1)` 明明发生了，截图目录里一张 ev_kill 都没有。 */
+        constexpr float EV_SETTLE_SEC = 0.05f;   // 墙钟秒：60fps≈3 帧，且远小于命中标记的 0.24 秒
         const Hud::EvShot ev = hud_->take_ev_shot();
         bool ev_just_set = false;
         if (ev != Hud::EVSHOT_NONE) {
@@ -738,7 +748,7 @@ void WorldSim::_process(double p_delta) {
                 case Hud::EVSHOT_ALLY: pri = 2; break;
                 default:               pri = 1; break;     // HIT
             }
-            if (ev_wait_ < 0 || pri > ev_prio_) {
+            if (ev_wait_sec_ < 0.0f || pri > ev_prio_) {
                 switch (ev) {
                     case Hud::EVSHOT_HIT:  ev_tag_ = "ev_hit";     break;
                     case Hud::EVSHOT_KILL: ev_tag_ = "ev_kill";    break;
@@ -747,17 +757,39 @@ void WorldSim::_process(double p_delta) {
                     default: break;
                 }
                 ev_tag_ += godot::String("_t") + godot::String::num((double)va::W.t, 1);
-                ev_prio_ = pri;
-                ev_wait_ = 2;                              // 抢位也重新等三帧：要拍"这一次"的 _draw
+                ev_prio_  = pri;
+                // 抢位也重新计时：要拍的是"这一次"的 _draw
+                ev_wait_sec_    = EV_SETTLE_SEC;
+                ev_wait_frames_ = 1;
+                ev_from_t_ = (double)va::W.t;
+                ev_wall_   = 0.0;
+                ev_frames_ = 0;
                 ev_just_set = true;
             }
         }
-        if (!ev_just_set) {
-            if (ev_wait_ > 0) {
-                ev_wait_--;
-            } else if (ev_wait_ == 0) {
+        // 在途才推进。触发帧跳过递减 —— 这就保证了"当帧 _draw 已跑完"再读纹理（至少跨 1 帧）。
+        if (!ev_just_set && ev_wait_sec_ >= 0.0f) {
+            ev_wait_sec_ -= (float)p_delta;
+            if (ev_wait_frames_ > 0) --ev_wait_frames_;
+            ev_wall_ += p_delta;
+            ++ev_frames_;
+            if (ev_wait_sec_ <= 0.0f && ev_wait_frames_ <= 0) {
+                /* 落盘。这一行日志是**取证时序的自证**：把"墙钟过了多久"和"仿真过了多久"
+                   一起打出来。判读方法：**墙钟耗时必须小于被取证据的寿命**
+                   （命中标记 0.24 秒 / 击杀标记 0.40 秒），否则截到的是已经衰减掉的画面，
+                   甚至是完全消失的画面 —— 这正是当初 "ff=6 组一张 ev_hit 都没有" 的根因。 */
+                const double now_t = (double)va::W.t;
                 save_shot(ev_tag_);
-                ev_wait_ = -1;
+                if (ev_cap_) {
+                    UtilityFunctions::print(
+                        "[capture-ev] 落盘 ", ev_tag_,
+                        "  检测 t=", godot::String::num(ev_from_t_, 2),
+                        " → 成像 t=", godot::String::num(now_t, 2),
+                        "  仿真 +", godot::String::num(now_t - ev_from_t_, 2), "s",
+                        "  墙钟 +", godot::String::num(ev_wall_, 3), "s",
+                        "  ", ev_frames_, " 帧");
+                }
+                ev_wait_sec_ = -1.0f;                      // 回到空闲
                 ev_prio_ = 0;
             }
         }
