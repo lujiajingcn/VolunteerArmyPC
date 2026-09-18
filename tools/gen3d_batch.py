@@ -77,6 +77,13 @@ KEYS = [
 FACE_COUNT = 50000
 GEN_ARGS = ["--enable-pbr", "--generate-type", "Normal", "--face-count", str(FACE_COUNT)]
 
+# 【模型档位】hy 后端用哪一版混元生3D，默认 3.1（与内置通道 / 已接入模型对齐）。
+# 可被 VA_GEN3D_MODEL 覆盖 —— 典型场景：免费额度在 3.1 上耗尽后改试同族的 3.0。
+# 依据：TokenHub 的免费体验包是**按模型**领取的，即每个模型各有独立额度；
+# 而 3.0 / 3.1 同属混元生3D，风格差异远小于换到 tripo-3d-3.1 / hi3d-2.1 这类别的模型族。
+# 只对 hy 生效：builtin 的 model 由 buddy-cloud.py 决定，tc 走 CAM 签名那套字段。
+G3D_MODEL = os.environ.get("VA_GEN3D_MODEL", "hy-3d-3.1").strip()
+
 # ---- 后端选择 ----
 # builtin：内置多模态通道（gen3d.py），限 5 次提交/天，且**同一天内不重置**。
 # tc     ：腾讯云混元生3D 官方 API 直连（gen3d_tc.py），CAM 签名，要 SecretId/SecretKey。
@@ -240,7 +247,8 @@ def run_one(key, token, force):
             # TokenHub 同理：凭据由 gen3d_hy.py 读环境变量 TOKENHUB_API_KEY 或
             # ~/.workbuddy/va_3d_api_key.txt。面数走同一个 FACE_COUNT 真值来源。
             cmd = [PY, os.path.join(ROOT, "tools", "gen3d_hy.py"), "submit",
-                   src, out_json, "--face-count", str(FACE_COUNT)]
+                   src, out_json, "--face-count", str(FACE_COUNT),
+                   "--model", G3D_MODEL]
             stdin_text = None
         else:
             cmd = [PY, os.path.join(ROOT, "tools", "gen3d.py"), src, out_json] + GEN_ARGS
