@@ -55,6 +55,28 @@ static uint32_t new_seed() {
     return (uint32_t)Time::get_singleton()->get_ticks_msec();
 }
 
+// ---- 取证机位（VA_CAM_*）-----------------------------------------------
+//
+// 相机默认固定在玩家的 (x,y) 上、离地 1.65 米，于是**没有任何办法拍到战场全貌** ——
+// 峡谷这种大尺度地形的验收要靠俯视/抬高机位，靠"站在原地转视角"是拍不到的：
+// 谷壁的天际线、道路两侧的对称性、水口缺口，站在谷底一张都看不全。
+//
+//   VA_CAM_H=<米>      在眼高之上再抬多少（如 40 → 近似航拍）
+//   VA_CAM_PITCH=<度>  强制俯仰（负值向下；-25 是常用的"半俯视"）
+//   VA_CAM_YAW=<度>    强制偏航（0 = 朝北=路的北侧；-90 = 朝东=车队来向）
+//
+// 【不写回状态】这三个旋钮只覆盖**相机变换**，不写 va::W.viewPitch / 不改 IN.* ——
+// 与 VA_ADS 只做视效、绝不写回 IN.ads 是同一条纪律（写回会污染 VA_DBG_INPUT 的取证）。
+// 代价是：强制俯仰时"子弹有效射程"仍按玩家真实视角算，取证图里别拿它验证命中率。
+static bool env_set(const char *p_name) {
+    const char *e = std::getenv(p_name);
+    return e != nullptr && *e != '\0';
+}
+static float env_f(const char *p_name, float p_def) {
+    const char *e = std::getenv(p_name);
+    return (e != nullptr && *e != '\0') ? (float)std::atof(e) : p_def;
+}
+
 WorldSim::WorldSim() = default;
 WorldSim::~WorldSim() = default;
 
@@ -774,14 +796,17 @@ void WorldSim::sync_entity_nodes() {
     for (size_t i = 0; i < va::W.vehicles.size(); ++i) {
         const va::Vehicle &v = va::W.vehicles[i];
         Node3D *n = veh_nodes_[i];
+        // 车队全程在公路（谷底）上跑，地形高度恒为 0；这里仍走同一个函数，
+        // 免得以后有人把车队路线挪出谷底时漏掉一处抬升。
+        const float gh = ground_h(v.x, v.y);
         if (v.destroyed) {
             n->set_visible(true);
-            n->set_position(to3(v.x, v.y, -0.18f));
+            n->set_position(to3(v.x, v.y, gh - 0.18f));
             n->set_rotation(Vector3(0, -v.angle, 0));
             n->set_scale(Vector3(1, 0.86f, 1));
             continue;
         }
-        n->set_position(to3(v.x, v.y));
+        n->set_position(to3(v.x, v.y, gh));
         n->set_rotation(Vector3(0, -v.angle, 0));
     }
 }
@@ -868,11 +893,19 @@ void WorldSim::_process(double p_delta) {
         const bool moving = (va::IN.w || va::IN.a || va::IN.s || va::IN.d);
         if (moving) bob_t_ += (float)p_delta * (va::IN.shift ? 13.0f : 9.0f);
         const float bob = moving ? std::sin(bob_t_) * 0.035f : 0.0f;
-        cam_->set_position(to3(p->x, p->y, (va::IN.ctrl ? 1.05f : EYE_H) + bob));
+        /* 相机必须跟着地形抬：玩家站在坡上时若还按"绝对高度 1.65"摆，
+           镜头就会埋进坡里（地形抬升最大 4.5 米 = 够埋掉整个头）。
+           取证机位 VA_CAM_H 在此之上再抬（见文件开头的说明）。 */
+        const float cam_h = (va::IN.ctrl ? 1.05f : EYE_H) + bob
+                          + ground_h(p->x, p->y) + env_f("VA_CAM_H", 0.0f);
+        cam_->set_position(to3(p->x, p->y, cam_h));
 
         // 逻辑层朝向回写：yaw = -facing - π/2  ⇒  facing = -yaw - π/2
         va::W.viewPitch = pitch_;
-        cam_->set_rotation(Vector3(pitch_, yaw_, 0));
+        const float PI = 3.14159265358979323846f;
+        const float cam_pitch = env_set("VA_CAM_PITCH") ? env_f("VA_CAM_PITCH", 0.0f) * PI / 180.0f : pitch_;
+        const float cam_yaw   = env_set("VA_CAM_YAW")   ? env_f("VA_CAM_YAW", 0.0f)   * PI / 180.0f : yaw_;
+        cam_->set_rotation(Vector3(cam_pitch, cam_yaw, 0));
     }
     // 相机落地后的第一帧才量得出真数字 —— 在此之前 cam_ 还停在原点，
     // 量出来的"距离"全是到世界原点的距离（与开局的"谁挡在镜头前"没有关系）。

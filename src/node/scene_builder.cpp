@@ -66,6 +66,177 @@ static MeshInstance3D *add_mesh(Node3D *parent, const Ref<Mesh> &mesh, const Vec
     return mi;
 }
 
+// ============================================================================
+// 峡谷地形
+// ============================================================================
+//
+// 【为什么地形只存在于渲染层】
+// 逻辑层 (src/sim/*) 是一张 2D 平面：单位只有 (x,y)，掩体只有 (x,y,r)，没有高度维；
+// 子弹的遮挡同样是 2D 的 —— `va_combat.cpp` 用 segCircle 撞掩体圆，不看高度。
+// 所以这里加的山坡**只改画面**：单位的 (x,y)、掩体的 (x,y) 与 p.r、判定顺序
+// 一个都没动，`src/sim/` 一行未改。
+//
+// 高度由一个**纯函数** ground_h() 给出，地形网格与单位/掩体摆位**共用同一个函数**：
+// 两边各写一份，迟早出现"人埋在坡里 / 石头浮在半空"这类只有靠截图才能发现的偏差。
+//
+// 【形状】公路（逻辑 y=650 → 32.5 米）压在谷底正中，两侧按剖面抬升成山坡，
+// 于是公路位于一条两侧上坡夹出的峡谷里；河道（逻辑 x 306~414 → 15.3~20.7 米）
+// 处把两侧谷壁切出一道缺口，让河从谷壁里穿出来（水口），桥正好架在缺口上。
+//
+// 【一个必须交代的取舍：为什么地图内的抬升是克制的】
+// 子弹挡在掩体上靠 2D 圆判定、不看高度。若可走区域里把地面抬得很高，站在高处的射手
+// 就会遇到"瞄准线明明越过了石头，子弹却停在石头上"——视线与判定脱节（平地没有这个问题，
+// 因为所有人都是同一高度）。所以剖面把**两个高度拆成两个旋钮**：
+//   · VA_TERRAIN_IN  = 地图边界（d = 32.5 米，`passable()` 把单位锁在地图里）处的高度，
+//     也就是**玩家走得到的最高点**，默认 **4.5 米** —— 脱节幅度被压在 1 米量级。
+//   · VA_TERRAIN_OUT = 谷壁峰值（d = 48 米，地图外，玩家走不到），默认 **18 米**。
+//     纯背景，不受上面那条约束；而它正是玩家从谷底看出去的那道天际线（视高角 ≈ 18°），
+//     峡谷感由它承担。
+// 想更激进就调大 VA_TERRAIN_OUT（只动画面）；调大 VA_TERRAIN_IN 则要同时接受上面那条脱节。
+//
+// 【一个必须交代的第二个取舍：峡谷为什么在东西两端收口】
+// 地形网格是有限的。若剖面沿 x 一路铺到网格边界，边界处就凭空多一道 15 米断崖。
+// 所以 x ∈ [-6, 122] 米保持全高、往两端 smoothstep 收口 —— 顺带也讲得通：
+// 公路从谷口穿出去（东边来车、西边是 C 点撤离线）。
+const float kRoadCy  = va::CFG.roadCY * S;                              // 32.5 米
+const float kRiverCx = (va::CFG.riverX1 + va::CFG.riverX2) * 0.5f * S;  // 18.0 米
+
+struct TerrainKnobs {
+    bool  on    = true;
+    // 这两个高度必须分开给，因为受的约束完全不同（见上面那段取舍说明）：
+    float h_in  = 4.5f;    // d = 地图边界（32.5 米）处的高度 = **玩家走得到的最高点**
+    float h_out = 18.0f;   // d = 48 米处的谷壁峰值 = **地图外，纯背景**
+    float bump  = 0.35f;   // 横向起伏强度（0 = 完美棱柱，越大越自然）
+    bool  gorge = true;    // 河道处是否开缺口
+};
+
+// 「默认开、写 0 才关」—— 与工程里其它开关同一套语义（见 README 的旋钮表）
+static bool env_off(const char *p_name) {
+    const char *e = std::getenv(p_name);
+    return e != nullptr && e[0] == '0' && e[1] == '\0';
+}
+
+static const TerrainKnobs &tknobs() {
+    static const TerrainKnobs k = [] {
+        TerrainKnobs t;
+        t.on    = !env_off("VA_TERRAIN");
+        t.gorge = !env_off("VA_TERRAIN_GORGE");
+        if (const char *v = std::getenv("VA_TERRAIN_IN"))   t.h_in  = va::clampf((float)std::atof(v), 0.0f, 40.0f);
+        if (const char *v = std::getenv("VA_TERRAIN_OUT"))  t.h_out = va::clampf((float)std::atof(v), 0.0f, 90.0f);
+        if (const char *v = std::getenv("VA_TERRAIN_BUMP")) t.bump  = va::clampf((float)std::atof(v), 0.0f, 1.0f);
+        return t;
+    }();
+    return k;
+}
+
+static float sstep(float t) { t = va::clampf(t, 0.0f, 1.0f); return t * t * (3.0f - 2.0f * t); }
+
+// 距路中心多远开始起坡（米）。路本身宽 7 米，所以坡脚离路肩还有 4.5 米平地。
+static constexpr float kFoot = 8.0f;
+
+// 横向剖面。用错开的 smoothstep 相加而不是查表插值：查表 + 逐段 smoothstep 会在每个
+// 控制点留下零导数（画面上一圈圈"梯田"），错开相加既光滑又只有几行。
+static float profile_h(float d, float h_in, float h_out) {
+    const float kEdge  = va::CFG.H * 0.5f * S;   // 32.5 米：地图边界，正好是"能走到的最高处"
+    const float kCrest = 48.0f;                  // 谷壁峰值所在的横向距离（地图外）
+    const float kBack  = 100.0f;                 // 缓降回平地
+    float h = h_in * sstep((d - kFoot) / (kEdge - kFoot));
+    h += (h_out - h_in) * sstep((d - kEdge) / (kCrest - kEdge));
+    h -= h_out * sstep((d - (kCrest + 4.0f)) / (kBack - kCrest - 4.0f));
+    return h;
+}
+
+// 平滑起伏。必须是**纯函数、无状态**：网格建顶点和每帧摆单位会各调一次，
+// 用带状态的 va::Rng 就会两边取到不同的值 —— 那正是"人陷进坡里"的来源。
+static float bnoise(float x, float y) {
+    float s = 0.52f * std::sin(x * 0.081f + y * 0.062f);
+    s += 0.27f * std::sin(x * 0.163f - y * 0.131f + 1.7f);
+    s += 0.13f * std::sin(x * 0.297f + y * 0.271f + 3.1f);
+    s += 0.08f * std::sin(x * 0.612f - y * 0.533f + 5.2f);
+    return va::clampf(0.5f + 0.5f * s, 0.0f, 1.0f);
+}
+
+// 东西两端收口（见上文的第二个取舍）
+static float x_taper(float x) {
+    if (x < -6.0f)  return sstep((x + 55.0f) / 49.0f);    // -55 → -6 米由 0 升到 1
+    if (x > 122.0f) return sstep((172.0f - x) / 50.0f);   // 122 → 172 米由 1 降到 0
+    return 1.0f;
+}
+
+// 河道缺口：河心两侧 5 米内削平（河宽 5.4 米 + 两条岸），13 米外恢复原坡
+static float gorge_mask(float x) {
+    const float xr = std::fabs(x - kRiverCx);
+    if (xr <= 5.0f) return 0.0f;
+    return sstep((xr - 5.0f) / 8.0f);
+}
+
+// 米制入参（x 沿路、y 垂直路），返回地面高度（米）
+static float terrain_raw(float x, float y) {
+    const TerrainKnobs &k = tknobs();
+    const float d = std::fabs(y - kRoadCy);
+    float h = profile_h(d, k.h_in, k.h_out);
+    if (h <= 0.0f) return 0.0f;                 // 谷底严格 0：公路/桥/河道不能被顶起来
+    h *= x_taper(x);
+    if (k.gorge) h *= gorge_mask(x);
+    if (k.bump > 0.0f) h *= (1.0f + k.bump * (bnoise(x, y) - 0.5f));
+    return h;
+}
+
+bool terrain_enabled() { return tknobs().on; }
+
+// ---- 对外入口：逻辑层坐标进，地面高度（米）出 ----
+float ground_h(float lx, float ly) {
+    if (!tknobs().on) return 0.0f;
+    return terrain_raw(lx * S, ly * S);
+}
+
+// 非均匀网格：缺口处加密（x 方向高度靠缺口掩码变化），坡面陡段加密（y 方向靠剖面变化）。
+static Ref<ArrayMesh> make_terrain_mesh() {
+    std::vector<float> xs, ys;
+    auto fill = [](std::vector<float> &v, float lo, float hi, float flo, float fhi, float fs, float cs) {
+        for (float x = lo; x < hi - 1e-3f; ) {
+            v.push_back(x);
+            x += (x >= flo && x < fhi) ? fs : cs;
+        }
+        v.push_back(hi);
+    };
+    fill(xs, -58.0f, 175.0f,  6.0f,  30.0f, 0.8f, 2.5f);
+    fill(ys, -80.0f, 145.0f, -40.0f, 105.0f, 1.0f, 4.0f);
+
+    const float TEX_M = 700.0f / 132.0f;   // 与原 700×700 地板同样的贴图密度（每 5.3 米一重复）
+    const float wall = std::max(tknobs().h_out, 0.001f);
+
+    Ref<SurfaceTool> st;
+    st.instantiate();
+    st->begin(Mesh::PRIMITIVE_TRIANGLES);
+    auto vtx = [&](float x, float y) {
+        const float h = terrain_raw(x, y);
+        const float t = va::clampf(h / wall, 0.0f, 1.0f);
+        const float nv = bnoise(x * 1.9f, y * 1.9f);
+        /* 顶点色只做很轻的染色（三通道均值都≈1、只在高处略偏干土）：
+           这套布光/曝光是标定过的（见 README 的材质三旋钮那段），染色一大就把标定推翻。
+           ACES 有跨通道耦合，所以这里只敢给"方向 + 很小幅度"，不按通道反推目标色。 */
+        const Color c(va::clampf(0.985f + 0.055f * t + 0.035f * (nv - 0.5f), 0.0f, 1.0f),
+                      va::clampf(0.995f + 0.015f * t + 0.035f * (nv - 0.5f), 0.0f, 1.0f),
+                      va::clampf(0.955f - 0.115f * t + 0.035f * (nv - 0.5f), 0.0f, 1.0f));
+        st->set_uv(Vector2(x / TEX_M, y / TEX_M));
+        st->set_color(c);
+        st->add_vertex(Vector3(x, h, y));   // 注意：单位是**米**，与 to3 的 h 同一套（不乘 S）
+    };
+    for (size_t i = 0; i + 1 < xs.size(); ++i) {
+        for (size_t j = 0; j + 1 < ys.size(); ++j) {
+            const float x0 = xs[i], x1 = xs[i + 1], y0 = ys[j], y1 = ys[j + 1];
+            vtx(x0, y0); vtx(x1, y0); vtx(x1, y1);
+            vtx(x0, y0); vtx(x1, y1); vtx(x0, y1);
+        }
+    }
+    /* index() 把重合顶点合并，generate_normals() 才会给**平滑**法线；
+       不 index 的话每个三角形各算各的，坡面会是一片片硬边。 */
+    st->index();
+    st->generate_normals();
+    return st->commit();
+}
+
 // 只重建掩体层（见头文件说明）
 // add_prop 定义在文件后半段，这里先声明（掩体建模函数很长，不搬家了）
 static void add_prop(Node3D *parent, const va::Prop &p);
@@ -843,7 +1014,8 @@ Transform3D unit_transform(float p_x, float p_y, float p_facing, bool p_downed) 
     if (p_downed) {
         b = b * Basis(Vector3(0.0f, 0.0f, 1.0f), 84.0f * 3.14159265358979323846f / 180.0f);
     }
-    return Transform3D(b, to3(p_x, p_y));
+    // 站到地面上：地形抬起来了，人就得跟着抬 —— 这里改一处，全场单位（含检阅台）一起生效。
+    return Transform3D(b, to3(p_x, p_y, ground_h(p_x, p_y)));
 }
 
 Node3D *make_vehicle_node(const std::string &type) {
@@ -923,7 +1095,8 @@ Node3D *make_box_node() {
 
 // ------------------------------------------------------- 掩体物件
 static void add_prop(Node3D *parent, const va::Prop &p) {
-    const Vector3 pos = to3(p.x, p.y);
+    // 种在坡面上：掩体的 (x,y) 与 r 都由逻辑层给、一个没动，这里只把它按地形抬起来。
+    const Vector3 pos = to3(p.x, p.y, ground_h(p.x, p.y));
     const float r = p.r * S;
     switch (p.type) {
         case va::PropType::Rock: {
@@ -1585,11 +1758,78 @@ void build_scene(Node3D *root, SceneRefs &out) {
         gm->set_roughness(0.98f);
         MeshInstance3D *mi = memnew(MeshInstance3D);
         mi->set_mesh(pm);
-        mi->set_position(to3(va::CFG.W * 0.5f, va::CFG.H * 0.5f));
+        /* 峡谷网格在谷底恒为 h=0，与这块地板共面 → 会 z-fighting。
+           把地板压下去 6 厘米（远处看不出这 6 厘米），峡谷网格就稳稳盖在上面；
+           关掉地形时地板回到 0，与改动前逐像素一致，A/B 才有意义。 */
+        mi->set_position(to3(va::CFG.W * 0.5f, va::CFG.H * 0.5f,
+                             terrain_enabled() ? -0.06f : 0.0f));
         mi->set_material_override(gm);
         ground->add_child(mi);
     }
     root->add_child(ground);
+
+    // ---- 峡谷地形（公路两侧的山坡） ----
+    if (terrain_enabled()) {
+        Node3D *terr = memnew(Node3D);
+        terr->set_name("Terrain");
+        Ref<StandardMaterial3D> tm;
+        tm.instantiate();
+        tm->set_albedo(Color(1, 1, 1));
+        tm->set_texture(StandardMaterial3D::TEXTURE_ALBEDO, tex_grass());
+        tm->set_roughness(0.98f);
+        // UV 已经按"每 5.3 米一重复"烘进了顶点，这里不能再叠 uv1_scale（会二次缩放）
+        // 枚举名注意：godot-cpp 里叫 FLAG_ALBEDO_FROM_VERTEX_COLOR（引擎文档里写作
+        // vertex_color_use_as_albedo），FLAG_VERTEX_COLOR_USE_AS_ALBEDO 这个名字不存在。
+        tm->set_flag(StandardMaterial3D::FLAG_ALBEDO_FROM_VERTEX_COLOR, true);
+        Ref<ArrayMesh> tmesh = make_terrain_mesh();
+        if (std::getenv("VA_DBG_TERRAIN") != nullptr) {
+            /* 参数读回。教训（见本文件 build_environment 里那段）：改完只截图看画面，
+               是看不出"这次改的值到底有没有编进去"的 —— 画面"看起来差不多"就白跑一轮。
+               这里把剖面与几个地标点的地面高度打成可读数字，既自证也留下回归基线。
+               判据：h(路心)=0（公路必须平）、h(32.5)=VA_TERRAIN_IN、h(48)=VA_TERRAIN_OUT、
+               水口中心恒为 0（河不能被埋）。 */
+            const TerrainKnobs &k = tknobs();
+            int verts = 0, tris = 0;
+            if (tmesh.is_valid() && tmesh->get_surface_count() > 0) {
+                const Array arr = tmesh->surface_get_arrays(0);
+                const PackedVector3Array vs = arr[Mesh::ARRAY_VERTEX];
+                const PackedInt32Array ix = arr[Mesh::ARRAY_INDEX];
+                verts = vs.size();
+                /* index() 之后顶点是**去重**的，所以顶点数 ≠ 3×三角形数。
+                   拿 vs.size()/3 当三角形数会少报一个数量级（实测 6308 vs 真值 37064）——
+                   自检里的数字必须可信，否则它比没有更糟。 */
+                tris = (ix.size() > 0) ? ix.size() / 3 : vs.size() / 3;
+            }
+            UtilityFunctions::print(String::utf8("[terrain] 开关 开  地图内最高 "), k.h_in,
+                                    String::utf8(" m  谷壁峰值 "), k.h_out,
+                                    String::utf8(" m  起伏 "), k.bump,
+                                    String::utf8("  水口 "), k.gorge ? 1 : 0,
+                                    String::utf8("  网格顶点 "), verts,
+                                    String::utf8(" / 三角形 "), tris);
+            struct P { const char *name; float lx, ly; };
+            const P pts[] = {
+                { "路心(1100,650)",      1100.0f,  650.0f },
+                { "桥/水口(360,650)",     360.0f,  650.0f },
+                { "水口北(360,200)",      360.0f,  200.0f },
+                { "玩家出生(872,872)",    872.0f,  872.0f },
+                { "北侧岩石(1128,350)",  1128.0f,  350.0f },
+                { "南侧树林(880,1240)",   880.0f, 1240.0f },
+                { "地图北界(1100,6)",    1100.0f,    6.0f },
+                { "地图南界(1100,1294)", 1100.0f, 1294.0f },
+                { "谷壁峰值(1100,1610)", 1100.0f, 1610.0f },   // 逻辑坐标，已在地图外
+            };
+            for (const P &p : pts) {
+                UtilityFunctions::print(String::utf8("[terrain] "), String::utf8(p.name),
+                                        String::utf8(" 地面 "), ground_h(p.lx, p.ly), String::utf8(" m"));
+            }
+        }
+        add_mesh(terr, tmesh, Vector3(), tm);
+        root->add_child(terr);
+    } else if (std::getenv("VA_DBG_TERRAIN") != nullptr) {
+        // 关掉时也要出声：没有这一行，"VA_TERRAIN=0 确实生效了"只能靠看图，
+        // 而 A/B 里最容易犯的错正是"以为自己关掉了、其实环境变量没传进去"。
+        UtilityFunctions::print(String::utf8("[terrain] 开关 关（VA_TERRAIN=0，平地，地板 h=0）"));
+    }
 
     // ---- 远景山脊：打破死板地平线，配合雾形成层叠剪影 ----
     {
@@ -1600,8 +1840,14 @@ void build_scene(Node3D *root, SceneRefs &out) {
 
     // ---- 河流 ----
     {
+        /* 水面长度：原来只有地图那么长（CFG.H），因为再往外是一片平地、看不出断头。
+           峡谷把河道所在的缺口一直削到离路 100 米，水若还停在地图边界，从谷底顺着
+           缺口看过去就是"河在半空中截断"。所以开地形时把水面延到缺口全长。
+           关地形时仍用原长度 —— 否则 VA_TERRAIN=0 的 A/B 里连河都不一样宽，
+           那就分不清差异是地形造成的还是这条改动造成的。 */
+        const float river_len = terrain_enabled() ? 205.0f : va::CFG.H * S;
         Ref<BoxMesh> rm = memnew(BoxMesh);
-        rm->set_size(Vector3((va::CFG.riverX2 - va::CFG.riverX1) * S, 0.10f, va::CFG.H * S));
+        rm->set_size(Vector3((va::CFG.riverX2 - va::CFG.riverX1) * S, 0.10f, river_len));
         Ref<StandardMaterial3D> wm;
         wm.instantiate();
         wm->set_albedo(Color(0.9f, 0.95f, 1.0f));
