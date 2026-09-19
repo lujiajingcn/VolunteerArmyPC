@@ -52,6 +52,7 @@
 #include <vector>
 
 #include <godot_cpp/classes/box_mesh.hpp>
+#include <godot_cpp/classes/capsule_mesh.hpp>
 #include <godot_cpp/classes/cylinder_mesh.hpp>
 #include <godot_cpp/classes/directional_light3d.hpp>
 #include <godot_cpp/classes/material.hpp>
@@ -83,11 +84,72 @@ constexpr uint32_t VM_LAYER = 1u << 1;
 const Vector3 HAND_R_BASE{0.0f, -0.080f, WPN_HAND_R0};
 const Vector3 HAND_L_BASE{-0.010f, -0.032f, WPN_HAND_L0};
 
-// 前臂半径。原先是 0.032，实测在 0.3~0.5 m 处是一条 120~180 px 宽的带子，
-// 换真模型之后它比枪本身还抢眼（识别色实测袖子 64500 px、手套只有 525 px）。
-// 人前臂直径 6~8 cm，但**这个视角下**看到的有效宽度还含近裁剪放大，
-// 所以视觉上要按"看上去像一根手臂"来压，而不是按解剖尺寸。0.024 是压过两档之后的值。
-constexpr float FOREARM_R = 0.024f;
+// 前臂的**腕端**相对掌心的偏移：从掌心往 +z 退出半个掌厚，落到掌背/腕上。
+// 起点放在掌心会被自己的圆柱把手掌整个包住（实测手套只剩 525 px 的那个坑）。
+const Vector3 WRIST_R_OFF{0.004f, -0.008f, 0.036f};
+const Vector3 WRIST_L_OFF{0.004f, -0.008f, 0.042f};
+
+// 肘的位置（枪局部系）。**这是一个常量，不随每把枪的握持点平移** ——
+// 肘长在人身上，支撑手在护木上往前挪 17 cm，肘不会跟着挪 17 cm。
+//
+// 【两个约束一起定这组数：方向要出画，深度不能太浅】
+//   ① 竖直角：相机空间的 y/z 之比要够大，肘才落在画面下沿之外。
+//      要求 atan(|y|/|z|) > 35.8°（垂直半视场 32.5° + 一点余量）。
+//   ② **深度**：这里才是上一版栽的地方。原先把肘放在 z=-0.12（换算到相机
+//      空间深度只有 0.22 m），而正交投影下"离视轴多远"是按**沿视轴的深度** z
+//      缩放的 —— 0.22 m 深处的一根 2.7 cm 粗的胳膊被透视放大成
+//      屏幕上一个 150 px 宽的**喇叭口**，比手还抢眼（放大取证图实测）。
+//      深度拉到 0.45 m 之后，同样的半径只占 ~50 px，才读得出是一条前臂。
+// 两个约束联立得到：肘放到相机空间深度 ~0.4 m、竖直角 ~40° 附近，再换算回枪局部系。
+//
+// 【为什么两只肘的 x 差这么多 —— 参考图里只有一条手臂】
+// 最初两只肘是对称地甩到 ±0.30 的（"两条前臂从画面两下角插进来"）。换到真模型
+// 之后这条不成立了：支撑手在护木上、离眼睛 0.42 m，肘再甩到左边，左前臂就成了
+// **一条从画面左下角斜穿到中央的长杠**，横在公路上比枪还抢眼。
+// 看参考图（CSGO / BFV）会发现持枪视角里通常**只看得见扳机手那一条前臂**，
+// 支撑臂是垂在枪下面、几乎整条出画的。所以左肘收到枪的中线底下（x≈-0.15，
+// 几乎垂直向下），右肘留在右下角 —— 这样左臂只剩枪腹下的一小段，
+// 视觉重心回到枪上。
+// 【2026-09-19 二次结论：肘的位置几乎不影响腰射观感，别再调它了】
+// 这一版把两只肘从 (0.30, -0.44, -0.12) 一路挪到 (0.56, -0.60, -0.43)，
+// 腰射截图逐像素比对（阈值 8）**只有 1% 的像素有差异** —— 等于没动。
+// 原因是肘本来就在画面外，露出来的那一截（腕 → 画面下沿）的屏幕位置只由
+// 腕端决定：
+//     腕 u0.538 v0.691 ／ 肘 u0.409 v1.230
+// 腕不动，露出来的那 423 px 就一分不少。而按真人前臂 0.27 m 的长度反推，
+// 肘能提供的横向漂移最多只有 130~190 px —— 撑不出"斜穿画面"的构图。
+// 所以这一版不再动肘，改从**明度结构 + 筋络**下手（见下面的 strap / 袖褶）。
+//
+// 留一个记录：真正能减少"露出来多少"的只有**支撑手的屏幕高度**（v 0.69），
+// 而它由枪的握持点决定 —— 动它等于动枪，不是调手臂能解决的。
+const Vector3 ELBOW_R{0.560f, -0.600f, -0.430f};
+const Vector3 ELBOW_L{-0.150f, -0.560f, -0.500f};
+
+// 前臂半径（腕端 / 肘端）。
+// 腕端的口径是"屏幕上的绝对宽度"：0.026 半径 → 直径 5.2 cm，在 0.374 m 处
+// 折合 149 px（= 屏高的 11%）—— 一条比枪管还宽的可读块。压到 0.024（138 px）。
+// 肘端**不能跟着放大**：投影宽度 ∝ r/深度，而肘比腕更深，所以肘一粗，
+// 屏幕上的下沿反而比腕部更宽 —— 实测 0.026/0.034 会让画面下沿比腕部宽 9%，
+// 读出来是一根**下粗上细的喇叭口 / 树桩**。0.033 刚好把这一项拉平。
+constexpr float ARM_R_WRIST = 0.0215f;
+constexpr float ARM_R_ELBOW = 0.030f;
+// 腕带（手套腕口）半径 = 前臂腕端 ×1.32，并且**换成深色皮革**。
+// 上一版的口径是"靠轮廓上鼓一圈来读，不靠颜色"（手套 0.54 / 袖子 0.50
+// 几乎同色）。这一版反过来：袖子压暗到 0.33 之后，手腕处再套一圈 0.15 的
+// 深色腕带，于是"手 → 腕带 → 袖子"是一条 **L96 → L30 → L44** 的明度阶梯。
+//
+// ⚠️ **腕带必须套在腕球的位置上（t≈0）**。第一版把腕带放在腕端往肘 2.2 cm
+// 处，结果手套色的小腕球（albedo 0.54）孤零零留在手腕上，渲染出来是画面
+// 下方**最亮的一块**（实测 RGB 254 那一档的邻居），读成"金属护腕"；
+// 而深色腕带紧贴在它下面、压在同样深的袖子上，等于不存在。
+// 判据：识别色图里腕球与腕带都是"手套绿"，**分不出来** —— 只能靠
+// "正常图手腕处是不是比手还亮"来判断，别指望染色图。
+constexpr float CUFF_R_MUL = 1.32f;
+// 袖褶：手臂 62% 处套一圈比前臂粗 13% 的短管，用来**打断那根等宽长管**。
+// 一根从腕一直延伸到画面外的等宽圆柱，读出来是"木头 / 管子"；加一道褶，
+// 它才变成"布"。这是最便宜的一笔 —— 一行几何体换掉整个"原木"读感。
+constexpr float FOLD_AT = 0.62f;
+constexpr float FOLD_R_MUL = 1.13f;
 
 // 颜色统一走 sRGB→线性。Godot 的 albedo 在线性空间，直接把选色直觉
 // （sRGB 的 0.30）填进去会平白亮一大截。
@@ -108,6 +170,17 @@ float env_f(const char *name, float def) {
     const char *v = std::getenv(name);
     if (v == nullptr || *v == '\0') return def;
     return (float)std::strtod(v, nullptr);
+}
+
+// 本工程所有旋钮的统一语义：**不设 = 默认；显式给了合法值才覆盖**。
+// 越界（写错了）退回默认，而不是照一个荒唐的值算下去 —— 视图模型这一块
+// 一个越界的数就能让枪整个撞进近裁剪面，而症状（画面上一块黑板）跟"枪的
+// 位置不对"看不出关系，排查代价很高。
+float env_f_clamped(const char *p_name, float p_def, float p_lo, float p_hi) {
+    const char *e = std::getenv(p_name);
+    if (e == nullptr || *e == '\0') return p_def;
+    const float v = (float)std::strtod(e, nullptr);
+    return (v >= p_lo && v <= p_hi) ? v : p_def;
 }
 
 // 一盏"只管枪模"的平行光。travel 是光的传播方向（即节点的 -Z 轴）。
@@ -372,6 +445,49 @@ Ref<BoxMesh> box(float x, float y, float z) {
     return b;
 }
 
+// ---- 圆润基元：手用它们，枪用 BoxMesh ----
+//
+// 【为什么手不能再用方块】掌与指原来都是 BoxMesh。换真模型之后手离眼睛只有
+// 0.24~0.42 m，一块 5×7 cm 的方板在这个距离上占 ~190 px，**三条棱各自受不同
+// 方向的灯**，于是画面上一眼就是"一摞棕色积木"。这不是尺寸调得不对：
+// 盒体在这个尺度下的问题是没有连续法线 —— 相邻两个面的亮度是断的，
+// 大脑读到的就是"两个物体"。椭球/胶囊的平滑法线让明暗连续过渡，
+// 同样的轮廓立刻就变成"一块肉/一只手套"。代价只是分段数。
+MeshInstance3D *part_mi(Node3D *parent, const Ref<Mesh> &mesh, const Vector3 &half,
+                        const Vector3 &pos, const Vector3 &rot_deg, const Ref<Material> &mat) {
+    MeshInstance3D *mi = memnew(MeshInstance3D);
+    mi->set_mesh(mesh);
+    mi->set_scale(half);          // Godot 的节点变换是 T·R·S，缩放先于旋转生效
+    mi->set_position(pos);
+    mi->set_rotation_degrees(rot_deg);
+    mi->set_material_override(mat);
+    vm_layer(mi);
+    parent->add_child(mi);
+    return mi;
+}
+
+// 椭球：单位球按半轴 half 缩放。半径 1 / 高 2 = 标准单位球。
+MeshInstance3D *ball(Node3D *parent, const Vector3 &half, const Vector3 &pos,
+                     const Vector3 &rot_deg, const Ref<Material> &mat) {
+    Ref<SphereMesh> s = memnew(SphereMesh);
+    s->set_radius(1.0f);
+    s->set_height(2.0f);
+    s->set_radial_segments(16);
+    s->set_rings(8);
+    return part_mi(parent, s, half, pos, rot_deg, mat);
+}
+
+// 胶囊：一根手指 / 一段拇指。h 是**含两端半球**的总长（引擎要求 h >= 2r）。
+MeshInstance3D *cigar(Node3D *parent, float r, float h, const Vector3 &pos,
+                      const Vector3 &rot_deg, const Ref<Material> &mat) {
+    Ref<CapsuleMesh> c = memnew(CapsuleMesh);
+    c->set_radius(r);
+    c->set_height(std::max(h, r * 2.0f));
+    c->set_radial_segments(12);
+    c->set_rings(4);
+    return part_mi(parent, c, Vector3(1, 1, 1), pos, rot_deg, mat);
+}
+
 Ref<CylinderMesh> tube(float r, float h, int seg = 10) {
     Ref<CylinderMesh> c = memnew(CylinderMesh);
     c->set_top_radius(r);
@@ -382,35 +498,98 @@ Ref<CylinderMesh> tube(float r, float h, int seg = 10) {
     return c;
 }
 
-// 在两点之间架一根圆柱（前臂、枪管都用它）。
+// 在两点之间架一根圆柱（枪管等静态件用）。
 // CylinderMesh 的轴是局部 +Y，所以要构造一个把 +Y 旋到 a→b 方向的基。
 // 手写旋转角很容易把前臂摆成"立起来的柱子"（第一版就是这么错的）。
-MeshInstance3D *limb(Node3D *parent, const Vector3 &a, const Vector3 &b, float r,
-                     const Ref<Material> &mat) {
-    const Vector3 d = b - a;
-    const float len = d.length();
-    if (len < 1e-4f) return nullptr;
-    const Vector3 dir = d / len;
+Basis basis_along(const Vector3 &a, const Vector3 &b) {
+    const Vector3 dir = (b - a).normalized();
     const Vector3 up(0.0f, 1.0f, 0.0f);
-    Basis basis;
     const float dp = va::clampf(up.dot(dir), -1.0f, 1.0f);
     if (dp > 0.9999f) {
-        basis = Basis();
+        return Basis();
     } else if (dp < -0.9999f) {
-        basis = Basis(Vector3(1, 0, 0), 3.141592653589793f);
-    } else {
-        basis = Basis(up.cross(dir).normalized(), std::acos(dp));
+        return Basis(Vector3(1, 0, 0), 3.141592653589793f);
     }
-    MeshInstance3D *mi = memnew(MeshInstance3D);
-    mi->set_mesh(tube(r, len, 8));
-    mi->set_transform(Transform3D(basis, (a + b) * 0.5f));
-    mi->set_material_override(mat);
-    vm_layer(mi);
-    parent->add_child(mi);
-    return mi;
+    return Basis(up.cross(dir).normalized(), std::acos(dp));
+}
+
+// **带锥度**的圆柱：+Y 端半径 r_top、-Y 端半径 r_bot。
+// 【为什么前臂一定要有锥度】一根等径圆柱在这个视角下读不出"胳膊"，读得出的是
+// "管子/棍"。真人前臂在腕处约 5 cm、往上到肘附近涨到 8~9 cm，这一条收分就是
+// 大脑判定"这是手臂"的主要线索之一。程序化枪模最早那版前臂就是等径的，
+// 在放大图里和一根撑杆没有区别。
+Ref<CylinderMesh> tube_taper(float r_top, float r_bot, float h, int seg = 10) {
+    Ref<CylinderMesh> c = memnew(CylinderMesh);
+    c->set_top_radius(r_top);
+    c->set_bottom_radius(r_bot);
+    c->set_height(h);
+    c->set_radial_segments(seg);
+    c->set_rings(1);
+    return c;
+}
+
+// 把一根前臂摆到"腕 a → 肘 b"。**每次换枪都要重摆**。
+void set_forearm(MeshInstance3D *p_mi, const Vector3 &a, const Vector3 &b,
+                 float r_wrist, float r_elbow) {
+    if (p_mi == nullptr) return;
+    const float len = (b - a).length();
+    if (len < 1e-4f) {
+        p_mi->set_visible(false);
+        return;
+    }
+    p_mi->set_visible(true);
+    // 柱体的 +Y 端指向 b（肘），所以"顶端粗、底端细"= 肘粗腕细。
+    p_mi->set_mesh(tube_taper(r_elbow, r_wrist, len, 10));
+    p_mi->set_transform(Transform3D(basis_along(a, b), (a + b) * 0.5f));
+}
+
+// 手臂上的"一圈"：在腕 a → 肘 b 之间 t 处套一段短管（腕带 / 袖褶都用它）。
+// t 是**沿手臂长度的比例**，不是米数 —— 换枪时腕端会挪（莫辛 -0.45、
+// DP-27 -0.62），比例口径自动跟着走，不必每把枪重算一圈的位置。
+void set_ring(MeshInstance3D *p_mi, const Vector3 &a, const Vector3 &b,
+              float r, float t, float len) {
+    if (p_mi == nullptr) return;
+    const Vector3 d = b - a;
+    if (d.length() < 1e-4f) {
+        p_mi->set_visible(false);
+        return;
+    }
+    p_mi->set_visible(true);
+    p_mi->set_mesh(tube(r, len, 10));
+    p_mi->set_transform(Transform3D(basis_along(a, b), a + d * t));
+}
+
+// 腕口那一圈（深色腕带）。它比前臂略粗、只有 5 cm 长，摆在腕端往肘一侧一点。
+// 参考图里"手套的腕口压在袖子上"是读出手腕最省笔墨的一笔：只有它，
+// 前臂与手掌之间才有"关节"而不是两段直接焊在一起。
+void set_cuff(MeshInstance3D *p_mi, const Vector3 &a, const Vector3 &b, float r) {
+    if (p_mi == nullptr) return;
+    const float dl = (b - a).length();
+    if (dl < 1e-4f) {
+        p_mi->set_visible(false);
+        return;
+    }
+    set_ring(p_mi, a, b, r, 0.008f / dl, 0.056f);
 }
 
 } // namespace
+
+// 按当前 cur_hand_r / cur_hand_l 重摆两条前臂与腕口。
+// 换枪后必须调一次：每把枪的支撑手握点在护木上的位置差得很远
+// （莫辛 z=-0.45、波波沙 -0.48、DP-27 -0.62），腕端要跟着走，肘不动。
+void ViewModel::place_arms() {
+    if (hands == nullptr) return;
+    const float rw = env_f_clamped("VA_VM_ARM_W", ARM_R_WRIST, 0.008f, 0.080f);
+    const float re = env_f_clamped("VA_VM_ARM_E", ARM_R_ELBOW, 0.008f, 0.090f);
+    const Vector3 wr = cur_hand_r + WRIST_R_OFF;
+    const Vector3 wl = cur_hand_l + WRIST_L_OFF;
+    set_forearm(fore_r, wr, ELBOW_R, rw, re);
+    set_forearm(fore_l, wl, ELBOW_L, rw, re);
+    set_cuff(cuff_r, wr, ELBOW_R, rw * CUFF_R_MUL);
+    set_cuff(cuff_l, wl, ELBOW_L, rw * CUFF_R_MUL);
+    set_ring(fold_r, wr, ELBOW_R, rw * FOLD_R_MUL, FOLD_AT, 0.034f);
+    set_ring(fold_l, wl, ELBOW_L, rw * FOLD_R_MUL, FOLD_AT, 0.034f);
+}
 
 void ViewModel::build(Camera3D *p_cam, Node *p_proto_parent) {
     if (p_cam == nullptr) return;
@@ -419,8 +598,21 @@ void ViewModel::build(Camera3D *p_cam, Node *p_proto_parent) {
 
     // 开发期旋钮：不动代码就能扫姿态。VA_VM_HIP / VA_VM_AIM / VA_VM_ROT。
     env_vec3("VA_VM_HIP", hip_pos);
-    env_vec3("VA_VM_AIM", aim_pos);
+    aim_env_over = env_vec3("VA_VM_AIM", aim_pos);
     env_vec3("VA_VM_ROT", hip_rot);
+
+    // 视图模型统一缩放。**它和 hip_pos 必须一起调**：
+    // 整体乘 s 再把 hip_pos 也乘 s 是一个相似变换，屏幕上分毫不变 ——
+    // 真正决定观感的只有"眼睛在枪局部系里的位置" Z0 = -hip_pos.z / vm_scale。
+    // s 的作用是让"枪相对人有多大"可变，从而在不撞近裁剪面的前提下把 Z0 压下来。
+    vm_scale = env_f_clamped("VA_VM_SCALE", 0.620f, 0.30f, 1.60f);
+    // 开镜距离默认 0.270（原 0.200）。**这不是手感问题，是画面占比问题**：
+    // 0.200 时托底板落在眼睛前 20 cm 处，它 8.4 cm 高，屏幕高度 1369 px 下占
+    // 0.084/(2·0.20·0.6371)·1369 ≈ 820 px —— 开镜画面**下半屏整个被托底糊住**，
+    // 连枪自己的机匣都只剩一条。扫过 0.20 / 0.27 / 0.34 三档取证：
+    // 0.27 是"托底退到画面下缘之外、枪身仍占满中央"的那一档；0.34 时枪身细成一条。
+    // 注意改它**不影响开镜对准** —— 落点是由照门反推的，拉开距离只是等比缩小。
+    aim_dist = env_f_clamped("VA_VM_AIMDIST", 0.270f, 0.060f, 0.600f);
 
     // 开镜视场由基础视场推导 —— 改世界 FOV 时枪的放大倍率自动跟随。
     fov_base = p_cam->get_fov();
@@ -428,6 +620,10 @@ void ViewModel::build(Camera3D *p_cam, Node *p_proto_parent) {
 
     root = memnew(Node3D);
     root->set_name("ViewModel");
+    // root 只承担"位移 + 动态旋转"，缩放挂在同一层上：
+    // root 自己的 set_position 在父空间（相机空间）里，不受自身缩放影响，
+    // 所以 pos 那套摆动/后坐的米数不用跟着改。
+    root->set_scale(Vector3(vm_scale, vm_scale, vm_scale));
     p_cam->add_child(root);
 
     gun = memnew(Node3D);
@@ -483,7 +679,13 @@ void ViewModel::build(Camera3D *p_cam, Node *p_proto_parent) {
     // 暗过头又变回死黑方板。口径用 tools/vm_hand_probe.py
     // （正常图 + VA_VM_HIDE 消融图 + VA_VM_MAT 识别色图 → 拆出枪身/手套/袖子三行）。
     const float g_alb = va::clampf(env_f("VA_VM_GLOVE", 0.540f), 0.02f, 1.0f);
-    const float s_alb = va::clampf(env_f("VA_VM_SLEEVE", 0.500f), 0.02f, 1.0f);
+    // 袖子从 0.500 压到 0.330。**这不是审美问题，是构图问题**：
+    // 支撑前臂在腰射画面上是一条 423×150 px 的带子，占屏面积比枪管还大。
+    // 上一版它渲染成 L88 的暖卡其，是整个画面下半部**最亮的大块** ——
+    // 于是眼睛先看到"一根亮柱子"，再看枪。翻参考图（CSGO / BFV）会发现
+    // 那条前臂一律是**暗色剪影**：贴地的暗块，天然往后退。
+    // 压暗之后手（L96）与袖子（L~60）拉开一档半，手臂才退回"支撑物"的位置。
+    const float s_alb = va::clampf(env_f("VA_VM_SLEEVE", 0.330f), 0.02f, 1.0f);
     // 手套的色相比袖子还要极端 —— 这不是随手加的饱和度，是量出来的：
     // 手套那几个方块**朝相机**的面在蓝通道上的照度远高于红通道，按
     // "正常皮革色"（1 : 0.58 : 0.30）写进去，渲染出来是 RGB(83,60,75) ——
@@ -500,6 +702,11 @@ void ViewModel::build(Camera3D *p_cam, Node *p_proto_parent) {
     // 与木色拉开色相关系。
     const Ref<StandardMaterial3D> sleeve = dbg_mat ? id_mat(Color(0, 0, 1))
         : vm_mat(Color(s_alb, s_alb * 0.820f, s_alb * 0.400f), 0.0f, 0.95f);   // 军装布
+    // 腕带：深色皮革，比袖子还暗两档。dbg 模式下**必须仍旧算"手套绿"** ——
+    // tools/vm_hand_probe.py 是按"绿=手 / 蓝=袖 / 红=枪"分类像素的，
+    // 给它一个新识别色等于让那套口径失效（腕带会被算成"未知"丢掉）。
+    const Ref<StandardMaterial3D> strap = dbg_mat ? id_mat(Color(0, 1, 0))
+        : vm_mat(Color(0.150f, 0.138f, 0.120f), 0.04f, 0.88f);
 
     // 定档实测（莫辛，tools/vm_hand_probe.py；同一口径下改前 → 改后）：
     //     手套  L52 RGB(43,52,74) 偏蓝灰  →  L96 RGB(119,90,83) 皮革棕
@@ -648,21 +855,111 @@ void ViewModel::build(Camera3D *p_cam, Node *p_proto_parent) {
     //   · 左手托护木时，近侧看到的是**手掌压在管子下面 + 手指从管子顶上扣过来**
     //     → 掌放高一点（够到管顶），再放三条横跨管顶的指头。
     // 拇指一律放在近侧，它是"这里有一只手"最省笔墨的信号。
-    part(hand_r, box(0.054f, 0.080f, 0.080f), HAND_R_BASE, Vector3(14, 0, 0), glove);            // 右手掌（手背朝相机）
-    part(hand_r, box(0.020f, 0.024f, 0.030f),                                                    // 右手拇指
-         HAND_R_BASE + Vector3(-0.034f, 0.030f, -0.014f), Vector3(24, -18, 0), glove);
-    limb(hand_r, HAND_R_BASE + Vector3(0.004f, -0.006f, 0.030f),          // 起笔在掌背，不在掌心
-         Vector3(0.290f, -0.540f, -0.130f), FOREARM_R, sleeve);                                  // 右前臂
-
-    part(hand_l, box(0.056f, 0.086f, 0.086f), HAND_L_BASE, Vector3(), glove);                    // 左手掌（托在护木下）
-    for (int i = 0; i < 3; ++i) {                                                                // 左手四指扣过护木顶面
-        part(hand_l, box(0.058f, 0.017f, 0.021f),
-             HAND_L_BASE + Vector3(0.0f, 0.046f, (float)(i - 1) * 0.028f), Vector3(), glove);
+    // ---- 右手：握住握把，手背朝相机 ----
+    // ⚠️ 掌那块**本体**不能省。上一版改这一节时把它删掉了（只剩指节+腕+拇指），
+    // 结果画面上是一串**互相飘开**的棕方块 —— 指节本来是"贴在掌的棱上"的，
+    // 掌没了，它们就失去了参照物。这类"看起来像散件"的症状，先查主体在不在。
+    // ---- 右手：攥住握把，手背朝相机（近侧看到的是手背那一坨 + 拇指） ----
+    // ⚠️ 掌那块**本体**不能省。上一版改这一节时把它删掉了（只剩指节+腕+拇指），
+    // 结果画面上是一串**互相飘开**的棕方块 —— 指节本来是"贴在掌的棱上"的，
+    // 掌没了，它们就失去了参照物。这类"看起来像散件"的症状，先查主体在不在。
+    //
+    // 【2026-09-19 重做：四指从"竖直排成一列"改成"横着叠成四道指背"】
+    // 上一版四指是**沿 Y 竖着**的胶囊、沿 y 排开 1.95 cm。竖胶囊竖着叠 = 从
+    // 相机看过去是一根**竖着的柱子**；而且最上面那根（y 比掌顶还高 6 mm）在
+    // 画面里是**单独一块**漂在手背上方（放大取证图实测）。
+    // 拳头攥住握把时，指背是**横**的（沿 x 绕握把一圈），四道沿握把轴线叠起来。
+    // 所以改成：胶囊绕 Z 倒 70°（几乎水平）、沿 y 以 1.7 cm 叠四道，
+    // 并且**整列都收进掌的轮廓里**（掌半高抬到 0.042）—— 这样既不会露出
+    // 悬空的指节，四个指尖还会从掌的远侧探出去一点，读成"手指绕过去了"。
+    ball(hand_r, Vector3(0.026f, 0.042f, 0.036f),                                                // 右手背
+         HAND_R_BASE + Vector3(-0.006f, 0.000f, 0.000f), Vector3(10, 0, 6), glove);
+    for (int i = 0; i < 4; ++i) {
+        cigar(hand_r, 0.0092f, 0.046f,
+              HAND_R_BASE + Vector3(0.002f, 0.016f - (float)i * 0.0170f, -0.026f),
+              Vector3(0, 0, -70.0f + (float)i * 5.0f), glove);
     }
-    part(hand_l, box(0.018f, 0.022f, 0.034f),                                                    // 左手拇指
-         HAND_L_BASE + Vector3(-0.036f, 0.022f, -0.030f), Vector3(0, -20, 0), glove);
-    limb(hand_l, HAND_L_BASE + Vector3(0.004f, -0.006f, 0.036f),          // 起笔在掌背，不在掌心
-         Vector3(-0.320f, -0.540f, -0.150f), FOREARM_R, sleeve);                                 // 左前臂
+    ball(hand_r, Vector3(0.022f, 0.024f, 0.020f),                                                // 右手腕
+         HAND_R_BASE + Vector3(0.002f, -0.010f, 0.038f), Vector3(10, 0, 0), glove);
+    // 拇指从手背上沿往前指（真人握枪时拇指是搭在握把上侧的），
+    // 镜位在手背近侧，所以它要**贴着手背的左缘**再往外鼓一点才看得见。
+    cigar(hand_r, 0.0105f, 0.044f,                                                               // 右手拇指
+          HAND_R_BASE + Vector3(-0.030f, 0.023f, -0.025f), Vector3(-55, 0, -20), glove);
+
+    // ---- 左手：托在护木下，四指从管子顶上扣过来 ----
+    //
+    // ⚠️ 掌**必须压在木头下面**。掌心 y 的口径是"木头下缘 + 0.022"，
+    // 掌若做得太高，掌顶就盖到护木上面去 —— 画面上读出来是"一只手从两侧
+    // 夹住枪管"，不像托。半轴 0.030 之后掌顶刚好落在木头腰部，上面留给四指。
+    //
+    // 四指沿 **X** 横跨在护木上方（不是沿 z 排成一列）：手托护木时手指是
+    // 从近侧绕到管顶、**横着**搭过去的，四根指的走向与枪管垂直。
+    // ---- 左手：从**左侧**托住护木，手背朝相机、四指从木头顶上扣过去 ----
+    //
+    // 【这一节是 2026-09-19 重做的，症状是"四根竖着的香肠"】
+    // 上一版是一块埋在木头里的掌 + 四根**竖直**胶囊。竖直胶囊在画面上就是
+    // 四根并排立着的柱子 —— 没有"绕过枪"的方向，也没有和手掌连成一片，
+    // 于是读成"几根香肠浮在枪旁边"（放大取证图实测）。
+    //
+    // 重做按"相机看得见什么"分两层：
+    //   ① **手背那一坨必须是画面里能看见的主体。** 上一版掌心 x=-0.026 整个
+    //      落在莫辛 z=-0.45 处的木头（x∈[-0.039,+0.006]、y∈[-0.052,+0.016]）
+    //      **里面**，只剩木底下一道缝 —— 这才是"看不见手"的真正原因，
+    //      比握持点量得准不准更致命（量得再准也看不见）。
+    //      现在手背心挪到木头的**左外侧**（x=-0.048，木左缘是 -0.039），
+    //      侧面才露出一整片 ~3 cm 宽的手背。
+    //   ② 四指**斜搭**在木头左上棱上（绕 Z 倒 34°+）：指根在手背上、
+    //      指尖越过顶面 1.7 cm 落在木头另一侧。有了这个方向，它们才不是柱子。
+    //      四根沿 z 排开、间距 2.1 cm —— 对应护木上并排的四道指背。
+    ball(hand_l, Vector3(0.022f, 0.034f, 0.040f),                                                // 左手背
+         HAND_L_BASE + Vector3(-0.022f, 0.016f, 0.000f), Vector3(0, 0, 14), glove);
+    for (int i = 0; i < 4; ++i) {
+        cigar(hand_l, 0.0086f, 0.043f,
+              HAND_L_BASE + Vector3(-0.014f, 0.044f, ((float)i - 1.5f) * 0.0210f),
+              Vector3(0, 0, -34.0f + (float)i * 3.0f), glove);
+    }
+    // 拇指**顺着护木往前指**（真人托护木就是这样的），而不是从掌顶翘起来。
+    // ⚠️ 它必须**压在手背上**（x ≈ -0.058），不能放到手背轮廓之外：
+    // 放到 -0.070 时它在染色图里是一个**和手完全分开的椭圆**（中间隔着世界色），
+    // 画面上读成"一根漂在枪旁边的香肠"。
+    cigar(hand_l, 0.0100f, 0.048f,                                                               // 左手拇指
+          HAND_L_BASE + Vector3(-0.032f, 0.002f, -0.026f), Vector3(-72, 0, -12), glove);
+    ball(hand_l, Vector3(0.021f, 0.024f, 0.020f),                                                // 左手腕
+         HAND_L_BASE + Vector3(0.002f, -0.010f, 0.042f), Vector3(10, 0, 0), glove);
+
+    // 前臂与腕口挂在 hands 上（**不是** hand_r / hand_l）：那两组会随每把枪的
+    // 握持点整体平移，而肘长在人身上、不跟着枪走。挂进 hand 组的话，支撑手一
+    // 往前（莫辛 z=-0.45、DP-27 z=-0.62），肘跟着往前，前臂就被拉成一根
+    // 斜穿画面的细棍 —— 这正是放大取证图里那根"撑杆"的来历。
+    fore_r = memnew(MeshInstance3D);
+    fore_r->set_material_override(sleeve);
+    vm_layer(fore_r);
+    hands->add_child(fore_r);
+    fore_l = memnew(MeshInstance3D);
+    fore_l->set_material_override(sleeve);
+    vm_layer(fore_l);
+    hands->add_child(fore_l);
+    cuff_r = memnew(MeshInstance3D);
+    cuff_r->set_material_override(strap);
+    vm_layer(cuff_r);
+    hands->add_child(cuff_r);
+    cuff_l = memnew(MeshInstance3D);
+    cuff_l->set_material_override(strap);
+    vm_layer(cuff_l);
+    hands->add_child(cuff_l);
+    // 袖褶用袖子自己的材质 —— 它要读成"同一块布上的一道褶"，不是第二件装备。
+    fold_r = memnew(MeshInstance3D);
+    fold_r->set_material_override(sleeve);
+    vm_layer(fold_r);
+    hands->add_child(fold_r);
+    fold_l = memnew(MeshInstance3D);
+    fold_l->set_material_override(sleeve);
+    vm_layer(fold_l);
+    hands->add_child(fold_l);
+
+    cur_hand_r = HAND_R_BASE;
+    cur_hand_l = HAND_L_BASE;
+    place_arms();
 
     // ------------------------------------------------------------------
     // 枪口 + 枪口焰
@@ -798,6 +1095,7 @@ bool ViewModel::load_skin(int p_index) {
         art_len[p_index] = info.length;
         art_hand_r[p_index] = info.hand_r_pos;
         art_hand_l[p_index] = info.hand_l_pos;
+        art_sight[p_index] = info.sight_pos;
     }
     art_muzzle_z = art_mz[p_index];
 
@@ -820,6 +1118,17 @@ bool ViewModel::load_skin(int p_index) {
     if (env_vec3("VA_VM_HANDOFF_L", d)) hl += d;
     if (hand_r != nullptr) hand_r->set_position(hr - HAND_R_BASE);
     if (hand_l != nullptr) hand_l->set_position(hl - HAND_L_BASE);
+
+    // 前臂的腕端跟着新的握持点走，肘不动。
+    cur_hand_r = hr;
+    cur_hand_l = hl;
+    place_arms();
+
+    // 开镜对准：把"枪自己的照门"当眼睛要穿过的那一点。
+    // 换枪时它必须跟着换 —— 三把枪的照门高度差了一倍多（莫辛 0.075 / DP-27 0.160），
+    // 沿用同一组 aim 偏移的话，DP-27 开镜时枪会整个沉到画面下半。
+    aim_sight_x = art_sight[p_index].x;
+    aim_sight_y = art_sight[p_index].y;
 
     for (int i = 0; i < art_slots; ++i) {
         if (art_nodes[i] != nullptr) art_nodes[i]->set_visible(i == p_index);
@@ -965,13 +1274,30 @@ void ViewModel::update(double p_dt, float move01, bool running, float pitch, flo
     gun->set_rotation_degrees(hip_rot.lerp(aim_rot, ads));
 
     // ---- 合成位置 ----
-    Vector3 pos = hip_pos.lerp(aim_pos, ads);
+    //
+    // 【开镜落点不是常数，是按"枪自己的照门"反推的】
+    // 开镜时姿态角归零，枪局部系与相机系同向，于是"照门落在视轴上"这一个条件
+    // 直接给出 x/y：aim.x = -sight.x·s，aim.y = -sight.y·s。
+    // 上一版把它写死成 (0.018, -0.075)，那是**程序化枪模红点瞄具**的高度；
+    // 换成真模型之后每把枪的照门高度都不同，症状是开镜时枪沉在画面下方
+    // （实测莫辛机匣顶落在 0.73 屏高，离中心近四分之一屏高，等于瞄了个寂寞）。
+    // VA_VM_AIM 显式给过时整套照它的算 —— 找位/取证时要能强行指定。
+    Vector3 aim_eff = aim_env_over
+        ? aim_pos
+        : Vector3(-aim_sight_x * vm_scale, -aim_sight_y * vm_scale, -aim_dist);
+
+    Vector3 pos = hip_pos.lerp(aim_eff, ads);
     pos.x += bx + brx + sway_yaw * 0.35f;
     pos.y += by + bry + sway_pitch * 0.35f - rl * 0.115f;
     // 后坐退让：开镜时行程要收窄，否则枪托会顶到近裁剪面上
     pos.z += recoil * 0.045f * (1.0f - ads * 0.60f);
     pos.y += recoil * 0.017f;
     pos.x += rl * 0.045f;
+    // 最后一道保险：枪上任何一点落到相机后方都会被近裁剪面切开，
+    // 画面上不是"枪少了半截"而是一块**黑板**（切开的截面正对相机），
+    // 症状和"枪的位置不对"完全看不出关系。把枪托尾端到眼睛的距离钉在
+    // 0.078 m（近裁剪 0.06 + 1.8 cm 余量）以内不再靠近，无论上面怎么叠加。
+    pos.z = std::min(pos.z, -0.078f);
     root->set_position(pos);
 
     // ---- 合成旋转（root 只承担动态部分）----

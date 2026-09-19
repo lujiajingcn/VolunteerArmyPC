@@ -2,6 +2,7 @@
 
 #include <godot_cpp/classes/camera3d.hpp>
 #include <godot_cpp/classes/directional_light3d.hpp>
+#include <godot_cpp/classes/mesh_instance3d.hpp>
 #include <godot_cpp/classes/node.hpp>
 #include <godot_cpp/classes/node3d.hpp>
 #include <godot_cpp/classes/omni_light3d.hpp>
@@ -58,16 +59,66 @@ struct ViewModel {
     float art_len[MAX_SKINS] = {};              // 各外观归一化后的全长（米，日志用）
     godot::Vector3 art_hand_r[MAX_SKINS] = {};  // 各外观的右手手掌中心（gun 局部系）
     godot::Vector3 art_hand_l[MAX_SKINS] = {};  // 各外观的左手手掌中心
+    godot::Vector3 art_sight[MAX_SKINS] = {};   // 各外观的照门位置（gun 局部系）
     int  art_slots = 0;                          // 有效槽位数 = 武器键数
     int  art_index = 0;
     float art_muzzle_z = 0.0f;                   // 当前外观的枪口 z（gun 局部系）
     godot::Node *proto_parent = nullptr;         // 原始场景根的挂载点（场景里的容器）
 
     // ---- 姿态基准（build 时读环境变量覆盖，默认值见 viewmodel.cpp 的注释推导）----
-    godot::Vector3 hip_pos{0.150f, -0.130f, -0.330f};
+    //
+    // 这一组是**腰射**的基准。它改过一轮（2026-09-19）：换真模型之后枪长从
+    // 0.748 m 涨到 1.232 m，而这一组还是照程序化枪模调的，于是支撑手被顶到
+    // 眼前 0.78 m、前臂横跨 0.6 m，画面上读出来是"一根撑杆 + 一块木头"。
+    // 新值 + vm_scale=0.62 把支撑手拉回 0.41 m（真持枪约 0.35~0.45 m）。
+    godot::Vector3 hip_pos{0.105f, -0.088f, -0.130f};
     godot::Vector3 aim_pos{0.018f, -0.075f, -0.290f};
-    godot::Vector3 hip_rot{2.5f, 7.0f, -5.0f};
+    godot::Vector3 hip_rot{3.0f, 13.0f, -6.0f};
     godot::Vector3 aim_rot{0.0f, 0.0f, 0.0f};
+    // VA_VM_AIM 是否被显式给过。给过就整套照它的算（取证/找位用），
+    // 没给就按"枪自己的照门落在屏幕中心"反推。
+    bool aim_env_over = false;
+
+    // ---------------------------------------------------------------------
+    // 【视图模型统一缩放 + "眼睛在枪的哪儿"】
+    //
+    // 真模型是**真实尺寸**（莫辛 1.232 m、DP-27 1.275 m），而腰射姿态最早是照
+    // 0.748 m 的程序化枪模调的。一把真长度的步枪搁在眼前 0.33 m 处，必然
+    // 又细又长：支撑手被顶到眼睛前 0.78 m，前臂得横跨 0.6 m 才够得着，
+    // 画面上就是一根**长宽比 14:1 的细棍**（真人前臂约 5:1）。
+    //
+    // 关键认识：**均匀缩放本身不改变观感**。"整体乘 s + 距离也乘 s"是一个
+    // 相似变换，屏幕上的角度一模一样。真正决定观感的是**眼睛在枪局部系里的位置**：
+    //     Z0 = -hip_pos.z / vm_scale      （眼睛在枪原点后方多少米，枪局部单位）
+    // 想让支撑手落到 0.42 m 处、同时枪托又不能在近裁剪面（0.06 m）后面，
+    // 只能靠 s < 1 把枪本身做小 —— 这是真 FPS 给视图模型单独一套变换的常规做法。
+    //
+    // 三者是**一起**用的：s 定"枪相对人有多大"，hip_pos 定"枪摆在画面哪儿"。
+    // ---------------------------------------------------------------------
+    float vm_scale = 1.0f;
+
+    // ---- 开镜对准 ----
+    // 开镜时"眼睛要穿过的那一点"（照门/瞄具）在**枪局部系**里的位置。
+    // aim_pos.x/y 由它反推：aim = -sight * vm_scale，这样枪自己的照门正好落在
+    // 屏幕中心（准心处），而不是像上一版那样落在 0.73 屏高。
+    // 每把枪由 kWpnArt 给（tools/glb_preview.py --probe 量的剖面顶面）；
+    // 程序化枪模用它的红点瞄具 (0, +0.075)。
+    float aim_sight_x = 0.0f;
+    float aim_sight_y = 0.075f;
+    // 开镜时枪托尾端到眼睛的距离（米）。太远则枪缩成一小条，太近则托底撞近裁剪面 ——
+    // 而且**太近会把开镜画面下半屏整个糊掉**：0.200 时托底占 820 px（见 .cpp 里 build() 的注释）。
+    float aim_dist = 0.270f;
+
+    // 前臂 / 腕口。**不挂在 hand_r / hand_l 里** —— 那两组会随每把枪的握持点
+    // 整体平移，而肘长在人身上、不跟着枪走。挂进 hands，换枪时只重摆腕端。
+    godot::MeshInstance3D *fore_r = nullptr;
+    godot::MeshInstance3D *cuff_r = nullptr;
+    godot::MeshInstance3D *fold_r = nullptr;
+    godot::MeshInstance3D *fore_l = nullptr;
+    godot::MeshInstance3D *cuff_l = nullptr;
+    godot::MeshInstance3D *fold_l = nullptr;
+    godot::Vector3 cur_hand_r;   // 当前外观的右手掌心（枪局部系）
+    godot::Vector3 cur_hand_l;   // 当前外观的左手掌心
 
     float sway_yaw = 0, sway_pitch = 0;     // 视角惯性滞后
     float recoil = 0, recoil_v = 0;         // 弹簧-阻尼后坐
@@ -99,6 +150,8 @@ struct ViewModel {
     void update(double dt, float move01, bool running, float pitch, float yaw, bool ads_want);
     void on_shot();
     void on_reload(float dur);
+    // 按当前 cur_hand_r / cur_hand_l 重摆两条前臂与腕口。换枪后必须调一次。
+    void place_arms();
     bool valid() const { return root != nullptr; }
 
     // ---- 外观 ----

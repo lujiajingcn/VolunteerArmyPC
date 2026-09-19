@@ -155,6 +155,11 @@ struct WpnNodeInfo {
     // 按真模型的剖面量出来，见 scene_builder.cpp 的 kWpnArt。
     godot::Vector3 hand_r_pos;
     godot::Vector3 hand_l_pos;
+    // 开镜时"眼睛要穿过的那一点"（照门 / 瞄具）在枪局部系里的位置（米）。
+    // 量与判读口径同 hand_r_pos（tools/glb_preview.py --probe 的剖面**顶面**，
+    // 不是"低~中那一簇"—— 握持点取下面那块木头，照门取上面那道脊）。
+    // 对它的用途：开镜时把这一点摆到屏幕中心，枪自己的机械瞄具才压得住准心。
+    godot::Vector3 sight_pos;
     godot::Vector3 raw_size;         // 归一化**之前**模型自身的尺寸（排查用）
 };
 
