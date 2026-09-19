@@ -289,6 +289,12 @@ void WorldSim::_ready() {
     if (std::getenv("VA_HIDE_PROPS") != nullptr && refs_.props != nullptr) refs_.props->set_visible(false);
     if (std::getenv("VA_HIDE_UNITS") != nullptr && refs_.units != nullptr) refs_.units->set_visible(false);
     if (std::getenv("VA_HIDE_VEH") != nullptr && refs_.vehicles != nullptr) refs_.vehicles->set_visible(false);
+    // 自己身体的开关（默认隐藏）与"谁挡了镜头"的数字探针，都见 sync_entity_nodes 的注释
+    show_self_ = (std::getenv("VA_SHOW_SELF") != nullptr);
+    dbg_units_ = (std::getenv("VA_DBG_UNITS") != nullptr);
+    if (show_self_) {
+        UtilityFunctions::print(String::utf8("[self] VA_SHOW_SELF：刻意把玩家自己的身体画回来（复现视野遮挡用）"));
+    }
     spawn_entity_nodes();
     va_trace("_ready:spawn ok");
     setup_runtime_ui();
@@ -411,10 +417,53 @@ void WorldSim::capture_setup() {
     UtilityFunctions::print(String::utf8("[VA_CAPTURE] 计划在 "), (int)cap_times_.size(), String::utf8(" 个时刻截图"));
 }
 
+/* ---- 视野遮挡取证：镜头最近的是谁（VA_DBG_UNITS）--------------------------------
+   「用户视野有大片遮挡」这类问题，分层消融（VA_HIDE_PROPS / UNITS / VEH）只能
+   答到"属于哪一层"。要落到**具体哪一个单位**上，得看距离 ——
+   因为队友的出生点与玩家只差 1.4 m 左右，而一个 1.68 m 的模型在 2 m 处
+   就已经占满 66% 画高：截图上"贴脸的一大块"既可能是自己、也可能是队友。
+
+   量的是**水平距离**而不是到节点原点的三维距离：身体是竖直的，决定它占多大画面的
+   是水平距离（节点原点在脚底，三维距离会把"人比我矮"算成"离我远"，玩家自己
+   量出来会是 1.65 m = 眼高，反而看着不像 0 距离）。
+
+   p_when 只用于标注这一行是哪个时刻打的（ready / 某张截图前）。 */
+void WorldSim::dbg_units_dump(const char *p_when) const {
+    if (!dbg_units_ || cam_ == nullptr || unit_nodes_.size() != va::W.units.size()) return;
+    const Vector3 c = cam_->get_global_position();
+
+    struct Row { float d; size_t i; };
+    std::vector<Row> rows;
+    rows.reserve(va::W.units.size());
+    for (size_t i = 0; i < va::W.units.size(); ++i) {
+        const Vector3 p = unit_nodes_[i]->get_global_position();
+        const float dx = p.x - c.x, dz = p.z - c.z;
+        rows.push_back({ std::sqrt(dx * dx + dz * dz), i });
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) { return a.d < b.d; });
+
+    UtilityFunctions::print(String::utf8("[dbg-units] "), String::utf8(p_when),
+                            String::utf8(" 镜头最近的 6 个单位（水平距离 / 米；vis=是否在画，self=是不是玩家自己）"));
+    const size_t n = std::min<size_t>(6, rows.size());
+    for (size_t k = 0; k < n; ++k) {
+        const size_t i = rows[k].i;
+        const va::Unit &u = va::W.units[i];
+        const std::string key = unit_model_key(u);
+        UtilityFunctions::print(String::utf8("    #"), (int)i, " ", String::utf8(key.c_str()),
+                                String::utf8("  d="), String::num(rows[k].d, 2),
+                                String::utf8(" m  vis="), unit_nodes_[i]->is_visible() ? 1 : 0,
+                                " self=", u.isPlayer ? 1 : 0,
+                                u.dead ? String::utf8("  [阵亡]") : String(""));
+    }
+}
+
 // 把当前视口存成 PNG。两条取证通道共用：
 //   ① capture_step —— 按「战局秒数」定时拍（看战场整体长什么样）
 //   ② 战斗事件取证 —— 事件发生那一刻拍（命中标记只活 0.24 秒，定时拍撞不上）
 void WorldSim::save_shot(const godot::String &tag) {
+    // 每张截图前顺手打一次"镜头最近的是谁"，让截图与数字对得上 ——
+    // 只看图判断"这块深色是谁"，本机已经错过好几次（把树看成枪、把枪看成草地）。
+    dbg_units_dump("capture");
     const char *dir_env = std::getenv("VA_CAPTURE_DIR");
     const std::string dir = dir_env && *dir_env ? std::string(dir_env) : std::string("res://captures");
     const godot::String gdir = godot::String::utf8(dir.c_str());
@@ -615,8 +664,26 @@ void WorldSim::sync_entity_nodes() {
     for (size_t i = 0; i < va::W.units.size(); ++i) {
         const va::Unit &u = va::W.units[i];
         Node3D *n = unit_nodes_[i];
-        if (u.dead) { n->set_visible(false); continue; }
-        n->set_visible(true);
+        /* 【第一人称不画自己的身体】
+           逻辑层里玩家也是一个普通单位（W.units[0]，isPlayer=true），所以这个循环
+           一开始给**包括玩家在内**的每个人都建了节点、每帧摆到 (x, y)。
+           而相机就在同一个 (x, y) 上、高 1.65 m —— 角色模型归一化后高 1.68 m，
+           于是镜头正好落在自己模型的**头里**：画面上就是一大块贴着脸的深色面，
+           天空只剩左上角一条缝。实测的遮挡体量：一个 1.68 m 的模型在 2 m 处
+           就已经占满 66% 画高，而自己这个的"距离"是 0。
+
+           判据来自消融（VA_HIDE_UNITS 一藏、整块遮挡立刻消失），
+           而要落到"具体是哪一个单位"上则靠 VA_DBG_UNITS 的打点 ——
+           两者合起来才排除掉"其实是出生点旁边 1~2 米的队友挡的"这个很像的解释
+           （队友出生点与玩家只差 ~1.4 m）。
+
+           所以这里显式跳过玩家自己。VA_SHOW_SELF=1 可以放回来 ——
+           那是**复现**这个问题用的，不是可选的画面风格。
+           注意可见性要每帧重设：sync 的另一半（数量变化时重建节点）会新建节点，
+           只在 spawn 时藏一次的话，重开一局遮挡就回来了。 */
+        const bool self_hidden = u.isPlayer && !show_self_;
+        n->set_visible(!u.dead && !self_hidden);
+        if (u.dead) continue;
         // 姿态由 scene_builder 的 unit_transform 统一给出（偏航 + 倒地侧翻）。
         //
         // 【为什么姿态必须在这里施加】这段原来只写 position/rotation，而倒地姿态是在
@@ -626,6 +693,10 @@ void WorldSim::sync_entity_nodes() {
         // 【为什么抽成公共函数】检阅台（VA_UNIT_SHOW）建节点时也要施加同一姿态。
         // 这里再抄一份的话，两处迟早出现"战场上倒下、检阅台上还站着"的偏差 ——
         // 而这类偏差极难在截图上发现，因为两条路径从不出现在同一张图里。
+        //
+        // 被隐藏的"自己"照样摆位（只是不画）：位置若停在原点，
+        // VA_DBG_UNITS 就会把"自己 d=0.00 m"报成"自己 61 米外"，
+        // 那正是这个探针唯一要回答的问题。
         n->set_transform(unit_transform(u.x, u.y, u.facing, u.downed));
     }
     for (size_t i = 0; i < va::W.vehicles.size(); ++i) {
@@ -719,6 +790,12 @@ void WorldSim::_process(double p_delta) {
         // 逻辑层朝向回写：yaw = -facing - π/2  ⇒  facing = -yaw - π/2
         va::W.viewPitch = pitch_;
         cam_->set_rotation(Vector3(pitch_, yaw_, 0));
+    }
+    // 相机落地后的第一帧才量得出真数字 —— 在此之前 cam_ 还停在原点，
+    // 量出来的"距离"全是到世界原点的距离（与开局的"谁挡在镜头前"没有关系）。
+    if (dbg_first_) {
+        dbg_first_ = false;
+        dbg_units_dump("t=0");
     }
 
     va_trace("_process:cam ok");

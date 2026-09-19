@@ -170,6 +170,18 @@ private:
     bool   show_mode_ = false;
     double show_t_ = 0.0;
 
+    /* 第一人称是否画"自己的身体"。默认不画 —— 见 sync_entity_nodes 里那段长注释。
+       VA_SHOW_SELF=1 可以把它放回来：那是**复现"视野被大片遮挡"**用的，
+       不是可选的画面风格（放回来就是镜头被自己的模型包住）。 */
+    bool   show_self_ = false;
+
+    /* VA_DBG_UNITS=1：把"镜头最近的是谁"打成数字（见 dbg_units_dump）。
+       分层消融（VA_HIDE_PROPS/UNITS/VEH）只能答"属于哪一层"，
+       而"视野被谁挡了"要落到**具体哪一个单位**上。 */
+    bool   dbg_units_ = false;
+    bool   dbg_first_ = true;      // 相机落地后的第一帧再打一次（此前 cam_ 还在原点）
+    void   dbg_units_dump(const char *p_when) const;
+
     // UI：全套使命召唤风格 HUD，手绘在一个 Control 里（见 node/hud.h）
     Hud *hud_ = nullptr;
 };
