@@ -463,21 +463,21 @@ static Node3D *load_unit_proto(const std::string &p_key, Node *p_parent) {
     Ref<GLTFState> st;
     st.instantiate();
     if (doc.is_null() || st.is_null()) {
-        UtilityFunctions::print("[unit] GLTFDocument 不可用，全部回退图元士兵");
+        UtilityFunctions::print(String::utf8("[unit] GLTFDocument 不可用，全部回退图元士兵"));
         s_unit_failed[p_key] = true;
         return nullptr;
     }
 
     const Error err = doc->append_from_file(path, st);
     if (err != OK) {
-        UtilityFunctions::print("[unit] 模型解析失败 ", path, " err=", (int)err);
+        UtilityFunctions::print(String::utf8("[unit] 模型解析失败 "), path, " err=", (int)err);
         s_unit_failed[p_key] = true;
         return nullptr;
     }
     Node *scene = doc->generate_scene(st);
     Node3D *raw = Object::cast_to<Node3D>(scene);
     if (raw == nullptr) {
-        UtilityFunctions::print("[unit] 模型没有可用的场景根 ", path);
+        UtilityFunctions::print(String::utf8("[unit] 模型没有可用的场景根 "), path);
         s_unit_failed[p_key] = true;
         return nullptr;
     }
@@ -488,7 +488,7 @@ static Node3D *load_unit_proto(const std::string &p_key, Node *p_parent) {
     bool has = false;
     collect_aabb(raw, Transform3D(), box, has);
     if (!has || box.size.y <= 1e-5f) {
-        UtilityFunctions::print("[unit] 模型没有网格 ", path);
+        UtilityFunctions::print(String::utf8("[unit] 模型没有网格 "), path);
         raw->queue_free();
         s_unit_failed[p_key] = true;
         return nullptr;
@@ -522,12 +522,12 @@ static Node3D *load_unit_proto(const std::string &p_key, Node *p_parent) {
         p_parent->add_child(outer);
         outer->set_visible(false);
     } else {
-        UtilityFunctions::print("[unit] 警告：没有原型挂载点，模型资源会在退出时报泄漏");
+        UtilityFunctions::print(String::utf8("[unit] 警告：没有原型挂载点，模型资源会在退出时报泄漏"));
     }
 
-    UtilityFunctions::print("[unit] 模型 ", String::utf8(p_key.c_str()),
-                            " 原始包围盒 ", box.size,
-                            " 缩放 ", k, " yaw ", yaw_deg);
+    UtilityFunctions::print(String::utf8("[unit] 模型 "), String::utf8(p_key.c_str()),
+                            String::utf8(" 原始包围盒 "), box.size,
+                            String::utf8(" 缩放 "), k, " yaw ", yaw_deg);
     s_unit_proto[p_key] = outer;
     return outer;
 }

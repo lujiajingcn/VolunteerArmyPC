@@ -433,16 +433,16 @@ void Hud::update(double p_delta) {
         if (ev_cap_) pending_shot_ = EVSHOT_HIT;
         if (ev_log_) {
             UtilityFunctions::print("[hud-ev] t=", String::num((double)va::W.t, 2),
-                                    " 命中 +", pl->hits - seen_hits_, " (hits=", pl->hits,
-                                    ") → 命中标记 hit_t_=0.24");
+                                    String::utf8(" 命中 +"), pl->hits - seen_hits_, " (hits=", pl->hits,
+                                    String::utf8(") → 命中标记 hit_t_=0.24"));
         }
         if (pl->kills > seen_kills_) {
             hit_kill_t_ = 0.40f;
             if (ev_cap_) pending_shot_ = EVSHOT_KILL;   // 覆盖同帧的 HIT：击杀更难得
             if (ev_log_) {
                 UtilityFunctions::print("[hud-ev] t=", String::num((double)va::W.t, 2),
-                                        " 击杀 (kills=", pl->kills,
-                                        ") → 击杀标记 hit_kill_t_=0.40 + 飘字「+1 击杀」");
+                                        String::utf8(" 击杀 (kills="), pl->kills,
+                                        String::utf8(") → 击杀标记 hit_kill_t_=0.40 + 飘字「+1 击杀」"));
             }
             Popup p;
             p.text = "+1 击杀";
@@ -479,8 +479,8 @@ void Hud::update(double p_delta) {
         if (ev_cap_) pending_shot_ = EVSHOT_DOWN;
         if (ev_log_) {
             UtilityFunctions::print("[hud-ev] t=", String::num((double)va::W.t, 2),
-                                    " 玩家倒地 (downTimer=", String::num(pl->downTimer, 1),
-                                    ") → draw_downed 接管中央（倒计时环 + 大字）");
+                                    String::utf8(" 玩家倒地 (downTimer="), String::num(pl->downTimer, 1),
+                                    String::utf8(") → draw_downed 接管中央（倒计时环 + 大字）"));
         }
     }
     prev_down_ = pl->downed;
@@ -526,9 +526,9 @@ void Hud::update(double p_delta) {
             if (ev_cap_ && pending_shot_ == EVSHOT_NONE) pending_shot_ = EVSHOT_ALLY;
             if (ev_log_) {
                 UtilityFunctions::print("[hud-ev] t=", String::num((double)va::W.t, 2),
-                                        " 阵亡播报 ", String::utf8(p.text.c_str()),
-                                        " (凶手=", String::utf8(it.killer.c_str()),
-                                        ") → 飘字 1.5s");
+                                        String::utf8(" 阵亡播报 "), String::utf8(p.text.c_str()),
+                                        String::utf8(" (凶手="), String::utf8(it.killer.c_str()),
+                                        String::utf8(") → 飘字 1.5s"));
             }
         }
         while (feed_.size() > 5) feed_.pop_back();
@@ -1926,7 +1926,7 @@ Ref<Texture2D> Hud::load_tex(const String &p_res_path) {
     }
     const Ref<Image> img = Image::load_from_file(path);
     if (img.is_valid() && !img->is_empty()) return ImageTexture::create_from_image(img);
-    UtilityFunctions::print("[ui] 素材载入失败：", path);
+    UtilityFunctions::print(String::utf8("[ui] 素材载入失败："), path);
     return Ref<Texture2D>();
 }
 
@@ -1946,12 +1946,12 @@ void Hud::load_art() {
                                 String::utf8(ally_art_key(kRosterIds[i]).c_str()) + ".png");
         if (art_port_[i].is_valid()) ++n_ok;
     }
-    UtilityFunctions::print("[ui] 任务素材 menu=", art_menu_.is_valid(),
+    UtilityFunctions::print(String::utf8("[ui] 任务素材 menu="), art_menu_.is_valid(),
                             " brief=", art_brief_.is_valid(),
                             " chapter=", art_chapter_.is_valid(),
                             " win=", art_win_.is_valid(),
                             " lose=", art_lose_.is_valid(),
-                            " 胸像=", n_ok, "/", kRosterN);
+                            String::utf8(" 胸像="), n_ok, "/", kRosterN);
 }
 
 // 按「cover」铺满 + 横向渐变压暗。

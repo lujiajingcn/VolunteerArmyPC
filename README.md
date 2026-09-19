@@ -115,6 +115,42 @@ sdk\godot\Godot_v4.5-stable_win64.exe --path .
 
 构建产物固定输出到 `bin/volunteer_army_pc.dll`，文件名由 `VolunteerArmyPC.gdextension` 引用，**不要改名**。
 
+### 在 VS 2022 里运行 / 调试（F5）
+
+打开 `build/VolunteerArmyPC.sln` 后直接按 F5 会弹：
+
+> 无法启动程序 …\bin\volunteer_army_pc.dll。… 不是有效的 Win32 应用程序。
+
+**这是正常的，不是文件损坏、也不是架构不对。** 本工程的目标是一个 SHARED 库（GDExtension），
+它本身不是可执行程序；而 VS 在没有"调试器命令"时，会退而拿**目标的输出文件**去启动 ——
+`CreateProcess` 只能启动 EXE，喂给它一个 DLL，报的就是这句话。
+
+CMake 里已经配好了正确的调试方式（`VS_DEBUGGER_COMMAND`），F5 会变成：
+
+```
+sdk/godot/Godot_v4.5-stable_win64.exe  --path <工程根> --log-file <工程根>/debug_run.log
+```
+
+引擎加载 `bin/volunteer_army_pc.dll`，**断点直接落在我们自己的源码里** ——
+GDExtension 没有独立的宿主 EXE，这也是它唯一的本地调试方式。
+
+三个容易踩的点：
+
+| 点 | 说明 |
+|---|---|
+| 不能指向 `*_console.exe` | 它是 197 KB 的**外壳**（只负责 fork 主 exe 并挂控制台），VS 会附到外壳上，而外壳里没加载我们的 dll → 断点永远绑不上。自动挑选时已排除 |
+| 必须有 `--log-file` | 主 exe 是 GUI 子系统，**stdout 无人接收**。不加这个参数，`print` 与 Godot 自己的报错全部丢掉，而本项目的回归判据恰恰是"日志里有没有 ERROR" |
+| 想要断点就得选有符号的配置 | `Release` 没有 `/Zi`，能跑但断点打不上。切 `RelWithDebInfo` / `Debug`（首次会连 godot-cpp 一起按该配置重建，耗时是正常的） |
+
+改了 `CMakeLists.txt` 后要**重新生成一次工程**才会写进 `.vcxproj`（VS 会提示"重新加载项目"）：
+
+```bash
+cmake -S . -B build -DVA_DEBUG_ENV="VA_SCRIPT_A=1;VA_FF=6"   # 可选：F5 时注入取证旋钮
+```
+
+`VA_DEBUG_ENV` 用分号分隔、写进 `<LocalDebuggerEnvironment>`；不设就是空。
+不重新生成、只想临时改，也可以走 VS 的「项目属性 → 调试 → 命令 / 命令参数 / 环境」。
+
 ### 导出可执行程序（Windows）
 
 ```bash
@@ -227,6 +263,33 @@ sweep/sim/va_sweep.exe -v         # 逐局明细（活/亡/倒、坦克、箱、
 
 - **模型旋转约定**：逻辑层「模型前方 = +X」→ Godot 绕 Y 轴旋转角 = `-facing`；
   相机 `yaw = -facing - π/2`。
+
+- **日志里的中文必须走 `String::utf8()`**：godot-cpp 的 `String(const char *)` 绑定的是
+  引擎的窄字符构造，那是按 **Latin-1 逐字节取码点**的。源文件是 UTF-8，"取证" 的
+  `E5 8F 96` 会被读成三个 Latin-1 字符，写进日志再按 UTF-8 编码 → `C3A5 C28F C296`，
+  也就是**二次编码**的乱码：`åè¯æ³¨å`。只有 `String::utf8()` 才按 UTF-8 解释。
+
+  ```cpp
+  // 错：日志里是 åè¯æ³¨å¥
+  UtilityFunctions::print("[combat-ev] 取证注入：自动战斗=", autoplay_ ? "开" : "关");
+  // 对
+  UtilityFunctions::print(String::utf8("[combat-ev] 取证注入：自动战斗="),
+                          autoplay_ ? String::utf8("开") : String::utf8("关"));
+  ```
+
+  编译期完全不报错，只能靠 `tools/check_log_encoding.py` 兜住
+  （扫 `src/**/*.cpp` 的日志调用参数表，有发现退出码 1）：
+
+  ```bash
+  python tools/check_log_encoding.py
+  ```
+
+  注意它只管**日志调用**。别处的非 ASCII 窄字面量是合法的、不能乱包 ——
+  例如 `va::W.overKind = "成功"` 是赋给 `std::string` 的字节透传，包了类型都不对。
+
+- **诊断日志要看编码**：同一条日志在三种输出通道下字节可能不同，
+  别把"乱码"当成引擎 bug。判定方法是对原始字节做十六进制看：
+  `取` 的正确 UTF-8 是 `e5 8f 96`，二次编码则是 `c3 a5 c2 8f c2 96`。
 
 ## 开发期旋钮
 
@@ -372,6 +435,7 @@ VA_UNIT_SHOW=one:char_rifleman:180   VA_CAPTURE=1 ...   # 背面
 | `vm_eval.py` | 按颜色掩码提取枪模各部件像素，统计亮度分布（死黑 / 正常 / 过曝占比） |
 | `diff_png.py` | 两图逐像素求差，定位某个物体实际占据的屏幕区域 |
 | `period_probe.py` | 去趋势 + 自相关，判定画面里的规律条纹（**肉眼看不出合成出来的周期条纹**） |
+| `check_log_encoding.py` | 检查日志调用里的中文是否都走了 `String::utf8()`（漏了会写出二次编码的乱码，**编译期不报错**） |
 | `prep_art.py` / `prep_char.py` | 任务素材 / 角色立绘预处理：去半透明水印、规范命名、自动裁胸像 |
 | `montage_char.py` | 把 11 张胸像拼成联络表（**并排才看得出切歪**） |
 | `gen3d.py` / `gen3d_batch.py` | 图生3D 单张 / 批量编排（绕命令行长度上限、按服务端并发配额限流、断点续跑） |
@@ -412,6 +476,12 @@ VA_UNIT_SHOW=one:char_rifleman:180   VA_CAPTURE=1 ...   # 背面
 - **玩法平衡**：离线扫描器 `va_sweep`（`src/sim/*` 脱离引擎单独跑）量出**车顶机枪是唯一瓶颈**，
   采用 A 方案（伤害 ×0.55、射击间隔 ×1.80）—— 胜率 **3/10 → 8/10**、我方伤亡 **71 → 36 人**；
   配套 `BalanceCfg BAL` 三个旋钮 + 一行 `BAL 默认` 校验（防"扫描与实机分家"）
+- **VS 2022 里 F5 可直接运行/调试**：目标本身是 SHARED 库，VS 默认会拿它去"启动"，
+  报「不是有效的 Win32 应用程序」；现由 CMake 的 `VS_DEBUGGER_COMMAND` 指向引擎
+  （`--path <工程根> --log-file debug_run.log`），断点落进自己的源码。详见「在 VS 2022 里运行 / 调试（F5）」
+- **日志中文乱码已修**：`String(const char *)` 按 Latin-1 解释字节，28 处含中文的日志
+  写成二次编码（`取证` → `åè¯æ³¨å`）；全部改走 `String::utf8()`，
+  并加 `tools/check_log_encoding.py` 守卫（旧版报 58 处、当前 0 处）
 
 **待办**
 

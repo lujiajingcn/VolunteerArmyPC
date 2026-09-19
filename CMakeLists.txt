@@ -73,11 +73,75 @@ foreach(cfg "" _DEBUG _RELEASE _RELWITHDEBINFO _MINSIZEREL)
     )
 endforeach()
 
+# ---------------------------------------------------------------------------
+# 让 VS 的 F5「运行工程」真的能跑起来
+#
+#   volunteer_army_pc 是 SHARED 库（GDExtension），它**不是**可执行程序。
+#   VS 找不到调试器命令时，会退而拿"目标的输出文件"当要启动的程序 ——
+#   于是 F5 去执行 bin/volunteer_army_pc.dll，弹出
+#       「无法启动程序 … 不是有效的 Win32 应用程序」
+#   这句话的字面意思就是 CreateProcess 只能启动 EXE，却被喂了个 DLL；
+#   跟文件损坏、架构不对都没关系（这个 dll 是合法的 x64 PE）。
+#
+#   正解不是换启动项目，而是告诉 VS"这个目标该怎么被调试"：
+#   用引擎可执行程序带着本工程跑（--path <工程根>）。引擎会加载
+#   bin/volunteer_army_pc.dll，断点就落在我们自己的代码里 ——
+#   GDExtension 没有独立的宿主 EXE，这也是它唯一的本地调试方式。
+#
+#   两个必须注意的点：
+#   1) 只能指向**主 exe**，不能指向 *_console.exe。后者是 197 KB 的外壳
+#      （subsys=CONSOLE，导入 CreateProcessW），只负责 fork 出主 exe 并挂
+#      一个控制台；VS 会附到外壳上，而外壳里根本没加载我们的 dll，
+#      断点永远绑不上。下面自动挑选时已把 *console.exe 排除。
+#   2) 必须带 --log-file。主 exe 是 GUI 子系统，stdout 无人接收 ——
+#      不加这个参数，print 出来的东西（含 [capture-ev]/[hud-ev] 与
+#      Godot 自身的报错）会全部丢掉，而本项目「回归判据 = 日志里有没有
+#      ERROR」全靠它。日志写到工程根的 debug_run.log（已被 *.log 忽略）。
+# ---------------------------------------------------------------------------
+set(VA_GODOT_EXECUTABLE "" CACHE FILEPATH
+    "VS 调试(F5)时用来加载本 GDExtension 的引擎可执行文件；留空则自动在 sdk/godot/ 下寻找")
+
+if(NOT VA_GODOT_EXECUTABLE)
+    file(GLOB _va_godot_exes "${CMAKE_CURRENT_SOURCE_DIR}/sdk/godot/*.exe")
+    foreach(_e ${_va_godot_exes})
+        if(_e MATCHES "[_.]console\\.exe$")
+            # 控制台外壳：能看输出，但它不是加载 dll 的那个进程，调试用不了
+        else()
+            list(APPEND _va_godot_engines "${_e}")
+        endif()
+    endforeach()
+    if(_va_godot_engines)
+        list(SORT _va_godot_engines)
+        list(GET _va_godot_engines 0 VA_GODOT_EXECUTABLE)
+    endif()
+endif()
+
+# 可选：F5 时注入环境变量（分号分隔，如 VA_SCRIPT_A=1;VA_FF=6）。
+# 取证跑图那套旋钮见 README，想 F5 直接进交火就靠它。
+set(VA_DEBUG_ENV "" CACHE STRING
+    "F5 时注入的环境变量，分号分隔，如 VA_SCRIPT_A=1;VA_FF=6")
+
 if(MSVC)
     target_compile_options(volunteer_army_pc PRIVATE /utf-8 /MP /bigobj)
     target_compile_definitions(volunteer_army_pc PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-    set_target_properties(volunteer_army_pc PROPERTIES
-        VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+
+    if(VA_GODOT_EXECUTABLE)
+        set_target_properties(volunteer_army_pc PROPERTIES
+            VS_DEBUGGER_COMMAND "${VA_GODOT_EXECUTABLE}"
+            VS_DEBUGGER_COMMAND_ARGUMENTS
+                "--path \"${CMAKE_CURRENT_SOURCE_DIR}\" --log-file \"${CMAKE_CURRENT_SOURCE_DIR}/debug_run.log\""
+            VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+        if(VA_DEBUG_ENV)
+            string(REPLACE ";" "\n" _va_env_lines "${VA_DEBUG_ENV}")
+            set_target_properties(volunteer_army_pc PROPERTIES
+                VS_DEBUGGER_ENVIRONMENT "${_va_env_lines}")
+        endif()
+    else()
+        message(WARNING
+            "sdk/godot/ 下没找到引擎可执行文件 —— VS 里 F5 仍会去启动那个 dll。\n"
+            "  请把 Godot 引擎（主 exe，不是 *_console.exe）放进 sdk/godot/，"
+            "或设 -DVA_GODOT_EXECUTABLE=<绝对路径>。")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -116,4 +180,10 @@ message(STATUS "   godot-cpp target : ${GODOTCPP_TARGET}")
 message(STATUS "   源文件           : ${VA_EXISTING}")
 message(STATUS "   输出目录         : ${CMAKE_CURRENT_SOURCE_DIR}/bin")
 message(STATUS "   离线扫描 va_sweep: ${VA_BUILD_SIM_SWEEP}（产物 -> sweep/sim/）")
+if(VA_GODOT_EXECUTABLE)
+    message(STATUS "   VS 的 F5         : ${VA_GODOT_EXECUTABLE}")
+    message(STATUS "                      --path <工程根> --log-file debug_run.log")
+else()
+    message(STATUS "   VS 的 F5         : 未配置（sdk/godot/ 下没有引擎 exe）")
+endif()
 message(STATUS "──────────────────────────────────────────────")

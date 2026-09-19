@@ -138,7 +138,7 @@ void WorldSim::build_unit_showcase() {
         constexpr float CAM_H  = 1.05f;
         Node3D *nd = make_unit_node_by_key(key, refs_.units);
         if (nd == nullptr) {
-            UtilityFunctions::print("[show] 近景：没有模型 ", String::utf8(key.c_str()));
+            UtilityFunctions::print(String::utf8("[show] 近景：没有模型 "), String::utf8(key.c_str()));
         } else {
             const float lx = p->x + fx * DIST_M * U;
             const float ly = p->y + fy * DIST_M * U;
@@ -160,9 +160,9 @@ void WorldSim::build_unit_showcase() {
         cam_->set_rotation(Vector3(0.04f, yaw_, 0));
         // VA_FOV 显式给了就以它为准（想试别的取景时不必改代码）
         if (std::getenv("VA_FOV") == nullptr) cam_->set_fov(32.0f);
-        UtilityFunctions::print("[show] 近景 ", String::utf8(key.c_str()),
-                                " 距离 ", DIST_M, "m 机高 ", CAM_H,
-                                " 临时偏航 ", dyaw * 180.0f / PI, " 度");
+        UtilityFunctions::print(String::utf8("[show] 近景 "), String::utf8(key.c_str()),
+                                String::utf8(" 距离 "), DIST_M, String::utf8("m 机高 "), CAM_H,
+                                String::utf8(" 临时偏航 "), dyaw * 180.0f / PI, String::utf8(" 度"));
         if (refs_.units != nullptr) refs_.units->set_visible(false);
         return;
     }
@@ -195,8 +195,8 @@ void WorldSim::build_unit_showcase() {
             // 模型缺失时**留一格空位**并打一行日志，而不是把后面的往前挪 ——
             // 挪位之后"第 4 格是医疗兵"这种读图方式就失效了，
             // 而"少一个模型"恰恰是最需要一眼看出来的事。
-            UtilityFunctions::print("[show] 缺模型，第 ", i, " 格（",
-                                    String::utf8(key.c_str()), "）空置");
+            UtilityFunctions::print(String::utf8("[show] 缺模型，第 "), i, String::utf8(" 格（"),
+                                    String::utf8(key.c_str()), String::utf8("）空置"));
             continue;
         }
         const float lx = p->x + fx * dep_m * U + rx * off_m * U;
@@ -216,8 +216,8 @@ void WorldSim::build_unit_showcase() {
     cam_->set_position(to3(p->x, p->y, 1.65f));
     cam_->set_rotation(Vector3(pitch_, yaw_, 0));
 
-    UtilityFunctions::print("[show] 检阅台：陈列 ", built, "/", n, " 个模型，间距 ",
-                            GAP_M, "m，前排 ", ROW0_M, "m 后排 ", ROW1_M, "m");
+    UtilityFunctions::print(String::utf8("[show] 检阅台：陈列 "), built, "/", n, String::utf8(" 个模型，间距 "),
+                            GAP_M, String::utf8("m，前排 "), ROW0_M, String::utf8("m 后排 "), ROW1_M, "m");
 
     /* 藏掉场上**真单位**、以及**道具层**。
        真单位用的是同一批模型，又正好冻在出生点（大多就在玩家身边几米内），
@@ -261,24 +261,23 @@ void WorldSim::_ready() {
         ff_ = k;
     }
     if (autoplay_ || down_at_ >= 0.0 || ff_ > 1) {
-        UtilityFunctions::print("[combat-ev] 取证注入：自动战斗=", autoplay_ ? "开" : "关",
-                                "  强制击倒时刻=", down_at_ >= 0.0 ? String::num(down_at_, 1) : String("-"),
-                                "  快进=", ff_, "x");
+        UtilityFunctions::print(String::utf8("[combat-ev] 取证注入：自动战斗="), autoplay_ ? String::utf8("开") : String::utf8("关"),
+                                String::utf8("  强制击倒时刻="), down_at_ >= 0.0 ? String::num(down_at_, 1) : String("-"),
+                                String::utf8("  快进="), ff_, "x");
     }
     /* 剧本 A（VA_SCRIPT_A）：与 tools/va_sweep.cpp 的 SCRIPT_A 逐条对应。
        没有它就跑不到交火 —— 见 world_sim.h 里的说明（伏击由第一枪触发，
        而"有没有第一枪"取决于车队有没有进射界，这不是自动战斗能保证的事）。 */
     if (std::getenv("VA_SCRIPT_A") != nullptr) {
         script_a_ = true;
-        UtilityFunctions::print("[combat-ev] 启用剧本 A（与离线扫描同一套口令/触发条件）");
+        UtilityFunctions::print(String::utf8("[combat-ev] 启用剧本 A（与离线扫描同一套口令/触发条件）"));
     }
     /* VA_CAPTURE_EV 的本层开关。HUD 侧读同一个变量（决定要不要把事件报上来），
        这里再读一次只为能打印 "[capture-ev] 落盘 …" 那行时序自证 ——
        没有它，下次再遇到"截不到某条路径"，就只能靠猜是帧率问题还是标记寿命问题。 */
     ev_cap_ = (std::getenv("VA_CAPTURE_EV") != nullptr);
     if (ev_cap_) {
-        UtilityFunctions::print("[combat-ev] 启用事件当帧落盘（VA_CAPTURE_EV）："
-                                "等 0.05 秒墙钟 + 至少跨 1 帧，与帧率解耦");
+        UtilityFunctions::print(String::utf8("[combat-ev] 启用事件当帧落盘（VA_CAPTURE_EV）：等 0.05 秒墙钟 + 至少跨 1 帧，与帧率解耦"));
     }
     va_trace("_ready:init_world ok");
 
@@ -324,7 +323,7 @@ void WorldSim::_ready() {
             Input *in = Input::get_singleton();
             if (in != nullptr) in->set_mouse_mode(Input::MOUSE_MODE_VISIBLE);
         }
-        UtilityFunctions::print("[ui] 初始屏 = ",
+        UtilityFunctions::print(String::utf8("[ui] 初始屏 = "),
                                 String(s0 == Hud::SCREEN_MENU ? "MENU"
                                        : (s0 == Hud::SCREEN_BRIEF ? "BRIEF" : "PLAY")));
     }
@@ -351,8 +350,8 @@ void WorldSim::_ready() {
         va::W.over = true;
         va::W.overKind = win ? "成功" : "失败";
         va::score_mission();
-        UtilityFunctions::print("[ui] VA_END 强制结局 = ", String(win ? "win" : "lose"),
-                                " 评级=", String::utf8(va::W.score.g.c_str()));
+        UtilityFunctions::print(String::utf8("[ui] VA_END 强制结局 = "), String(win ? "win" : "lose"),
+                                String::utf8(" 评级="), String::utf8(va::W.score.g.c_str()));
     }
 
     // 第一人称相机
@@ -409,7 +408,7 @@ void WorldSim::capture_setup() {
         pos = comma + 1;
     }
     std::sort(cap_times_.begin(), cap_times_.end());
-    UtilityFunctions::print("[VA_CAPTURE] 计划在 ", (int)cap_times_.size(), " 个时刻截图");
+    UtilityFunctions::print(String::utf8("[VA_CAPTURE] 计划在 "), (int)cap_times_.size(), String::utf8(" 个时刻截图"));
 }
 
 // 把当前视口存成 PNG。两条取证通道共用：
@@ -442,7 +441,7 @@ void WorldSim::capture_step() {
     save_shot(godot::String::num_int64((int)cap_times_[(size_t)cap_i_]) + godot::String("s"));
     cap_i_++;
     if (cap_i_ >= (int)cap_times_.size()) {
-        UtilityFunctions::print("[VA_CAPTURE] 全部完成，退出");
+        UtilityFunctions::print(String::utf8("[VA_CAPTURE] 全部完成，退出"));
         get_tree()->quit();
     }
 }
@@ -548,7 +547,7 @@ void WorldSim::hud_down_inject() {
         if (d < bd) { bd = d; src = &u; }
     }
     UtilityFunctions::print("[combat-ev] t=", String::num((double)va::W.t, 2),
-                            " 注入致命伤（真实 damage_unit）→ 击倒玩家");
+                            String::utf8(" 注入致命伤（真实 damage_unit）→ 击倒玩家"));
     va::damage_unit(p, 5000.0f, src, "bullet");
 }
 
@@ -782,12 +781,12 @@ void WorldSim::_process(double p_delta) {
                 save_shot(ev_tag_);
                 if (ev_cap_) {
                     UtilityFunctions::print(
-                        "[capture-ev] 落盘 ", ev_tag_,
-                        "  检测 t=", godot::String::num(ev_from_t_, 2),
-                        " → 成像 t=", godot::String::num(now_t, 2),
-                        "  仿真 +", godot::String::num(now_t - ev_from_t_, 2), "s",
-                        "  墙钟 +", godot::String::num(ev_wall_, 3), "s",
-                        "  ", ev_frames_, " 帧");
+                        String::utf8("[capture-ev] 落盘 "), ev_tag_,
+                        String::utf8("  检测 t="), godot::String::num(ev_from_t_, 2),
+                        String::utf8(" → 成像 t="), godot::String::num(now_t, 2),
+                        String::utf8("  仿真 +"), godot::String::num(now_t - ev_from_t_, 2), "s",
+                        String::utf8("  墙钟 +"), godot::String::num(ev_wall_, 3), "s",
+                        "  ", ev_frames_, String::utf8(" 帧"));
                 }
                 ev_wait_sec_ = -1.0f;                      // 回到空闲
                 ev_prio_ = 0;
@@ -927,7 +926,7 @@ void WorldSim::enter_play() {
        而不是先闪一帧歪的。 */
     aim_at_road();
     sync_entity_nodes();
-    UtilityFunctions::print("[ui] 进入战斗");
+    UtilityFunctions::print(String::utf8("[ui] 进入战斗"));
 }
 
 bool WorldSim::shell_owns_input() const {
@@ -961,14 +960,14 @@ void WorldSim::on_alert(const std::string &text, float dur) {
 void WorldSim::on_end(const std::string &kind, const std::string &text) {
     // 结算本身由 HUD 的结算面板呈现（成败、评级、统计）；
     // 这里只把逻辑层给的这段文案留个记录，方便对照逻辑输出。
-    UtilityFunctions::print("[结算] ", String::utf8(kind.c_str()), "：", String::utf8(text.c_str()));
+    UtilityFunctions::print(String::utf8("[结算] "), String::utf8(kind.c_str()), String::utf8("："), String::utf8(text.c_str()));
 }
 void WorldSim::on_subs_dirty() {}
 void WorldSim::on_objectives_dirty() {}
 
 void WorldSim::push_subtitle(const std::string &who, const std::string &text, const std::string &cls) {
     (void)cls;
-    UtilityFunctions::print("[无线电] ", String::utf8(who.c_str()), ": ", String::utf8(text.c_str()));
+    UtilityFunctions::print(String::utf8("[无线电] "), String::utf8(who.c_str()), ": ", String::utf8(text.c_str()));
 }
 
 // ------------------------------------------------------------- 对外接口
