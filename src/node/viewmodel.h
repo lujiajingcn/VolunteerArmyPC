@@ -15,7 +15,7 @@ namespace volunteer_army {
 //       └ root      位置 = 枪在相机空间的落点（含 sway / bob / 后坐位移）
 //         └ gun     位置 = 0，旋转 = 持枪姿态角（腰射↔开镜插值）
 //           ├ proc_body   程序化枪身（有真模型时整块隐藏）
-//           ├ hands       程序化双手与前臂（用真模型时默认藏，VA_VM_HANDS=1 放回）
+//           ├ hands       双手与前臂（**默认显示**；VA_VM_HANDS=0 藏掉）
 //           ├ art_holder  真模型的挂载点（gun 局部系，见下）
 //           ├ muzzle
 //           └ flash_group
@@ -56,8 +56,8 @@ struct ViewModel {
     godot::Node3D *art_nodes[MAX_SKINS] = {};   // 懒加载，建好就留着（切换只是切可见性）
     float art_mz[MAX_SKINS] = {};               // 各外观的枪口 z（gun 局部系）
     float art_len[MAX_SKINS] = {};              // 各外观归一化后的全长（米，日志用）
-    float art_hr[MAX_SKINS] = {};               // 各外观的右手落点
-    float art_hl[MAX_SKINS] = {};               // 各外观的左手落点
+    godot::Vector3 art_hand_r[MAX_SKINS] = {};  // 各外观的右手手掌中心（gun 局部系）
+    godot::Vector3 art_hand_l[MAX_SKINS] = {};  // 各外观的左手手掌中心
     int  art_slots = 0;                          // 有效槽位数 = 武器键数
     int  art_index = 0;
     float art_muzzle_z = 0.0f;                   // 当前外观的枪口 z（gun 局部系）
@@ -73,6 +73,15 @@ struct ViewModel {
     float recoil = 0, recoil_v = 0;         // 弹簧-阻尼后坐
     float ads = 0, bob = 0, breath = 0;
     float flash_t = 0, reload_t = 0, reload_dur = 0;
+
+    // ---- 枪口焰的取证计数（VA_DBG_VM=1 时打进日志）----
+    // 闪光只活 0.045 秒，**肉眼、定时截图、事件落盘三种手段都抓不住它**
+    // （事件落盘的等待是 0.05 秒墙钟 > 0.045 秒）。所以"到底画没画出来"这件事
+    // 只能靠"亮了几帧、每帧 dt 多少"来回答 —— 而它恰好由 dt 决定。
+    int   flash_frames = 0;                 // 本次闪光实际被画出来的帧数
+    float flash_dt_max = 0.0f;              // 本次闪光期间的最大帧间隔（秒）
+    float dbg_dt_acc = 0.0f;                // VA_DBG_VM 的帧率心跳累加器
+    int   dbg_dt_frames = 0;
     float last_yaw = 0, last_pitch = 0;
     float fov_base = 65.0f, fov_ads = 45.5f;
 

@@ -87,3 +87,7 @@ desktop.ini
 # --- Python 字节码缓存（tools/ 下的纯 Python 工具跑一次就会生成）---
 __pycache__/
 *.pyc
+
+# --- glb_preview.py 的副产物（三视图调试图，生成在输入 GLB 旁边）---
+# 跑一次 probe/默认视图就会冒出来；它是取证中间件，不是素材。
+*_views.png

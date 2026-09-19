@@ -59,7 +59,10 @@ fi
 # ---- 定住取证条件 ----
 export VA_SEED=1
 [ -z "$KEEP_HUD" ] && export VA_HIDE_HUD=1
-export VA_CAPTURE="1"
+# VA_CAPTURE 允许调用方覆盖（默认 1 秒那一帧）：要看"打到交火之后"的画面
+# 就得把时刻往后推，而车队要 175 秒才进地图 —— 那时必须配 VA_AUTO + VA_SCRIPT_A
+# + VA_FF 才跑得完，见下面那条枪口焰取证的用例。
+export VA_CAPTURE="${VA_CAPTURE:-1}"
 export VA_CAPTURE_DIR="res://$OUT"
 [ -n "$ADS" ] && export VA_ADS=1
 
@@ -82,7 +85,7 @@ LOG="$OUT/run.log"
 
 echo "外观: $LABEL${ADS:+（开镜）}"
 echo "目录: $OUT"
-echo "旋钮: ALB=${VA_VM_ART_ALB:-默认} METAL=${VA_VM_ART_METAL:-默认} ROUGH=${VA_VM_ART_ROUGH:-默认} HANDS=${VA_VM_HANDS:-默认藏}"
+echo "旋钮: ALB=${VA_VM_ART_ALB:-默认} METAL=${VA_VM_ART_METAL:-默认} ROUGH=${VA_VM_ART_ROUGH:-默认} GLOVE=${VA_VM_GLOVE:-默认} SLEEVE=${VA_VM_SLEEVE:-默认} HANDS=${VA_VM_HANDS:-默认显示}"
 
 "$ROOT/sdk/godot/Godot_v4.5-stable_win64_console.exe" --path "$WIN_ROOT" > "$LOG" 2>&1
 echo "EXIT=$?"

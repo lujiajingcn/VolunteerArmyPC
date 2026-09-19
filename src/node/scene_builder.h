@@ -123,20 +123,22 @@ std::string unit_model_key(const va::Unit &u);
 //
 // 注意：**渲染层与阴影不在这个函数里设**。枪模要挂到"只照枪的那几盏灯"所在的层上，
 // 那是 ViewModel 的光照安排的产物，由它自己走一遍子树去设。
-// 程序化枪模上双手的落点（gun 局部系 z，米）。
-// 【为什么放在头文件里】真模型的握持点是**相对它**做偏移的
-// （见 WpnNodeInfo::hand_r_z），两边必须是同一个数 —— 各写一份就一定会漂移，
-// 而漂移的症状是"手慢慢从枪上滑开"，一次几厘米根本看不出来。
+// 程序化枪模上双手**手掌方块中心**的落点（gun 局部系，米）。
+// 【为什么放在头文件里】真模型的握持点是以它俩为基准做偏移的
+// （见 WpnNodeInfo::hand_r_pos / load_skin），两边必须是同一个数 ——
+// 各写一份就一定会漂移，而漂移的症状是"手慢慢从枪上滑开"，一次几厘米根本看不出来。
 // viewmodel.cpp 里建那两只程序化手时也直接引用这两个常量。
-constexpr float WPN_HAND_R0 = -0.015f;   // 右手（握把）
-constexpr float WPN_HAND_L0 = -0.260f;   // 左手（护木）
+constexpr float WPN_HAND_R0 = -0.015f;   // 右手（握把）z
+constexpr float WPN_HAND_L0 = -0.260f;   // 左手（护木）z
 
 struct WpnNodeInfo {
     float         length = 0.0f;     // 归一化后的全长（米）
     float         muzzle_z = 0.0f;   // 枪口在返回节点局部系的 z（负值）
     float         scale = 0.0f;      // 施加的缩放倍率（排查用）
-    float         hand_r_z = 0.0f;   // 右手在枪上的落点（gun 局部 z）
-    float         hand_l_z = 0.0f;   // 左手在枪上的落点
+    // 双手手掌方块的中心在**枪的局部系**里的位置（米）。由 tools/glb_preview.py --probe
+    // 按真模型的剖面量出来，见 scene_builder.cpp 的 kWpnArt。
+    godot::Vector3 hand_r_pos;
+    godot::Vector3 hand_l_pos;
     godot::Vector3 raw_size;         // 归一化**之前**模型自身的尺寸（排查用）
 };
 

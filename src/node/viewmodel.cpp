@@ -76,6 +76,19 @@ namespace {
 // 不会跑去照亮旁边的石头和队友。
 constexpr uint32_t VM_LAYER = 1u << 1;
 
+// 程序化枪模那两只手**手掌方块中心**的基准落点（hand_r / hand_l 组的局部系）。
+// 这两个数同时是"换真模型时该平移多少"的参考点：hand_r->set_position(目标 − 基准)。
+// 它们必须与 scene_builder.h 的 WPN_HAND_R0 / WPN_HAND_L0 一致（z 那一项直接引用），
+// 而 WPN_HAND_R0 / L0 是"程序化枪模自己那套"的落点，没有键的真模型回退到它。
+const Vector3 HAND_R_BASE{0.0f, -0.080f, WPN_HAND_R0};
+const Vector3 HAND_L_BASE{-0.010f, -0.032f, WPN_HAND_L0};
+
+// 前臂半径。原先是 0.032，实测在 0.3~0.5 m 处是一条 120~180 px 宽的带子，
+// 换真模型之后它比枪本身还抢眼（识别色实测袖子 64500 px、手套只有 525 px）。
+// 人前臂直径 6~8 cm，但**这个视角下**看到的有效宽度还含近裁剪放大，
+// 所以视觉上要按"看上去像一根手臂"来压，而不是按解剖尺寸。0.024 是压过两档之后的值。
+constexpr float FOREARM_R = 0.024f;
+
 // 颜色统一走 sRGB→线性。Godot 的 albedo 在线性空间，直接把选色直觉
 // （sRGB 的 0.30）填进去会平白亮一大截。
 Color SRGB(float r, float g, float b) {
@@ -123,6 +136,24 @@ Ref<StandardMaterial3D> vm_mat(const Color &srgb_albedo, float metallic, float r
     m->set_roughness(roughness);
     // 枪模不接收世界阴影：离相机太近、阴影贴图精度不够会出条纹，
     // 而且手臂与枪身互相自阴影比没有阴影更难看。
+    m->set_flag(BaseMaterial3D::FLAG_DONT_RECEIVE_SHADOWS, true);
+    return m;
+}
+
+// VA_VM_MAT=1 用的**识别色**材质：不受光（unshaded）。
+//
+// 【为什么不受光才是对的】识别色的全部价值是"像素颜色 → 哪个部件"的一一对应。
+// 一旦它被打光，纯绿会被五盏灯的高光洗成惨白偏黄，"手套=绿"这条判据当场作废：
+// 实测有一次，手套明明在画面上占了 5000+ px，按 `g > r+40 且 g > b+40` 的数法
+// 却只数出 680 px —— 于是得出了"手还是看不见"的错误结论，差点把量好的握持点推翻。
+// 颜色必须由材质常量决定，不能由光照决定。
+//
+// 判断形状与明暗仍然看**正常材质**那张图：识别色只回答"这块是谁"。
+Ref<StandardMaterial3D> id_mat(const Color &c) {
+    Ref<StandardMaterial3D> m;
+    m.instantiate();
+    m->set_shading_mode(BaseMaterial3D::SHADING_MODE_UNSHADED);
+    m->set_albedo(c);
     m->set_flag(BaseMaterial3D::FLAG_DONT_RECEIVE_SHADOWS, true);
     return m;
 }
@@ -209,6 +240,46 @@ bool art_report_enabled() {
     static const bool s = (std::getenv("VA_VM_ART_QUIET") == nullptr);
     return s;
 }
+
+// VA_DBG_VM=1：视图模型的时序取证（每帧 dt = 帧率，以及每次枪口焰亮了几帧）。
+bool dbg_vm() {
+    static const bool s = (std::getenv("VA_DBG_VM") != nullptr);
+    return s;
+}
+
+// VA_VM_HANDS=0 藏掉双手（消融对照用）。**默认显示**。
+//
+// 语义记牢：是"0 才关"，不是"存在就开"。原先写反了（`getenv != nullptr` = 开），
+// 于是默认藏、要看手得显式 VA_VM_HANDS=1 —— 结果就是第一人称画面里
+// **只有一把枪悬在空中**。第一人称里"没有手"是最容易被一眼读出来的破绽：
+// 枪的朝向、后坐、摆动都做对了，玩家还是会立刻觉得假。
+bool hands_enabled() {
+    static const bool s = [] {
+        const char *e = std::getenv("VA_VM_HANDS");
+        return !(e != nullptr && e[0] == '0' && e[1] == '\0');
+    }();
+    return s;
+}
+
+// ---- 枪口焰的时长 ----
+//
+// 时长默认 0.045 秒（约等于真枪的两次曝光，视觉上就是"一闪"）。
+// VA_VM_FLASH=<秒> 覆盖它，**只为取证**：0.045 秒比本工程三种取证手段的
+// 最小粒度都短 —— 事件落盘要等 0.05 秒墙钟、定时截图按战局秒数触发，
+// 所以"枪口焰长什么样"本来是一张**注定拍不到**的图（这是"判据必须小于
+// 被取证据的寿命"那条铁律的又一个实例）。取证时用 VA_VM_FLASH=5 按住它，
+// 拍完就扔；游戏里永远用默认值。
+float flash_sec() {
+    static const float s = [] {
+        const char *e = std::getenv("VA_VM_FLASH");
+        const float v = (e != nullptr && *e != '\0') ? (float)std::strtod(e, nullptr) : 0.045f;
+        return (v >= 0.005f && v <= 60.0f) ? v : 0.045f;
+    }();
+    return s;
+}
+
+// 枪口自发光几何 / 点光的满亮强度。跟着上面的时长一起用，不再散在字面量里。
+constexpr float FLASH_ENERGY = 7.0f;
 
 void vm_layer(MeshInstance3D *mi) {
     mi->set_layer_mask(VM_LAYER);
@@ -380,13 +451,67 @@ void ViewModel::build(Camera3D *p_cam, Node *p_proto_parent) {
     // metallic 必须压低：金属件在缺少反射探针时镜面路径采不到环境，只剩"黑" ——
     // 实测 0.78 的导轨显示 RGB(0,1,10)，整条直接消失。使命召唤的枪械本身也是哑光，
     // 金属感靠粗糙度与高光，不靠 metallic。
-    const Ref<StandardMaterial3D> metal = vm_mat(dbg_mat ? Color(1, 1, 1) : Color(0.170f, 0.174f, 0.186f), 0.12f, 0.58f);
-    const Ref<StandardMaterial3D> poly = vm_mat(dbg_mat ? Color(1, 0, 0) : Color(0.165f, 0.161f, 0.152f), 0.0f, 0.70f);
-    const Ref<StandardMaterial3D> dark = vm_mat(dbg_mat ? Color(0.35f, 0.35f, 0.35f) : Color(0.092f, 0.090f, 0.086f), 0.0f, 0.62f);
-    const Ref<StandardMaterial3D> glove = vm_mat(dbg_mat ? Color(0, 1, 0) : Color(0.160f, 0.152f, 0.140f), 0.0f, 0.92f);
-    // 袖子：早期用 0.30 的橄榄绿会变成一根横穿画面的亮条；压到 0.110 又变成
-    // 死黑竖杠（实测 64% 像素亮度 <20）。0.170 是这两者之间唯一可用的一档。
-    const Ref<StandardMaterial3D> sleeve = vm_mat(dbg_mat ? Color(0, 0, 1) : Color(0.170f, 0.178f, 0.138f), 0.0f, 0.95f);
+    const Ref<StandardMaterial3D> metal = dbg_mat ? id_mat(Color(1, 1, 1))
+        : vm_mat(Color(0.170f, 0.174f, 0.186f), 0.12f, 0.58f);
+    const Ref<StandardMaterial3D> poly = dbg_mat ? id_mat(Color(1, 0, 0))
+        : vm_mat(Color(0.165f, 0.161f, 0.152f), 0.0f, 0.70f);
+    const Ref<StandardMaterial3D> dark = dbg_mat ? id_mat(Color(0.35f, 0.35f, 0.35f))
+        : vm_mat(Color(0.092f, 0.090f, 0.086f), 0.0f, 0.62f);
+    // 手套与袖子的 albedo 做成旋钮（VA_VM_GLOVE / VA_VM_SLEEVE，sRGB 标量）。
+    // 扫它们不会波及枪：程序化枪身有自己那套材质，这两块**只被双手用到**。
+    //
+    // 【色相为什么从"中性深灰"改成暖褐】这是接真模型之后必须重标的一处。
+    // 原先 0.160/0.170 配的是两组几乎中性的灰（手套 1 : 0.95 : 0.875，
+    // 袖子 1 : 1.047 : 0.812），在**程序化枪身**（0.165 的深灰）旁边同档，
+    // 看起来是"一体的深色装备"。换成真模型之后枪身中位 L143（暖木色 + 冷钢），
+    // 而双手实测只有 L52 / L33 —— 手比枪暗 2.7~4.3 倍，再叠上偏蓝的色偏，
+    // 于是画面上读出来是"一把枪 + 两根横插进来的树干"，正是玩家报的那个症状。
+    //
+    // 色偏的来源已经用归因实验排掉了一个想当然的答案：把 VA_AMBIENT 从 1.62 归零，
+    // 手套只从 L52 掉到 L49（−5%）、袖子 L33→L30（−9%）—— 所以**不是环境光**，
+    // 而是五盏枪模灯里那两盏偏蓝的（冷补光 0.68/0.77/0.95、轮廓光 0.55/0.60/0.68）
+    // 正打在"朝相机"的那些面上，而唯一照朝相机面的中性光（第 3 盏轴光）
+    // 只有 1.5 能量。修法有两条，选的是第二条：
+    //   ① 提轴光（试过，否掉了）：手确实亮了、色偏也修好了，但枪身跟着变
+    //      —— 中位 RGB (136,143,168)→(182,141,115)、过曝 25.2%→26.5%。
+    //      枪身的亮度是逐档标定出来的，不能让双手把它带跑。详见灯那段的注释。
+    //   ② **只动这两个 albedo**（当前方案）：提高标量 + 把色相从近乎中性
+    //      改成真正的皮革 / 军装布黄褐，用暖色相抵消剩下的冷偏。
+    //      它们只被双手用到，所以改它们对枪的影响恒为 0。
+    //
+    // 扫的时候仍然别只往亮里调：亮过头袖子会变成横穿画面的一条亮带，
+    // 暗过头又变回死黑方板。口径用 tools/vm_hand_probe.py
+    // （正常图 + VA_VM_HIDE 消融图 + VA_VM_MAT 识别色图 → 拆出枪身/手套/袖子三行）。
+    const float g_alb = va::clampf(env_f("VA_VM_GLOVE", 0.540f), 0.02f, 1.0f);
+    const float s_alb = va::clampf(env_f("VA_VM_SLEEVE", 0.500f), 0.02f, 1.0f);
+    // 手套的色相比袖子还要极端 —— 这不是随手加的饱和度，是量出来的：
+    // 手套那几个方块**朝相机**的面在蓝通道上的照度远高于红通道，按
+    // "正常皮革色"（1 : 0.58 : 0.30）写进去，渲染出来是 RGB(83,60,75) ——
+    // 绿分量比蓝还低，成了一种发紫的灰（实测）。
+    //
+    // ⚠️ 这里**不能按通道线性反推**，会被 ACES 的跨通道混合打脸：实测把蓝 albedo
+    // 从 0.187 降到 0.090（只动这一项），渲染出来的红反而从 119 升到 174（+46%）、
+    // 绿几乎不动（71→66）。也就是说"降蓝会让红更红"，通道之间是耦合的。
+    // 所以色相只能经验扫：先在两个极端之间取中点，再单独扫标量。
+    const Ref<StandardMaterial3D> glove = dbg_mat ? id_mat(Color(0, 1, 0))
+        : vm_mat(Color(g_alb, g_alb * 0.760f, g_alb * 0.320f), 0.0f, 0.92f);   // 皮革
+    // 袖子刻意**不跟枪托同色系**：枪托是暖木色，袖子也做成暖褐的话，画面上就是
+    // "两根木条 + 一把木枪"，反而更像板子。所以袖子走军装布卡其（r≈g>b），
+    // 与木色拉开色相关系。
+    const Ref<StandardMaterial3D> sleeve = dbg_mat ? id_mat(Color(0, 0, 1))
+        : vm_mat(Color(s_alb, s_alb * 0.820f, s_alb * 0.400f), 0.0f, 0.95f);   // 军装布
+
+    // 定档实测（莫辛，tools/vm_hand_probe.py；同一口径下改前 → 改后）：
+    //     手套  L52 RGB(43,52,74) 偏蓝灰  →  L96 RGB(119,90,83) 皮革棕
+    //     袖子  L33 RGB(24,34,45) 近黑    →  L88 RGB(111,84,53) 军装卡其
+    //     枪身  L143 过曝 25.2%          →  L143 过曝 25.2%（未动）
+    // 扫过的范围：标量 0.30~0.76、色相比 (g : b)/r 从 0.62:0.34 一路试到 0.84:0.44，
+    // 两头都不可用 ——
+    //   太亮（0.72 配 0.72:0.26）：手套过曝跳到 22.5%、糊成一片亮橙 RGB(243,154,75)；
+    //   太灰（0.44 配 0.80:0.38）：渲染成 RGB(79,72,76)，又变回一块灰板。
+    // 最终 0.540 配 (1 : 0.760 : 0.320) 是唯一同时满足"读得出是皮革"与
+    // "过曝 < 3%"的一档。**中间那些值不必重扫** —— 改色相比就等于同时动了标量
+    // （跨通道耦合），所以参数表本身不可插值，只能按"读感 + 过曝"两个判据选点。
 
     // ------------------------------------------------------------------
     // 分组：枪身 / 双手 / 真模型。
@@ -495,13 +620,49 @@ void ViewModel::build(Camera3D *p_cam, Node *p_proto_parent) {
     //      几乎竖直垂在画面正中，把视觉重心从"右下角持枪"拽到了中间，整把枪都
     //      不像枪了。外移到 ±0.30 之后，右臂斜向右下 (u 0.67→0.82)、左臂斜向左下
     //      (u 0.58→0.29)，画面中下部才让给枪身。
+    //
+    // 【手心的基准落点】= 手掌方块的中心。它是一把"尺子"：换真模型时整个 hand 组
+    // 按 (目标手心 − 基准手心) 平移，见 load_skin。所以这里的位置改了，
+    // kWpnArt 里那三组 hand_r / hand_l 也必须跟着改 —— 两边是同一个数。
+    //
+    // 另外补了一块**拇指**：光一块方板读不出"手"（实测玩家反馈就是"只有一把枪"，
+    // 而那时手其实在画面外/陷进枪里）。拇指放在掌心前上方，从背后看是一个越出
+    // 掌顶的小鼓包 —— 不管枪的哪一侧面朝相机都看得见，是性价比最高的一笔。
     // ------------------------------------------------------------------
-    part(hand_r, box(0.050f, 0.074f, 0.080f), Vector3(0, -0.080f, WPN_HAND_R0), Vector3(14, 0, 0), glove); // 右手
-    part(hand_r, box(0.012f, 0.020f, 0.055f), Vector3(0, -0.044f, WPN_HAND_R0 - 0.057f), Vector3(), glove); // 右手食指
-    limb(hand_r, Vector3(0.005f, -0.082f, -0.010f), Vector3(0.300f, -0.440f, -0.130f), 0.032f, sleeve); // 右前臂
+    // 【为什么每只手是"一块掌 + 几根指"而不是一块方板】
+    // 上一版每只手只有一块 5×7.4×8 cm 的方板。在**这个视角的灯下**那是读不出"手"的：
+    // 五盏枪模灯都相对相机固定，一块正对相机的平面被均匀照亮 —— 出来就是一块**没有任何
+    // 明暗变化的浅色平板**，跟枪身那种满是台阶的硬表面完全不是一种东西。
+    // 加几根手指之后，指节之间有了朝不同方向的面，才有体积感。
+    //
+    // ⚠️ 前臂的**起点必须落在手掌后面**（+z 方向），不能放在掌心。
+    // 前臂是一根直径 5.4 cm 的圆柱，而手掌只有 5.4×8 cm ——
+    // 起点放在掌心 = 手掌整只手被那根管子包在里面。实测症状：
+    // 识别色里手套只剩 525 px、袖子 64500 px（"手不见了"的**真正**原因，
+    // 比"握持点没量准"更致命：量得再准也看不见）。
+    // 所以两根前臂都从掌心往 +z 退到掌背处起笔。
+    //
+    // 指头的摆法按"从相机（枪的左后方）看过去能看到什么"来定，不是按解剖书：
+    //   · 右手攥握把时，近侧看到的是**手背那一坨** + 拇指
+    //     → 一块掌加一块拇指就够，再堆指头反而会被握把挡掉；
+    //   · 左手托护木时，近侧看到的是**手掌压在管子下面 + 手指从管子顶上扣过来**
+    //     → 掌放高一点（够到管顶），再放三条横跨管顶的指头。
+    // 拇指一律放在近侧，它是"这里有一只手"最省笔墨的信号。
+    part(hand_r, box(0.054f, 0.080f, 0.080f), HAND_R_BASE, Vector3(14, 0, 0), glove);            // 右手掌（手背朝相机）
+    part(hand_r, box(0.020f, 0.024f, 0.030f),                                                    // 右手拇指
+         HAND_R_BASE + Vector3(-0.034f, 0.030f, -0.014f), Vector3(24, -18, 0), glove);
+    limb(hand_r, HAND_R_BASE + Vector3(0.004f, -0.006f, 0.030f),          // 起笔在掌背，不在掌心
+         Vector3(0.290f, -0.540f, -0.130f), FOREARM_R, sleeve);                                  // 右前臂
 
-    part(hand_l, box(0.058f, 0.062f, 0.088f), Vector3(-0.010f, -0.032f, WPN_HAND_L0), Vector3(), glove);   // 左手
-    limb(hand_l, Vector3(-0.006f, -0.034f, WPN_HAND_L0), Vector3(-0.330f, -0.420f, -0.150f), 0.032f, sleeve); // 左前臂
+    part(hand_l, box(0.056f, 0.086f, 0.086f), HAND_L_BASE, Vector3(), glove);                    // 左手掌（托在护木下）
+    for (int i = 0; i < 3; ++i) {                                                                // 左手四指扣过护木顶面
+        part(hand_l, box(0.058f, 0.017f, 0.021f),
+             HAND_L_BASE + Vector3(0.0f, 0.046f, (float)(i - 1) * 0.028f), Vector3(), glove);
+    }
+    part(hand_l, box(0.018f, 0.022f, 0.034f),                                                    // 左手拇指
+         HAND_L_BASE + Vector3(-0.036f, 0.022f, -0.030f), Vector3(0, -20, 0), glove);
+    limb(hand_l, HAND_L_BASE + Vector3(0.004f, -0.006f, 0.036f),          // 起笔在掌背，不在掌心
+         Vector3(-0.320f, -0.540f, -0.150f), FOREARM_R, sleeve);                                 // 左前臂
 
     // ------------------------------------------------------------------
     // 枪口 + 枪口焰
@@ -547,6 +708,16 @@ void ViewModel::build(Camera3D *p_cam, Node *p_proto_parent) {
     // 几乎全部朝向相机。只给侧向/后方光的时候，实测袖子有 63% 的像素亮度 <20
     // （albedo 提高 2.1 倍都没用，因为那些像素的照度本来就是 0）。加一盏沿视轴的
     // 光之后，任何"朝相机"的面才拿得到基础照明。
+    //
+    // 【为什么不能靠"把轴光提上去"来救双手 —— 试过，枪身会跟着变】
+    // 直觉是"轴光 travel 近乎纯 -Z，只对法线朝 +Z 的面有效，而枪身上这种面很少"。
+    // 实测把这个直觉否掉了（莫辛，tools/vm_hand_probe.py）：
+    //     轴光 1.5 → 3.2：手套 L52→65、袖子 L33→66（色偏也修好了），但
+    //     枪身中位 RGB (136,143,168)→(182,141,115)、过曝 25.2%→26.5%
+    // —— 因为**圆柱体的可见半边本来就朝相机**，枪管、机匣、弹匣都吃这盏灯。
+    // 枪身的亮度与过曝是本项目逐档量着标定出来的（见 VA_VM_ART_ALB 那段），
+    // 所以这条路放弃：灯一律不动，双手的补偿全部做在它自己的 albedo 上
+    // （见上面手套/袖子那两段的注释）。
     // ------------------------------------------------------------------
     const float k_key = env_f("VA_VMK", 3.80f);
     const float k_side = env_f("VA_VMF", 2.00f);
@@ -625,19 +796,30 @@ bool ViewModel::load_skin(int p_index) {
         art_nodes[p_index] = n;
         art_mz[p_index] = info.muzzle_z;
         art_len[p_index] = info.length;
-        art_hr[p_index] = info.hand_r_z;
-        art_hl[p_index] = info.hand_l_z;
+        art_hand_r[p_index] = info.hand_r_pos;
+        art_hand_l[p_index] = info.hand_l_pos;
     }
     art_muzzle_z = art_mz[p_index];
 
-    // 双手按这把枪的握持点整组平移。基准就是程序化枪模那两只手的落点，
-    // 偏移量 = 本枪落点 − 基准（程序化时两者相等，偏移为 0，原样不动）。
-    // 不做这一步的症状见 WpnArtDef 里 hand_*_z 的注释：手悬在枪身外面。
-    // 只平移 z —— 竖直方向每把枪的握把高度差在**前臂会跟着动**的前提下
-    // 会变成"手整体浮起或下陷"，而枪本身已经用 place.y 对齐了枪管轴线，
-    // 所以竖直方向留给后续按截图微调，不在这里猜。
-    if (hand_r != nullptr) hand_r->set_position(Vector3(0, 0, art_hr[p_index] - WPN_HAND_R0));
-    if (hand_l != nullptr) hand_l->set_position(Vector3(0, 0, art_hl[p_index] - WPN_HAND_L0));
+    // 双手按这把枪的握持点整组平移（**三个方向都平移**）。
+    // 基准 = 程序化那两只手掌方块的中心（HAND_R_BASE / HAND_L_BASE），
+    // 偏移 = 本枪的握持点 − 基准；程序化枪模时两者相等、偏移为 0，原样不动。
+    //
+    // 【为什么不能只挪 z】上一版就是这么写的，理由是"竖直方向留给按截图微调"。
+    // 结果是手**整块陷进枪身**：真模型的握把高度和程序化枪模差 2~5 cm，
+    // 只挪 z 等于把指头按在枪托内部。症状不是"手飘在枪外"，而是"**手根本看不见**" ——
+    // 从背后看只剩两侧各 2 mm 的边，实测绿(手套) 525 px、蓝(袖子) 64500 px，
+    // 玩家看到的就是"手里只有一把枪"。所以握持点必须是三维量出来的。
+    //
+    // 握持点的来历见 scene_builder.cpp 的 kWpnArt（tools/glb_preview.py --probe 量）。
+    // 想现场扫偏移而不重编译，用 VA_VM_HANDOFF_R / _L（"x,y,z"，米）。
+    Vector3 hr = art_hand_r[p_index];
+    Vector3 hl = art_hand_l[p_index];
+    Vector3 d;
+    if (env_vec3("VA_VM_HANDOFF_R", d)) hr += d;
+    if (env_vec3("VA_VM_HANDOFF_L", d)) hl += d;
+    if (hand_r != nullptr) hand_r->set_position(hr - HAND_R_BASE);
+    if (hand_l != nullptr) hand_l->set_position(hl - HAND_L_BASE);
 
     for (int i = 0; i < art_slots; ++i) {
         if (art_nodes[i] != nullptr) art_nodes[i]->set_visible(i == p_index);
@@ -649,15 +831,20 @@ bool ViewModel::load_skin(int p_index) {
 
     // 真模型接管枪身，程序化枪身整块让位。
     //
-    // 双手**默认藏**：程序化那双手是给程序化枪模配的粗方块（前臂是一整根
-    // 方柱），跟真模型那种硬表面细节放一起非常突兀 —— 实测在波波沙与
-    // DP-27 上比枪本身还抢眼（弹鼓/圆盘弹匣反而被两块灰板压住）。
-    // 参考图是光枪，生成的模型里本来也没有手，所以"藏掉"比"硬套方块"
-    // 更接近素材原貌。
-    // VA_VM_HANDS=1 放回来 —— 将来有配得上的手模/手套时，每把枪的握持点
-    // 已经标定在 kWpnArt 的 hand_r_z / hand_l_z 里，直接接上即可。
+    // 双手**要留着**：参考图是光枪，生成的模型里本来就没有手，
+    // 连手一起藏掉的话画面上就是一把悬空的枪 —— 这是上一轮踩的坑
+    // （当时嫌那两块粗方块"抢眼"，就把默认值改成了藏，结果连"手持"都丢了）。
+    // 现在的取舍：手默认显示；每把枪的握持点标定在 kWpnArt 的 hand_r / hand_l 里，
+    // 换枪时整组跟着走。实在想对照"有手/没手"，用 VA_VM_HANDS=0。
     if (proc_body != nullptr) proc_body->set_visible(false);
-    if (hands != nullptr) hands->set_visible(std::getenv("VA_VM_HANDS") != nullptr);
+    if (hands != nullptr) hands->set_visible(hands_enabled());
+
+    // 顺手报一下手落在枪的哪个位置 —— 判"手有没有陷进枪身"时，
+    // 拿这三个数与 glb_preview --probe 量出来的剖面直接比就行，不必靠看图。
+    if (dbg_vm()) {
+        UtilityFunctions::print(String::utf8("[vm] 握持点 右手 "), hr,
+                                String::utf8("  左手 "), hl);
+    }
 
     UtilityFunctions::print(String::utf8("[vm] 武器外观 "), (int)p_index + 1, "/", art_slots,
                             " ", String::utf8(skin_label()),
@@ -690,10 +877,17 @@ void ViewModel::on_shot() {
     // 一次冲量：位移 + 角速度。数值靠手感调 —— 太大像在"点头"，太小没反馈。
     recoil_v += 3.6f;
     recoil = std::min(recoil + 0.22f, 1.0f);
-    flash_t = 0.045f;
+    flash_t = flash_sec();
+    flash_frames = 0;
+    flash_dt_max = 0.0f;
     if (muzzle != nullptr) {
         // 每发随机滚一下枪口焰，避免连发时同一个形状反复闪
         muzzle->set_rotation_degrees(Vector3(0, 0, (float)(rand() % 360)));
+    }
+    if (dbg_vm()) {
+        UtilityFunctions::print(String::utf8("[vm] 开火 → 枪口焰 时长 "),
+                                String::num(flash_t, 3), String::utf8("s  枪口 z "),
+                                String::num(muzzle != nullptr ? (double)muzzle->get_position().z : 0.0, 3));
     }
 }
 
@@ -787,13 +981,51 @@ void ViewModel::update(double p_dt, float move01, bool running, float pitch, flo
         rl * 32.0f));
 
     // ---- 枪口焰 ----
+    //
+    // 【判定必须排在扣减之前 —— 这条顺序就是"开火没有光效"的根因】
+    // 原先写的是先 `flash_t -= dt` 再判 `flash_t > 0`。只要**一帧的间隔 ≥ 闪光时长**，
+    // 整段闪光就被这一帧一次扣光，画面上**一帧都画不出来**，枪口焰彻底消失：
+    //     0.045 秒的门槛 = 22 fps。高于它才有闪光，低于它永远没有。
+    // 而本机 1080p 实测的帧间隔就在 0.05～0.1 秒（10～20 fps，见 VA_DBG_VM 的日志），
+    // 正好整个落在门槛之下 —— 于是这是一个**只在低帧率机器上成立**的 bug，
+    // 帧率高的机器上连复现都复现不出来，看代码也很难看出问题。
+    // 现在先定"这一帧画不画"，再扣时间：闪光在任意帧率下都至少有一帧的曝光。
     if (flash_t > 0.0f) {
+        // 亮度取**扣减之前**的剩余比例 → 第一帧必定满亮
+        const float k = va::clampf(flash_t / flash_sec(), 0.0f, 1.0f);
         flash_t -= dt;
-        const bool on = flash_t > 0.0f;
-        flash_group->set_visible(on);
+        flash_group->set_visible(true);
         if (flash_light != nullptr) {
-            // 用剩余时间当衰减：枪口焰的持续时间极短，闪一下就灭
-            flash_light->set_param(Light3D::PARAM_ENERGY, on ? 7.0f * (flash_t / 0.045f) : 0.0f);
+            flash_light->set_param(Light3D::PARAM_ENERGY, FLASH_ENERGY * k);
+        }
+        ++flash_frames;
+        flash_dt_max = std::max(flash_dt_max, dt);
+        if (flash_t <= 0.0f) {
+            // 本次闪光结束：几何与点光一起灭掉
+            flash_group->set_visible(false);
+            if (flash_light != nullptr) flash_light->set_param(Light3D::PARAM_ENERGY, 0.0f);
+            if (dbg_vm()) {
+                const float fps = (flash_dt_max > 0.0f) ? (1.0f / flash_dt_max) : 0.0f;
+                UtilityFunctions::print(String::utf8("[vm] 枪口焰 结束：亮 "), flash_frames,
+                                        String::utf8(" 帧  最大帧间隔 "), String::num(flash_dt_max, 3),
+                                        String::utf8("s（≈"), (int)fps, String::utf8(" fps）"));
+            }
+        }
+    }
+
+    // VA_DBG_VM=1：每秒一行帧率。枪口焰画不画得出来完全由 dt 决定，
+    // 所以报帧率就是报这件事的"因" —— 判读时两行对着看。
+    if (dbg_vm()) {
+        dbg_dt_acc += dt;
+        ++dbg_dt_frames;
+        if (dbg_dt_acc >= 1.0f) {
+            const float avg = dbg_dt_acc / (float)dbg_dt_frames;
+            UtilityFunctions::print(String::utf8("[vm] dt "), String::num(avg, 4),
+                                    String::utf8("s ≈ "), (int)(1.0f / avg),
+                                    String::utf8(" fps  （枪口焰时长 "), String::num(flash_sec(), 3),
+                                    String::utf8("s，要 dt 小于它才画得出来）"));
+            dbg_dt_acc = 0.0f;
+            dbg_dt_frames = 0;
         }
     }
 

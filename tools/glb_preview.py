@@ -23,6 +23,17 @@
 用法：
     <venv-python> tools/glb_preview.py <a.glb> [--out png] [--size 520] [--views XY,ZY,XZ]
 
+    # 量"枪的握把 / 护木"在**引擎局部系**里的位置（给双手落点用）
+    <venv-python> tools/glb_preview.py <a.glb> --len 1232 --probe -0.18,-0.45
+
+--probe 会按 scene_builder::make_wpn_node 的同一套归一化
+（绕 Y 转 90° → 按 --len 缩放 → 平移到"包围盒 +Z 端顶到 WPN_STOCK_Z"）
+把顶点换算到引擎局部系，再报每个 z 切片上的 x / y 范围。
+判读口径：y 的分位数给的是"这一片里从最低到最高的分布"——
+握把是**下面那一簇木头**，不是最高点（最高点通常是机匣/照门）。
+--len 不给就按原始单位算（k=1），此时打印出来的 k 与引擎日志里的
+"[wpn] 模型 … 缩放 k" 对不上就说明参数给错了。
+
 依赖 Pillow（与 slim_glb.py 共用隔离 venv）：
     C:/Users/<user>/.workbuddy/binaries/python/envs/default/Scripts/python.exe
 """
@@ -204,6 +215,76 @@ def render_view(pts, ha, va, size, margin):
     return img, (x1 - x0, y1 - y0)
 
 
+WPN_STOCK_Z = 0.15
+
+
+def engine_space(pts, len_mm, place):
+    """按 scene_builder::make_wpn_node 的同一套变换把顶点换算到**引擎局部系**。
+
+    那一套是（逐字对应源码）：
+        1) euler = (0, WPN_YAW_DEG=90°, 0)          —— 绕 Y 转 90°：(x,y,z) -> (z,y,-x)
+        2) k = len_m / max(旋转前包围盒最长边)
+        3) 量**旋转后**的包围盒 box，c = box 中心
+        4) 平移 x/y 以包围盒中心为准再加 place；z 把包围盒 +Z 端顶到 WPN_STOCK_Z
+       place.x / place.y 是把"枪管轴线"对到 x=0 / y=0 的项（本工具量出来写进 kWpnArt）。
+
+    【为什么必须在这里重做一遍】双手的落点要落在**引擎会看到的那把枪**上，
+    而它和 GLB 原始坐标之间隔着旋转（换轴）、缩放、平移三道 ——
+    直接在原始坐标上量出来的数字放进引擎是错的。
+
+    ⚠️ 缩放 k ≠ 1 会带来一个**很容易漏的偏差**：place 是拿原始单位算的，
+    却被引擎放在**缩放之后**的坐标系里。于是"轴线对到 y=0"只在 k=1 时精确成立，
+    k≠1 时轴线落在 (k−1)·(轴线偏移)。莫辛 k=1.036 偏 2 mm 无所谓，
+    波波沙 k=0.715 偏到 26 mm —— 量双手落点时必须用这里的换算，
+    不能拿"原始 y 减轴线"糊过去。
+
+    返回 (engine 点列表, k, 重算出的 place)。
+    """
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    zs = [p[2] for p in pts]
+    ext = (max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs))
+    axis = max(range(3), key=lambda i: ext[i])
+    k = (len_mm / 1000.0 / ext[axis]) if len_mm else 1.0
+
+    # place.y 的定义（与 main() 现有那段逐字一致）：在**原始**坐标里取长轴最大端 3%
+    cut = sorted(p[axis] for p in pts)[int(len(pts) * 0.97)]
+    front = [p for p in pts if p[axis] >= cut]
+    rot = [(p[2], p[1], -p[0]) for p in pts]
+    rx = [p[0] for p in rot]
+    ry = [p[1] for p in rot]
+    rz = [p[2] for p in rot]
+    c = ((min(rx) + max(rx)) * 0.5, (min(ry) + max(ry)) * 0.5, (min(rz) + max(rz)) * 0.5)
+    py = -((sum(p[1] for p in front) / len(front)) - c[1])
+    px = -((sum(p[2] for p in front) / len(front)) - c[0])
+    pos_z = WPN_STOCK_Z - max(rz) * k
+    # ⚠️ z 这一项**不能减 c[2]**：源码对 x/y 是按包围盒中心平移的，
+    # 对 z 却是"把包围盒 +Z 端顶到 WPN_STOCK_Z"（pos_z 里已经含 −max(rz)·k）。
+    # 顺手写成 (p[2]−c[2])·k 的话，整条 z 会平移 c[2]·k —— 莫辛偏 4.9 cm，
+    # 于是"量 z=-0.18 的握把"实际量的是 -0.229，量出来的双手落点全是错的。
+    eng = [((p[0] - c[0]) * k + place[0],
+            (p[1] - c[1]) * k + place[1],
+            p[2] * k + pos_z + place[2]) for p in rot]
+    return eng, k, (px, py)
+
+
+def probe_slabs(eng, zs, half):
+    """报每个 z 切片上的 x / y 分布。握把在 y 的下半簇，看分位数而不是极值。"""
+    print("  引擎局部系切片（半宽 ±%.3f m）：" % half)
+    print("    %8s %6s %10s %10s   %s" % ("z", "顶点", "y 分位", "", "x 范围"))
+    for z in zs:
+        sel = [p for p in eng if abs(p[2] - z) <= half]
+        if len(sel) < 8:
+            print("    %8.3f %6d   （这一片几乎没有顶点，换个 z）" % (z, len(sel)))
+            continue
+        vy = sorted(p[1] for p in sel)
+        vx = sorted(p[0] for p in sel)
+        q = lambda f: vy[min(len(vy) - 1, int(len(vy) * f))]
+        print("    %8.3f %6d  低 %+.3f 10%% %+.3f 中 %+.3f 90%% %+.3f 高 %+.3f   x [%+.3f, %+.3f]"
+              % (z, len(sel), vy[0], q(0.10), q(0.50), q(0.90), vy[-1], vx[0], vx[-1]))
+    print("    （握把/护木取「低 ~ 中」那一簇；最高点通常是机匣或照门，别拿它当握持中心）")
+
+
 def main():
     a = sys.argv[1:]
     if not a:
@@ -281,8 +362,10 @@ def main():
     # 在 splat 图上根本读不出来；而"托底比枪管粗得多"是稳定的结构差异。
     lo, hi = min(xs), max(xs)
     slices = {}
-    for tag, a, b in (("最小端", lo, lo + ext[0] * 0.05), ("最大端", hi - ext[0] * 0.05, hi)):
-        sel = [p[1] for p in pts if a <= p[0] <= b]
+    # 循环变量别叫 a/b —— main 里的 a 是命令行参数（原名 a 会被这里覆盖掉，
+    # 于是后面 `"--probe" in a` 报 "argument of type 'float' is not iterable"）
+    for tag, sa, sb in (("最小端", lo, lo + ext[0] * 0.05), ("最大端", hi - ext[0] * 0.05, hi)):
+        sel = [p[1] for p in pts if sa <= p[0] <= sb]
         slices[tag] = (max(sel) - min(sel)) if sel else 0.0
     if slices["最小端"] > 0 and slices["最大端"] > 0:
         thick = "最小端" if slices["最小端"] < slices["最大端"] else "最大端"
@@ -311,6 +394,22 @@ def main():
         out.paste(t, (i * (size + gap), 0))
     out.save(dst)
     print("  wrote %s  %dx%d" % (dst, out.width, out.height))
+
+    # ---- --probe：量引擎局部系里指定 z 处的剖面（双手落点用）----
+    if "--probe" in a:
+        zs = [float(v) for v in a[a.index("--probe") + 1].split(",")]
+        half = opt("--probe-half", 0.02)
+        pl = [float(v) for v in opt("--place", "0,0,0").split(",")]
+        eng, k, recomputed = engine_space(pts, opt("--len", 0), pl)
+        ez = [p[2] for p in eng]
+        print("  engine 空间：缩放 k=%.9f（要和引擎日志的「缩放」一致）" % k)
+        print("    z 范围 [%+.4f, %+.4f]  （+Z 端应顶在 WPN_STOCK_Z=%+.2f；"
+              "枪口在另一端）" % (min(ez), max(ez), WPN_STOCK_Z))
+        print("    本工具重算的 place = (%+.4f, %+.4f)，表里给的是 (%+.4f, %+.4f)  %s"
+              % (recomputed[0], recomputed[1], pl[0], pl[1],
+                 "一致" if (abs(recomputed[0] - pl[0]) < 2e-3 and abs(recomputed[1] - pl[1]) < 2e-3)
+                 else "**不一致，表要更新**"))
+        probe_slabs(eng, zs, half)
     return 0
 
 
