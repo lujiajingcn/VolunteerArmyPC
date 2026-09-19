@@ -295,6 +295,10 @@ void WorldSim::_ready() {
     if (show_self_) {
         UtilityFunctions::print(String::utf8("[self] VA_SHOW_SELF：刻意把玩家自己的身体画回来（复现视野遮挡用）"));
     }
+    dbg_input_ = (std::getenv("VA_DBG_INPUT") != nullptr);
+    if (dbg_input_) {
+        UtilityFunctions::print(String::utf8("[dbg-input] 逐事件记录按键流 + 每 0.25 秒墙钟打一次位置心跳"));
+    }
     spawn_entity_nodes();
     va_trace("_ready:spawn ok");
     setup_runtime_ui();
@@ -455,6 +459,58 @@ void WorldSim::dbg_units_dump(const char *p_when) const {
                                 " self=", u.isPlayer ? 1 : 0,
                                 u.dead ? String::utf8("  [阵亡]") : String(""));
     }
+}
+
+/* ---- 输入取证：按住方向键时，事件流把 IN 改成了什么（VA_DBG_INPUT）--------------
+   "按住不松开会一直走 / 松开应该立刻停" 这类问题必须看事件流，不能看画面：
+   画面上"走得慢"和"走了两步就停"读不出量级，而键鼠事件里的两个标志位
+   （pressed = 键现在是不是按下的；echo = 这条是**操作系统的按键重复**）
+   恰好就是判据本身 —— 重复事件绝不等于松开。
+
+   判读口径（两条，缺一不可）：
+   ① echo=1 的事件后面，IN(w,s,a,d) 必须与之前**相同**；
+   ② 心跳里"位移=0.000 m"只能出现在 release 之后，不能出现在按住期间。 */
+void WorldSim::dbg_input_key(int64_t p_code, bool p_pressed, bool p_echo) {
+    if (!dbg_input_) return;
+    UtilityFunctions::print(String::utf8("[dbg-input] key 码="), p_code,
+                            String::utf8(" pressed="), p_pressed ? 1 : 0,
+                            String::utf8(" echo="), p_echo ? 1 : 0,
+                            String::utf8("  →  IN(w,s,a,d)="),
+                            va::IN.w ? 1 : 0, va::IN.s ? 1 : 0, va::IN.a ? 1 : 0, va::IN.d ? 1 : 0,
+                            String::utf8(" shift="), va::IN.shift ? 1 : 0,
+                            String::utf8(" ctrl="), va::IN.ctrl ? 1 : 0);
+}
+
+/* 位置心跳。报的是**两次心跳之间的位移**（米）而不是坐标 ——
+   "按住了却位移 0" 与 "松开了还在位移" 是同一枚硬币的两面，
+   坐标列本身读不出这件事，位移列一眼就能读出来。 */
+void WorldSim::dbg_input_heartbeat(double p_delta) {
+    if (!dbg_input_) return;
+    dbg_in_wall_ += p_delta;
+    if (dbg_in_wall_ < dbg_in_next_) return;
+    dbg_in_next_ = dbg_in_wall_ + 0.25;
+
+    const va::Unit *p = va::W.player;
+    const double x = p != nullptr ? (double)p->x : 0.0;
+    const double y = p != nullptr ? (double)p->y : 0.0;
+    /* 第一条心跳只记基准、不报位移：基准位置是从 (0,0) 起算的，
+       而玩家出生点离原点 1.2 km —— 不这样处理的话第一行会报"位移 1233 米"，
+       看着像"按住键瞬移了"，其实只是基准没建。 */
+    if (dbg_in_have_prev_) {
+        const double dx = x - dbg_in_x_, dy = y - dbg_in_y_;
+        UtilityFunctions::print(String::utf8("[dbg-input] 心跳 墙钟="), String::num(dbg_in_wall_, 2),
+                                String::utf8("s 战局="), String::num((double)va::W.t, 2),
+                                String::utf8("s IN(w,s,a,d)="),
+                                va::IN.w ? 1 : 0, va::IN.s ? 1 : 0, va::IN.a ? 1 : 0, va::IN.d ? 1 : 0,
+                                String::utf8(" shift="), va::IN.shift ? 1 : 0,
+                                String::utf8(" moving="), (p != nullptr && p->moving) ? 1 : 0,
+                                String::utf8(" 位移="), String::num(std::sqrt(dx * dx + dy * dy), 3),
+                                String::utf8(" m"));
+    } else {
+        dbg_in_have_prev_ = true;
+    }
+    dbg_in_x_ = x;
+    dbg_in_y_ = y;
 }
 
 // 把当前视口存成 PNG。两条取证通道共用：
@@ -752,6 +808,17 @@ void WorldSim::_process(double p_delta) {
         return;
     }
 
+    /* 失焦兜底：只在**刚失焦的那一帧**清一次闩锁，不是每帧都清 ——
+       每帧清会把 autoplay 每步刚写好的 IN.fire 也一起抹掉，还会把日志刷爆。
+       （窗口一直不聚焦也是支持的用法：本工程的取证运行就是从命令行起的，
+         那时窗口常常不在前台，而 autoplay 完全不依赖键鼠。） */
+    {
+        Window *w = get_window();
+        const bool focused = (w == nullptr) || w->has_focus();
+        if (!focused && focus_was_) clear_held_input(true);
+        focus_was_ = focused;
+    }
+
     // 固定步长推进逻辑（网页版是「按需要拆成 <=0.022s 的小步」，这里等价处理）
     va_trace("_process:enter");
     const double H = 1.0 / 60.0;
@@ -891,6 +958,9 @@ void WorldSim::_process(double p_delta) {
         }
     }
 
+    // VA_DBG_INPUT 的位置心跳：按**墙钟**（p_delta）而不是战局秒数推进，
+    // 这样 VA_FF 快进时"一秒墙钟走了几米"仍然读得出来。
+    dbg_input_heartbeat(p_delta);
     va_trace("_process:hud ok");
     cap_sim_t_ = (double)va::W.t;
     capture_step();
@@ -906,6 +976,14 @@ void WorldSim::_input(const Ref<InputEvent> &p_event) {
        角色会带着这个残留的按键状态直接开跑 —— 表现成"一进场就自己往前走"。
        所以这里在喂给逻辑层之前就整体 return。 */
     if (shell_owns_input()) {
+        /* 外壳期间键鼠整条链路转交界面，一点都不能漏进逻辑层。
+           漏的后果很具体：菜单里按 W 会写 va::IN.w，等玩家点"开始行动"进战斗时，
+           角色会带着这个残留的按键状态直接开跑 —— 表现成"一进场就自己往前走"。
+           注意这里连 **release 也一起被吃掉**了：战斗里按住 W 再进菜单松手，
+           逻辑层的 IN.w 会永远停在 true。所以进外壳时必须把闩锁清掉，
+           而且不允许 echo 重建（p_reacquire_ok=false）：菜单里的按键
+           与战场无关。 */
+        clear_held_input(false);
         if (Ref<InputEventKey> k = p_event; k.is_valid()) {
             if (k->is_pressed() && !k->is_echo()) hud_->shell_key((int64_t)k->get_keycode());
             return;
@@ -953,43 +1031,117 @@ void WorldSim::_input(const Ref<InputEvent> &p_event) {
     }
 
     if (Ref<InputEventKey> k = p_event; k.is_valid()) {
-        const bool down = k->is_pressed() && !k->is_echo();
         const Key code = k->get_keycode();
-        switch (code) {
-            case Key::KEY_W: case Key::KEY_UP:    va::IN.w = down; break;
-            case Key::KEY_S: case Key::KEY_DOWN:  va::IN.s = down; break;
-            case Key::KEY_A: case Key::KEY_LEFT:  va::IN.a = down; break;
-            case Key::KEY_D: case Key::KEY_RIGHT: va::IN.d = down; break;
-            case Key::KEY_SHIFT: va::IN.shift = down; break;
-            case Key::KEY_CTRL:  va::IN.ctrl = down; break;
-            // R 有双重语义：战斗中换弹，结算界面上重开一局。
-            // 用 W.over 分支而不是再占一个键 —— 结算时换弹毫无意义，
-            // 键位重叠不会产生歧义。
-            case Key::KEY_R:
-                if (down) {
-                    if (hud_ != nullptr && hud_->mission_over()) reset_mission();
-                    else va::IN.reload = true;
-                }
-                break;
-            case Key::KEY_G:     if (down) va::IN.grenade = true; break;
-            case Key::KEY_F:     if (down) va::IN.smoke = true; break;
-            case Key::KEY_Q:     if (down) { /* 指令面板（待接入） */ } break;
-            case Key::KEY_Z:     if (down) va::IN.markerSet = true; break;
-            case Key::KEY_ESCAPE:
-                if (down) {
-                    /* 结算界面上 Esc = 回主菜单；战斗中 Esc = 释放鼠标。
-                       和 R 键同一个思路：结算时"释放鼠标"毫无意义（已经没在瞄了），
-                       键位重叠不产生歧义。顺带让界面外壳成为一个闭环，
-                       而不是"进了战斗就再也回不到菜单"的单向门。 */
-                    if (hud_ != nullptr && hud_->mission_over()) {
-                        reset_mission();                    // 内部会把 W.over 清掉
-                        hud_->set_screen(Hud::SCREEN_MENU);
-                    }
-                    in->set_mouse_mode(Input::MOUSE_MODE_VISIBLE);
-                }
-                break;
-            default: break;
+        /* ---- 系统按键重复：它说的是"键还按着"，绝不是"松开了" ----------------
+           按住不放时 Windows 每 ~30ms 重发一次 keydown，Godot 把它标成 echo=1
+           （pressed 仍然是 1）。原来这里写的是
+               const bool down = k->is_pressed() && !k->is_echo();
+               ... va::IN.w = down;
+           于是**每一条重复事件都把 IN.w 按成 false**：按住不放只走了 0.53 秒
+           （Windows 默认重复延迟 500ms）就被自己的重复事件按停，之后一直到松开
+           都不再动。实测数据（tools/inject_key.py + VA_DBG_INPUT，见 README）：
+               6.4s pressed=1 echo=0 → IN.w=1，随后两条心跳位移 11.7 / 23.5 m
+               ≈7.0s pressed=1 echo=1 → IN.w=0   ← 被重复事件按停
+               7.0~8.4s 共 30 条 echo=1 → 位移 0.000 m
+           现在的语义：echo 不写任何状态；只有"闩锁刚被清过"（见 clear_held_input）
+           时才拿它把"键其实还按着"补回来 —— 那种情况下真正的 press 事件
+           压根没送到过，echo 是唯一的线索。 */
+        if (k->is_echo()) {
+            if (reacquire_ && is_hold_key(code)) {
+                reacquire_ = false;
+                apply_key(code, true);
+            }
+            dbg_input_key((int64_t)code, true, true);
+            return;
         }
+        const bool down = k->is_pressed();
+        // 真事件到了，键态就有了权威来源，不必再靠 echo 重建
+        if (is_hold_key(code)) reacquire_ = false;
+        apply_key(code, down);
+        // VA_DBG_INPUT：事件原文（pressed/echo）与它写进逻辑层的结果打在一行上
+        dbg_input_key((int64_t)code, down, false);
+    }
+}
+
+/* 只有"按住"语义的键才允许被 echo 事件重建（W/A/S/D、方向键、Shift、Ctrl）。
+   开关类是一次动作：R 换弹 / G 手雷 / F 烟雾 / Z 标记 —— 让重复事件去补一次
+   按下，等于多打一枪、多丢一颗雷。 */
+bool WorldSim::is_hold_key(Key p_code) {
+    switch (p_code) {
+        case Key::KEY_W: case Key::KEY_UP:
+        case Key::KEY_S: case Key::KEY_DOWN:
+        case Key::KEY_A: case Key::KEY_LEFT:
+        case Key::KEY_D: case Key::KEY_RIGHT:
+        case Key::KEY_SHIFT: case Key::KEY_CTRL:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* 把一条"键按下/松开"写进逻辑层。抽成函数是因为按键重复那条重建路径
+   （见 _input 顶部）也要走同一套语义 —— 两处各抄一份，迟早会写歪一处。 */
+void WorldSim::apply_key(Key p_code, bool p_down) {
+    switch (p_code) {
+        case Key::KEY_W: case Key::KEY_UP:    va::IN.w = p_down; break;
+        case Key::KEY_S: case Key::KEY_DOWN:  va::IN.s = p_down; break;
+        case Key::KEY_A: case Key::KEY_LEFT:  va::IN.a = p_down; break;
+        case Key::KEY_D: case Key::KEY_RIGHT: va::IN.d = p_down; break;
+        case Key::KEY_SHIFT: va::IN.shift = p_down; break;
+        case Key::KEY_CTRL:  va::IN.ctrl = p_down; break;
+        // R 有双重语义：战斗中换弹，结算界面上重开一局。
+        // 用 W.over 分支而不是再占一个键 —— 结算时换弹毫无意义，
+        // 键位重叠不会产生歧义。
+        case Key::KEY_R:
+            if (p_down) {
+                if (hud_ != nullptr && hud_->mission_over()) reset_mission();
+                else va::IN.reload = true;
+            }
+            break;
+        case Key::KEY_G:     if (p_down) va::IN.grenade = true; break;
+        case Key::KEY_F:     if (p_down) va::IN.smoke = true; break;
+        case Key::KEY_Q:     if (p_down) { /* 指令面板（待接入） */ } break;
+        case Key::KEY_Z:     if (p_down) va::IN.markerSet = true; break;
+        case Key::KEY_ESCAPE:
+            if (p_down) {
+                /* 结算界面上 Esc = 回主菜单；战斗中 Esc = 释放鼠标。
+                   和 R 键同一个思路：结算时"释放鼠标"毫无意义（已经没在瞄了），
+                   键位重叠不产生歧义。顺带让界面外壳成为一个闭环，
+                   而不是"进了战斗就再也回不到菜单"的单向门。 */
+                if (hud_ != nullptr && hud_->mission_over()) {
+                    reset_mission();                    // 内部会把 W.over 清掉
+                    hud_->set_screen(Hud::SCREEN_MENU);
+                }
+                Input *in = Input::get_singleton();
+                if (in != nullptr) in->set_mouse_mode(Input::MOUSE_MODE_VISIBLE);
+            }
+            break;
+        default: break;
+    }
+}
+
+/* 清空"按住"类输入闩锁。三条路径会丢 keyup，一条都不能漏：
+     ① 窗口失焦 —— Windows 把 keyup 送给了抢走焦点的那个窗口，本进程永远收不到。
+        不处理的话：按住 W 时切出去，角色**自己一直走**（这就是"按住不放就一直
+        往那个方向移动"的另一半原因）。
+     ② 界面外壳 —— _input 在外壳期间整条 return（见上面的说明），release 也一起被吃掉。
+     ③ 每帧的焦点核对 —— 兜底：通知（NOTIFICATION_APPLICATION_FOCUS_OUT）万一没送到，
+        也不能让闩锁卡住。
+   p_reacquire_ok 决定"要不要允许 echo 把键态补回来"：
+     · 失焦 → true（键可能真的还按着，回来就该接着走）
+     · 进菜单 → false（菜单里按住 W 不能变成"一进场就自己往前走"） */
+void WorldSim::clear_held_input(bool p_reacquire_ok) {
+    const bool any = va::IN.w || va::IN.s || va::IN.a || va::IN.d
+                     || va::IN.shift || va::IN.ctrl || va::IN.fire || va::IN.ads;
+    va::IN.w = va::IN.s = va::IN.a = va::IN.d = false;
+    va::IN.shift = va::IN.ctrl = false;
+    va::IN.fire = va::IN.ads = false;
+    if (p_reacquire_ok) reacquire_ = true;
+    // 什么都没按着就不吭声：这条路径每帧都可能被调用，否则日志会被刷屏
+    if (any && dbg_input_) {
+        UtilityFunctions::print(String::utf8("[dbg-input] 清空按键闩锁（"),
+                                String::utf8(p_reacquire_ok ? "失焦" : "界面外壳"),
+                                String::utf8("）—— 否则丢掉的 keyup 会让角色一直走"));
     }
 }
 
@@ -1011,7 +1163,14 @@ bool WorldSim::shell_owns_input() const {
 }
 
 void WorldSim::_notification(int p_what) {
-    (void)p_what;
+    /* 窗口失焦：Windows 把 keyup 送给了抢走焦点的窗口，本进程收不到那条松开 ——
+       "按住不放，角色就自己一直往那个方向走"就是这么来的。
+       这里（以及 _process 每帧的焦点核对，兜通知没送到的情况）把闩锁清掉。
+       用 p_reacquire_ok=true：键可能真的还按着，回到前台就该接着走，
+       而 Windows 的按键重复会把"还按着"这件事再送一条 echo 过来（见 _input）。 */
+    if (p_what == Node::NOTIFICATION_APPLICATION_FOCUS_OUT) {
+        clear_held_input(true);
+    }
 }
 
 // ------------------------------------------------------------- SimEvents

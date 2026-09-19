@@ -61,6 +61,21 @@ private:
     //                      会把战斗中的角色一起推着走）
     void enter_play();
     bool shell_owns_input() const;
+    /* ---- 输入：把"按住"与"重复"分开 ------------------------------------------
+       逻辑层只有"键现在是不是按着"一个概念（va::IN 里全是 bool），
+       而引擎侧的事件流有三类：按下 / **系统按键重复** / 松开。
+       重复（InputEventKey::is_echo()）说的是"键还按着"，把三条塞进两个状态里
+       是本工程踩过的坑（按住 W 只走半秒就被自己的重复按停），详见 _input 与
+       clear_held_input 的注释。
+         apply_key        写状态（含 R/G/F/Z/R/Esc 这些"一次动作"键）
+         is_hold_key      该键是不是"按住"语义（决定 echo 能不能用来重建状态）
+         clear_held_input 丢 keyup 的三条路径（失焦 / 进菜单 / 每帧兜底）统一从这里清
+    */
+    void apply_key(godot::Key p_code, bool p_down);
+    static bool is_hold_key(godot::Key p_code);
+    void clear_held_input(bool p_reacquire_ok);
+    bool reacquire_ = false;       // 闩锁被清过、还没与真实键态对上 → 允许 echo 重建一次
+    bool focus_was_ = true;        // 上一帧窗口是否聚焦（只为识别"刚失焦"那一刻）
     void push_subtitle(const std::string &who, const std::string &text, const std::string &cls);
     // 开发用截图探针：设了环境变量 VA_CAPTURE=<秒,秒,...> 时，
     // 在指定的战局时刻把视口存成 PNG 到 res://captures/，全部拍完后自动退出。
@@ -181,6 +196,22 @@ private:
     bool   dbg_units_ = false;
     bool   dbg_first_ = true;      // 相机落地后的第一帧再打一次（此前 cam_ 还在原点）
     void   dbg_units_dump(const char *p_when) const;
+
+    /* VA_DBG_INPUT=1：逐事件打印按键流 + 每 0.25 秒墙钟打一次"位置心跳"。
+       「按住方向键该不该一直走 / 松开该不该立刻停」这类问题，**只看画面判不了** ——
+       屏幕上是"走得慢"还是"走了两步就停"读不出量级；而键鼠事件流里
+       pressed / echo 两个标志位是**排他的原因**（echo=1 是操作系统的按键重复）。
+       两张表一对（下面 dbg_input_key 与 dbg_input_heartbeat），
+       就能把"手感"换成"哪一类事件把 IN 改成了什么"。
+       判读口径：echo=1 的事件**不得**改变 IN（重复不等于松开）；
+       心跳里"位移=0.000 m"必须只在 release 之后出现。 */
+    bool   dbg_input_ = false;
+    double dbg_in_wall_ = 0.0;     // 墙钟累计（心跳按它触发，与是否快进无关）
+    double dbg_in_next_ = 0.25;    // 下一次心跳的墙钟时刻
+    double dbg_in_x_ = 0.0, dbg_in_y_ = 0.0;   // 上次心跳时的玩家位置
+    bool   dbg_in_have_prev_ = false;          // 第一条心跳只建基准，不报位移
+    void   dbg_input_key(int64_t p_code, bool p_pressed, bool p_echo);
+    void   dbg_input_heartbeat(double p_delta);
 
     // UI：全套使命召唤风格 HUD，手绘在一个 Control 里（见 node/hud.h）
     Hud *hud_ = nullptr;

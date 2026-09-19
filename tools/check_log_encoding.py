@@ -80,6 +80,27 @@ def match_paren(text, open_idx):
     return -1
 
 
+def utf8_arg_spans(span):
+    """span 里所有 String::utf8( … ) 的实参区间（左括号位置, 右括号位置）。
+
+    为什么按"区间"判而不是按"字面量紧跟在 String::utf8( 之后"判：
+    实参可以是个表达式 —— 例如
+        String::utf8(p_ok ? "失焦" : "界面外壳")
+    每个分支都是 `const char *` 字面量，String::utf8 会把它按 UTF-8 解释，
+    是**正确**写法；但"紧跟"式的判据会把它当成漏包而误报。
+    （注意：包到 std::string 上就不对了 —— 那种情况形如
+        va::W.overKind = "成功";
+    不在这条日志判据的管辖范围内，见文件头。）
+    """
+    out = []
+    for m in re.finditer(r"String::utf8\s*\(", span):
+        op = span.index('(', m.start())
+        cl = match_paren(span, op)
+        if cl > 0:
+            out.append((op, cl))
+    return out
+
+
 def find_unwrapped(path):
     raw = open(path, encoding='utf-8', errors='replace').read()
     masked = strip_comments(raw)
@@ -92,11 +113,12 @@ def find_unwrapped(path):
         span = raw[start:end + 1]
         if not any(ord(ch) > 127 for ch in span):
             continue
-        # 逐个字面量看：含非 ASCII 且没被 String::utf8( 包住的
+        wrapped = utf8_arg_spans(span)
+        # 逐个字面量看：含非 ASCII 且没落在任何 String::utf8( … ) 的实参区间内
         for lit in re.finditer(r'"((?:[^"\\]|\\.)*)"', span):
             if not any(ord(c) > 127 for c in lit.group(1)):
                 continue
-            if span[:lit.start()].rstrip().endswith('String::utf8('):
+            if any(a < lit.start() < b for a, b in wrapped):
                 continue
             line = raw.count('\n', 0, start + lit.start()) + 1
             found.append((line, lit.group(1)))
