@@ -1,5 +1,13 @@
 # -*- coding: utf-8 -*-
-"""VolunteerArmyPC —— 批量图生3D：11 个角色立绘 → assets/art/char/model/<键>.glb
+"""VolunteerArmyPC —— 批量图生3D：立绘/参考图 → assets/art/<档位>/model/<键>.glb
+
+【两档：角色（char）与武器（wpn）】
+    角色：输入 assets/art/char/<键>.png      → 成品 assets/art/char/model/<键>.glb
+    武器：输入 assets/art/wpn/<键>.png       → 成品 assets/art/wpn/model/<键>.glb
+             中间产物 sweep/gen3d_wpn/<键>.json
+    用 `--kind wpn` 切换（默认 char）。**中间产物目录分家**是刻意的：
+    两档的键名不同、任务 id 不同，混在一个目录里之后"这个 json 是哪批的"只能靠脑子记。
+    键名一律带前缀（wpn_ / char_），所以就算目录合并也不会撞名 —— 分家是为了可读，不是防重名。
 
 【为什么要有这一层，而不是在 shell 里 for 循环】
 一次图生3D 是「提交 → 轮询 1~5 分钟 → 拿到 URL → 下载 42MB → 瘦身到 1.5MB」，
@@ -30,8 +38,9 @@
     echo -n "<token>" | python tools/gen3d_batch.py [--jobs 4] [键 ...]      # builtin
     python tools/gen3d_batch.py --jobs 3 [键 ...]                            # VA_GEN3D_BACKEND=tc
     python tools/gen3d_batch.py --jobs 3 [键 ...]                            # VA_GEN3D_BACKEND=hy
+    python tools/gen3d_batch.py --kind wpn --jobs 3 wpn_mosin                # 武器档位
 
-    不给键就做全部 11 个；已存在 <键>.glb 且非空的**默认跳过**（--force 覆盖），
+    不给键就做该档位全部；已存在 <键>.glb 且非空的**默认跳过**（--force 覆盖），
     所以中断之后直接再跑一次就是"接着做没做完的"。
 """
 
@@ -44,21 +53,44 @@ import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC_DIR = os.path.join(ROOT, "assets", "art", "char")
-MODEL_DIR = os.path.join(SRC_DIR, "model")
-WORK = os.path.join(ROOT, "sweep", "gen3d")
+
+# 档位表。**这三条路径是模块级全局**，由 main() 按 --kind 覆写 ——
+# run_one() 是这份脚本里唯一带着"提交/下载/瘦身/校验"全部副作用的地方，
+# 与其把它改成到处传参，不如让路径在进入批次之前就定下来、之后不再变。
+# 覆写点只有一处（见 _select_kind），所以不存在"两个地方各写一份路径"的问题。
+PROFILES = {
+    "char": {
+        "label": "角色",
+        "src_dir": os.path.join(ROOT, "assets", "art", "char"),
+        "model_dir": os.path.join(ROOT, "assets", "art", "char", "model"),
+        "work": os.path.join(ROOT, "sweep", "gen3d"),
+        # 键的顺序 = scene_builder.cpp 里 all_art_keys() 的顺序，方便两边对账
+        "keys": [
+            "char_leader", "char_rifleman", "char_mg", "char_sniper",
+            "char_at", "char_demo", "char_medic", "char_ammo",
+            "char_enemy_rifle", "char_enemy_mg", "char_enemy_officer",
+        ],
+    },
+    "wpn": {
+        "label": "武器",
+        "src_dir": os.path.join(ROOT, "assets", "art", "wpn"),
+        "model_dir": os.path.join(ROOT, "assets", "art", "wpn", "model"),
+        "work": os.path.join(ROOT, "sweep", "gen3d_wpn"),
+        # 顺序 = scene_builder.cpp 里 all_wpn_keys() 的顺序，也是游戏里 V 键循环的顺序。
+        # 1951 年志愿军制式：步枪 / 冲锋枪 / 轻机枪。
+        "keys": ["wpn_mosin", "wpn_ppsh", "wpn_dp27"],
+    },
+}
+
+SRC_DIR = PROFILES["char"]["src_dir"]
+MODEL_DIR = PROFILES["char"]["model_dir"]
+WORK = PROFILES["char"]["work"]
+KEYS = list(PROFILES["char"]["keys"])
 
 PY = sys.executable
 # 瘦身要 Pillow，而 Pillow 只装在隔离 venv 里（本项目唯一一个非纯 Python 的工具）。
 # 若该 venv 不存在，脚本会明确报出来而不是悄悄产出一个 42MB 的 GLB 进仓库。
 VENV_PY = ("C:/Users/lujiajing/.workbuddy/binaries/python/envs/default/Scripts/python.exe")
-
-# 键的顺序 = scene_builder.cpp 里 all_art_keys() 的顺序，方便两边对账
-KEYS = [
-    "char_leader", "char_rifleman", "char_mg", "char_sniper",
-    "char_at", "char_demo", "char_medic", "char_ammo",
-    "char_enemy_rifle", "char_enemy_mg", "char_enemy_officer",
-]
 
 # 【`--face-count 50000` 必须显式给，这不是可选项】
 # buddy-cloud.py 的 `--face-count` 默认值是 **500000**（10 万~150 万区间），
@@ -162,6 +194,26 @@ def log(*a):
 
 class QuotaExhausted(Exception):
     """当日提交配额用尽。**整批必须立刻停**，不是这一个键失败。"""
+
+
+def _select_kind(p_kind):
+    """按档位覆写 SRC_DIR / MODEL_DIR / WORK / KEYS。
+
+    【为什么用 global 而不是把路径传进 run_one】run_one 里那四条路径要在
+    "续跑判据 / 输入校验 / 结果落盘 / 成品落盘 / 日志"五处以同样的值出现，
+    传参等于给每一处都增加一个可以说错话的机会。这里覆写一次、之后再没人改，
+    语义上就是"这一批的路径"。覆写点唯一，所以不会出现两份路径不一致。
+    """
+    global SRC_DIR, MODEL_DIR, WORK, KEYS
+    if p_kind not in PROFILES:
+        raise SystemExit("--kind 只能是 %s，当前为 %r"
+                         % (" / ".join(sorted(PROFILES)), p_kind))
+    p = PROFILES[p_kind]
+    SRC_DIR = p["src_dir"]
+    MODEL_DIR = p["model_dir"]
+    WORK = p["work"]
+    KEYS = list(p["keys"])
+    return p
 
 
 def _probe_tris(glb):
@@ -364,6 +416,7 @@ def main():
     argv = sys.argv[1:]
     jobs = 2
     force = False
+    kind = "char"
     keys = []
     i = 0
     while i < len(argv):
@@ -371,8 +424,14 @@ def main():
             jobs = int(argv[i + 1]); i += 2
         elif argv[i] == "--force":
             force = True; i += 1
+        elif argv[i] == "--kind":
+            kind = argv[i + 1]; i += 2
         else:
             keys.append(argv[i]); i += 1
+
+    # 档位必须在"读 token / 建目录 / 报批次"之前定下来 ——
+    # 它决定的是这一批的输入目录与成品目录，晚一步就会把武器写进角色目录里。
+    prof = _select_kind(kind)
 
     # tc / hy 后端的凭据由各自脚本自己读，不吃 stdin（所以这里不检查、也不阻塞等待）。
     token = ""
@@ -387,8 +446,10 @@ def main():
     os.makedirs(WORK, exist_ok=True)
     os.makedirs(MODEL_DIR, exist_ok=True)
 
-    log("批次：%d 个角色，并发 %d，后端 %s%s"
-        % (len(keys), jobs, BACKEND, "，强制重做" if force else ""))
+    log("批次：%d 个%s，并发 %d，后端 %s%s"
+        % (len(keys), prof["label"], jobs, BACKEND, "，强制重做" if force else ""))
+    log("  输入 %s" % SRC_DIR)
+    log("  成品 %s" % MODEL_DIR)
 
     lock = threading.Lock()
     todo = list(keys)

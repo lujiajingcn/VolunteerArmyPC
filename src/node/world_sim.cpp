@@ -384,7 +384,11 @@ void WorldSim::_ready() {
     cam_->set_near(0.06f);
     cam_->set_far(600.0f);
     add_child(cam_);
-    vm_.build(cam_);
+    // 第二个参数是武器模型**原始场景根**的挂载点：模型原型必须挂进场景树，
+    // 否则它持有的 mesh / material / 贴图会在退出时被 Godot 报成 8 条
+    // "RID allocations ... leaked at exit" 的 ERROR，污染"日志里有没有 ERROR"这条回归判据。
+    // 传 this（WorldSim 自己）而不是 cam_：原型是场景资产，不该挂在会动的相机下面。
+    vm_.build(cam_, this);
     va_trace("_ready:cam ok");
 
     aim_at_road();
@@ -672,6 +676,18 @@ void WorldSim::setup_runtime_ui() {
     hud_->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
     hud_->set_mouse_filter(Control::MOUSE_FILTER_IGNORE);
     layer->add_child(hud_);
+
+    // 把视图模型挂给 HUD（在 hud_ 刚建好之后 —— vm_.build 在本函数更早处，
+    // 所以顺序天然是对的）。用途只有一处：开镜时准星该不该让位给枪上的红点。
+    // 收指针而不是收布尔量，是为了不必在"按 V 换枪"那条路上再同步一次。
+    hud_->set_view_model(&vm_);
+
+    // VA_ADS=1 的取证覆盖也要给 HUD：它**不写回 va::IN.ads**（写回去会污染
+    // VA_DBG_INPUT 的输入取证，那是逻辑层的输入状态），只喂 ViewModel 的 ads 形参。
+    // 不把同一个开关同步给 HUD 的话，"强制开镜"的取证图里枪是开镜姿态、
+    // 准星却按腰射规则照画 —— 拿它验"开镜时准星让不让位"必然得出错结论
+    // （实测踩过：日志里 开镜=0，而图看着像开镜）。force_ads_ 在本函数更早处已读。
+    hud_->set_force_ads(force_ads_);
 
     // 取证用消融开关：把 HUD 整层藏掉，剩下的一定是 3D 画面。
     // 上一轮"画面正中央那根黑竖条到底是谁"靠肉眼认几何体认错过一次，
@@ -1101,6 +1117,24 @@ void WorldSim::apply_key(Key p_code, bool p_down) {
         case Key::KEY_G:     if (p_down) va::IN.grenade = true; break;
         case Key::KEY_F:     if (p_down) va::IN.smoke = true; break;
         case Key::KEY_Q:     if (p_down) { /* 指令面板（待接入） */ } break;
+        /* V：切手里的武器外观（纯表现）。
+           【为什么是 V】W/A/S/D 是移动、R 换弹、G 手雷、F 烟雾、Z 标记、Q 留给指令面板，
+           余下的字母里 V 与"外观/装扮（visual）"对得上，也不会和上面任何一个撞。
+           【为什么只在这个分支里做】apply_key 的调用点已经保证了两件事：
+             ① 系统按键重复（echo）到不了这里 —— V 不是 is_hold_key，echo 那条路直接 return。
+                否则按住 V 不放会以 ~30ms 的节奏把三把枪轮着切一遍。
+             ② 界面外壳期间整条链路被 shell_owns_input() 拦掉 ——
+                菜单里按 V 不会改战场上的枪。
+           【为什么是纯表现】它只动 ViewModel（渲染层）的可见性，
+           不碰 va:: 里的任何东西：伤害、射速、弹匣、判定顺序全都不变，
+           所以平衡基线不受影响。 */
+        case Key::KEY_V:
+            if (p_down && vm_.next_skin(1) && hud_ != nullptr) {
+                // 切完给个明确反馈。没有提示的话，玩家按了键只会怀疑"是不是没生效"
+                // —— 三把枪在腰射姿态下的轮廓差异，一眼未必分得清。
+                hud_->ev_alert(std::string("武器外观：") + vm_.skin_label(), 1.6f);
+            }
+            break;
         case Key::KEY_Z:     if (p_down) va::IN.markerSet = true; break;
         case Key::KEY_ESCAPE:
             if (p_down) {

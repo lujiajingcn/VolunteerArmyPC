@@ -1,5 +1,8 @@
 // VolunteerArmyPC —— HUD 实现（全部手绘，无 Label）
 #include "node/hud.h"
+// 只为 draw_crosshair 里那一句 vm_->using_art()：判断"枪上还有没有瞄具"。
+// 见 hud.h 里 set_view_model 的注释（开镜 + 真模型 = 原本一个瞄准参照都没有）。
+#include "node/viewmodel.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1610,8 +1613,56 @@ void Hud::draw_crosshair() {
     const va::Unit *pl = va::W.player;
     const Vector2 c = vp_ * 0.5f;
 
-    // 开镜时准星让位给枪上的红点 —— 否则屏幕中央会出现"两个准心"
-    if (va::IN.ads) return;
+    // 开镜时准星让位给枪上的红点 —— 否则屏幕中央会出现"两个准心"。
+    //
+    // 【但真模型武器没有那颗红点】换皮肤之后程序化枪身（含整个光学瞄具：
+    // 框架 / 镜片 / 红点）被整块隐藏，而每把真模型自带的机瞄并没有登记到
+    // 屏幕中心（那是另一件事，要逐把枪标定准星高度才做得到）。
+    // 若照旧让位，屏幕上就**一个瞄准参照都不剩**。所以这里多问一句
+    // "枪上到底还有没有瞄具"：有瞄具才让位，没瞄具就保留准星。
+    // 与枪看同一个"开镜"开关：VA_ADS=1 时枪会被强制摆成开镜姿态，准星规则
+    // 必须跟着一起进开镜态，否则取证图里两者不同步（见 hud.h 的 set_force_ads）。
+    const bool ads = va::IN.ads || force_ads_;
+
+    const bool gun_has_sight = (vm_ == nullptr) || !vm_->using_art();
+    const bool ads_yield = ads && gun_has_sight;
+
+    // VA_DBG_HUD=1：把"这一帧准星画不画、为什么"打成一行日志，仅在结论变化时打。
+    //
+    // 【为什么非要一条日志不可】"准星（中心圆点 + 四条正交短线）"与"命中标记
+    // （四条 ±45° 斜线）"在截图里长得极像，肉眼分不出来 —— 本函数上方那段判据
+    // 提醒就是为此写的；而跨运行截图差分又被"仿真跟墙钟走"的时序差异整片淹掉
+    // （实测全屏差异 17%，差分的信噪比为零）。让位/保留本身是一条纯逻辑分支，
+    // 只有日志能给出无歧义的答案。这条留在这里是**长期**的：以后每加一把
+    // 真模型武器，"它开镜时准星还在不在"都要再问一次。
+    static const bool s_dbg_hud = (std::getenv("VA_DBG_HUD") != nullptr);
+    if (s_dbg_hud) {
+        // 变化检测：结论变了要打，**视口尺寸变了也要打**。
+        // 只盯结论的话，第一帧那次打印会带着"启动时的小视口"的中心坐标留着 ——
+        // 实测窗口随后会变成 2560x1369，而日志里一直写 中心=1010,540（那是
+        // 第一帧 2020x1080 的中心）。一行写着过期数字的取证日志比没有更坏。
+        static int s_combo = -1;
+        static int s_vpx = -1, s_vpy = -1;
+        const int combo = (ads ? 1 : 0) | (gun_has_sight ? 2 : 0);
+        const int vpx = (int)c.x, vpy = (int)c.y;
+        if (combo != s_combo || vpx != s_vpx || vpy != s_vpy) {
+            s_combo = combo;
+            s_vpx = vpx;
+            s_vpy = vpy;
+            // 视口 = 中心 × 2，一并写出来，免得读日志的人再去乘。
+            UtilityFunctions::print(
+                String::utf8("[hud] 开镜="), String::num_int64(ads ? 1 : 0),
+                String::utf8(" 枪上有瞄具="), String::num_int64(gun_has_sight ? 1 : 0),
+                String::utf8(" 真模型="),
+                String::num_int64((vm_ != nullptr && vm_->using_art()) ? 1 : 0),
+                String::utf8(" → 准星"), String::utf8(ads_yield ? "让位" : "保留"),
+                String::utf8("  视口="), String::num_int64(vpx * 2), String::utf8("x"),
+                String::num_int64(vpy * 2), String::utf8(" 中心="), String::num_int64(vpx),
+                String::utf8(","), String::num_int64(vpy));
+        }
+    }
+
+    if (ads_yield) return;
 
     float sp = va::spread_mul(*pl);
     sp = clampf_((sp - 1.0f) / 2.4f, 0.0f, 1.0f);

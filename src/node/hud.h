@@ -41,6 +41,8 @@
 
 namespace volunteer_army {
 
+struct ViewModel;      // 只用一个指针，不必把 viewmodel.h 拖进来
+
 class Hud : public godot::Control {
     GDCLASS(Hud, godot::Control)
 
@@ -95,6 +97,24 @@ public:
     // 玩家选了退出
     bool   take_quit();
 
+    // ---- 视图模型的引用（world_sim 在 _ready 里挂一次）----
+    // 【为什么需要它】开镜时准星是**刻意**让位给枪上那颗红点的（见 draw_crosshair），
+    // 理由是不想让屏幕中央同时出现两个准心。但换上真模型武器之后，
+    // 程序化枪身整块隐藏 —— 连那颗红点也一起没了，于是
+    // "(开镜) + (真模型)"这个组合下屏幕中央**一个瞄准参照都没有**。
+    // 判断依据"枪上到底有没有瞄具"只有 ViewModel 自己知道，所以这里收一个指针
+    // 而不是收一个 bool：布尔量要在"初始化 / 按 V 换枪"两处同步，迟早漏一处；
+    // 指针每次绘制现问，天然不会不同步。
+    void set_view_model(const ViewModel *p_vm) { vm_ = p_vm; }
+
+    // VA_ADS=1 的取证覆盖（world_sim 在 _ready 里同步一次，与 ViewModel 同源）。
+    //
+    // 【为什么 HUD 也得知道】VA_ADS 原先只喂进 ViewModel::update 的 ads 形参，
+    // **从不写回 va::IN.ads**（那样会污染输入取证：VA_DBG_INPUT 打的就是 IN）。
+    // 于是"强制开镜"拍出来的取证图里，枪进了开镜姿态、准星却按腰射规则照画 ——
+    // 拿这种图去验"开镜时准星让不让位"，结论一定是错的。让它跟枪看同一个开关。
+    void set_force_ads(bool p_on) { force_ads_ = p_on; }
+
     // ---- SimEvents 转发入口 ----
     void ev_toast(const std::string &text);
     void ev_alert(const std::string &text, float dur);
@@ -122,6 +142,13 @@ private:
     godot::Vector2 vp_{};               // 视口尺寸（像素）
     godot::Ref<godot::Font> font_;
     bool layout();
+
+    // 手里的枪自己带不带瞄具。空指针 = "不知道"，按"带"处理（保守：
+    // 宁可维持原来的让位行为，也不要凭空多出一个准星）。
+    const ViewModel *vm_ = nullptr;
+
+    // VA_ADS=1 的取证覆盖，见 set_force_ads 的注释。
+    bool force_ads_ = false;
 
     // ======================================================== 绘制原语
     // 切角矩形：使命召唤面板的基本形状。cut=0 时退化成普通矩形。

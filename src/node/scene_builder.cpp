@@ -440,6 +440,42 @@ std::string unit_model_key(const va::Unit &u) {
     return ally_art_key(u.id);
 }
 
+static Node3D *load_glb_root(const String &p_path, const char *p_tag) {
+    // 先判存在再解析：直接解析一个不存在的路径会在 stderr 打一行 ERROR，
+    // 而"日志里有没有 ERROR"是本工程的回归判据之一，不能被这种假错误污染。
+    // 整条函数都用 print 而不是 push_error，理由同上：缺素材是**可预期**的情况
+    // （武器参考图不入库、模型还没生成），不该把它变成"回归失败"。
+    if (!FileAccess::file_exists(p_path)) {
+        UtilityFunctions::print(String("[") + String(p_tag) + String::utf8("] 缺模型文件 "), p_path);
+        return nullptr;
+    }
+
+    Ref<GLTFDocument> doc;
+    doc.instantiate();
+    Ref<GLTFState> st;
+    st.instantiate();
+    if (doc.is_null() || st.is_null()) {
+        UtilityFunctions::print(String("[") + String(p_tag) + String::utf8("] GLTFDocument 不可用"));
+        return nullptr;
+    }
+
+    const Error err = doc->append_from_file(p_path, st);
+    if (err != OK) {
+        UtilityFunctions::print(String("[") + String(p_tag) + String::utf8("] 模型解析失败 "),
+                                p_path, " err=", (int)err);
+        return nullptr;
+    }
+    Node *scene = doc->generate_scene(st);
+    Node3D *raw = Object::cast_to<Node3D>(scene);
+    if (raw == nullptr) {
+        UtilityFunctions::print(String("[") + String(p_tag) + String::utf8("] 模型没有可用的场景根 "), p_path);
+        return nullptr;
+    }
+    // 注意：这里**不判"有没有网格"**。角色要按身高缩放、武器要按全长缩放，
+    // 两者对"空模型"的判据不一样，交给各自的调用方。
+    return raw;
+}
+
 static Node3D *load_unit_proto(const std::string &p_key, Node *p_parent) {
     auto it = s_unit_proto.find(p_key);
     if (it != s_unit_proto.end()) {
@@ -451,33 +487,8 @@ static Node3D *load_unit_proto(const std::string &p_key, Node *p_parent) {
 
     const String path = String("res://assets/art/char/model/") +
                         String::utf8(p_key.c_str()) + String(".glb");
-    // 先判存在再解析：直接解析一个不存在的路径会在 stderr 打一行 ERROR，
-    // 而"日志里有没有 ERROR"是本工程的回归判据之一，不能被这种假错误污染。
-    if (!FileAccess::file_exists(path)) {
-        s_unit_failed[p_key] = true;
-        return nullptr;
-    }
-
-    Ref<GLTFDocument> doc;
-    doc.instantiate();
-    Ref<GLTFState> st;
-    st.instantiate();
-    if (doc.is_null() || st.is_null()) {
-        UtilityFunctions::print(String::utf8("[unit] GLTFDocument 不可用，全部回退图元士兵"));
-        s_unit_failed[p_key] = true;
-        return nullptr;
-    }
-
-    const Error err = doc->append_from_file(path, st);
-    if (err != OK) {
-        UtilityFunctions::print(String::utf8("[unit] 模型解析失败 "), path, " err=", (int)err);
-        s_unit_failed[p_key] = true;
-        return nullptr;
-    }
-    Node *scene = doc->generate_scene(st);
-    Node3D *raw = Object::cast_to<Node3D>(scene);
+    Node3D *raw = load_glb_root(path, "unit");
     if (raw == nullptr) {
-        UtilityFunctions::print(String::utf8("[unit] 模型没有可用的场景根 "), path);
         s_unit_failed[p_key] = true;
         return nullptr;
     }
@@ -555,6 +566,234 @@ Node3D *make_unit_node(const va::Unit &u, Node *p_proto_parent) {
     if (n != nullptr) return n;
     // 没有模型就退回图元士兵 —— 少一个模型文件不该让战场上少一个人。
     return make_soldier_node(u.team == va::Team::Enemy, u.downed);
+}
+
+// ---------------------------------------------- 武器三维模型（图生3D 产物）
+//
+// 参考图与生成方式：tools/fetch_wpn_refs.sh（取图）+ tools/gen3d_batch.py --kind wpn
+// （生成）→ assets/art/wpn/model/<键>.glb。
+//
+// 【与角色模型最本质的差别：枪有明确的"前后"】
+// 角色模型是"正面朝哪"的问题，枪是"枪口朝哪"的问题 —— 后者判错了，
+// 玩家手里就横着一根棍子，而且枪口焰会从枪托那头喷出来。
+//
+// 【归一化的目标坐标系】= viewmodel.cpp 里 gun 节点的局部系：
+//     原点在**枪托尾端平面**，枪口朝 **-Z**，y≈0 是枪管轴线，单位是**米**。
+// 与那套程序化枪模完全同构，所以接真模型**不需要改动任何姿态/后坐/开镜数学** ——
+// 位移与姿态全都作用在 root / gun 两层上，与挂在这一层下面的是什么网格无关。
+//
+// 【为什么按"真枪全长"缩放，而不是塞进某个固定长度】
+// 世界坐标里 1 单位 = 0.05 米、士兵 1.68 米，枪也必须按米来才是对的尺寸。
+// 塞进固定长度会让莫辛-纳甘（1232 mm）和波波沙（843 mm）一样长，
+// 而"长步枪看起来就是长"恰恰是这三把枪彼此最直观的区别。
+// 注意这**不是**"把枪做大一点更显眼"那类审美选择：图生3D 输出的尺度是它自己定的
+// （通常归一化到一个单位盒），不换算就必然错。
+
+// 枪托尾端平面在 gun 局部系的 z，与程序化枪托的 +0.15 对齐。
+constexpr float WPN_STOCK_Z = 0.15f;
+
+// 朝向校正的默认值。**这是实测项，不是推导项**：图生3D 把"图像的哪个方向"
+// 映到"模型的哪个轴"由服务端决定，只能量出来。与角色模型的 VA_MODEL_YAW 同理，
+// 能靠截图量出来改，就不该靠重编译猜。
+//
+// 默认 90° 的来历：角色模型那批的实测结论是"把 +Z 转到 +X 正好绕 Y 转 +90°"，
+// 而武器参考图是**侧视图**（图像横向 = 枪身长度方向），图像横向在生成结果里
+// 与角色的"正面方向"是同一个轴族 —— 所以先按同一套角度试，再按截图修正。
+constexpr float WPN_YAW_DEG = 90.0f;
+
+struct WpnArtDef {
+    const char *key;
+    const char *label;
+    float       len_mm;     // 真枪全长（毫米）—— 归一化按它缩放
+    float       place[3];   // 归一化之后的落位微调（米）：x 左右 / y 上下 / z 前后
+    /* 双手在枪上的落点（gun 局部系 z，单位米）。
+       【为什么必须每把枪单独给】程序化枪模上那对手是照**它自己**的握把与护木摆的
+       （右手 z=-0.015、左手 z=-0.260）。换成真模型之后，握把位置随枪而异：
+       莫辛的扳机在枪托后 0.33 m、波波沙在 0.28 m、DP-27 在 0.35 m ——
+       照抄同一组数会让手悬在枪身外面（实测波波沙就是这样：两只手都没搭在枪上）。
+       这是**量出来的**参数，改完要用截图复核。 */
+    float       hand_r_z;
+    float       hand_l_z;
+};
+
+// 全部武器键 + 标定参数。顺序 = 游戏里 V 键切换的顺序，也是检阅台/自检的顺序。
+//
+// 全长取的是**整枪长度**（枪托到尾端，不含刺刀）：
+//   莫辛-纳甘 M91/30  1232 mm   波波沙-41  843 mm   DP-27  1275 mm
+//
+// place.y 的来历：归一化时竖直方向按包围盒居中，而枪的重心明显偏下
+//   （枪托、弹鼓、脚架都垂在枪管下方），不补这一下枪管会比原点高出一截、
+//   枪口焰从枪管下方喷出来。数值 = -(枪管轴线 y − 包围盒中心 y)，
+//   两个量都由 tools/glb_preview.py 报出。
+static const WpnArtDef kWpnArt[] = {
+    // place 的两个横向/竖向分量都由 tools/glb_preview.py 量出来（"最前端 3% 切片"
+    // 在 Y 轴与 Z 轴上的均值 − 包围盒中心）：
+    //   Y → 引擎的 y（竖直，决定枪管是浮在原点上方还是陷进手里）
+    //   Z → 引擎的 x（横向，因为绕 Y 转 90° 后 原始Z→+X）
+    // 横向那一项容易漏，但它是实的：归一化是按**包围盒**居中的，而包围盒会被
+    // 只长在一边的突出物带偏。三把枪实测下来只有莫辛偏（它的拉机柄伸在外侧），
+    // 波波沙的弹鼓与 DP-27 的圆盘弹匣都在轴线上，所以那两把的横向量 ≈ 0。
+    // 莫辛： 竖向 轴线 0.1558、中心 0.0903 -> -0.0655 ／ 横向 -0.0012、中心 0.0148 -> +0.0159
+    { "wpn_mosin", "莫辛-纳甘 M91/30", 1232.0f, { 0.0159f, -0.0655f, 0.0f }, -0.180f, -0.450f },
+    // 波波沙：竖向 轴线 0.2377、中心 0.1474 -> -0.0903 ／ 横向 -0.0006、中心 -0.0003 -> +0.0002
+    { "wpn_ppsh",  "波波沙-41",         843.0f, { 0.0f, -0.0903f, 0.0f }, -0.130f, -0.350f },
+    // DP-27：竖向 轴线 0.3135、中心 0.1674 -> -0.1461 ／ 横向 -0.0016、中心 -0.0014 -> +0.0001
+    { "wpn_dp27",  "DP-27 轻机枪",     1275.0f, { 0.0f, -0.1461f, 0.0f }, -0.200f, -0.400f },
+};
+constexpr int kWpnCount = (int)(sizeof(kWpnArt) / sizeof(kWpnArt[0]));
+
+const std::vector<std::string> &all_wpn_keys() {
+    // 【为什么要有一份总表】游戏里的切换顺序、检阅台的陈列顺序、
+    // "模型齐备"的自检 —— 三处各抄一遍键名，加第四把枪时必然漏掉其中一处，
+    // 而漏掉的那一处只表现为"检阅台上少一把枪"，不报错。
+    static const std::vector<std::string> k = { "wpn_mosin", "wpn_ppsh", "wpn_dp27" };
+    return k;
+}
+
+static std::map<std::string, Node3D *> s_wpn_raw;    // 键 -> 未归一化的原始场景根
+static std::map<std::string, bool> s_wpn_failed;
+
+static const WpnArtDef *wpn_art_def(const std::string &p_key) {
+    for (int i = 0; i < kWpnCount; ++i) {
+        if (p_key == kWpnArt[i].key) return &kWpnArt[i];
+    }
+    return nullptr;
+}
+
+const char *wpn_label(const std::string &p_key) {
+    const WpnArtDef *d = wpn_art_def(p_key);
+    return (d != nullptr) ? d->label : "未知武器";
+}
+
+// 原始场景根：挂在 p_parent 下并隐藏（生命周期交给场景树）。
+// 不进场景树的话，它持有的 mesh / material / 贴图会在进程退出时被 Godot
+// 报成 "RID allocations ... leaked at exit" 的 ERROR —— 与角色原型同一个理由。
+static Node3D *load_wpn_raw(const std::string &p_key, Node *p_parent) {
+    auto it = s_wpn_raw.find(p_key);
+    if (it != s_wpn_raw.end()) return it->second;
+    if (s_wpn_failed.count(p_key) != 0) return nullptr;
+
+    const String path = String("res://assets/art/wpn/model/") +
+                        String::utf8(p_key.c_str()) + String(".glb");
+    Node3D *raw = load_glb_root(path, "wpn");
+    if (raw == nullptr) {
+        s_wpn_failed[p_key] = true;
+        return nullptr;
+    }
+    if (p_parent != nullptr) {
+        p_parent->add_child(raw);
+        raw->set_visible(false);
+    } else {
+        UtilityFunctions::print(String::utf8("[wpn] 警告：没有原型挂载点，模型资源会在退出时报泄漏"));
+    }
+    s_wpn_raw[p_key] = raw;
+    return raw;
+}
+
+Node3D *make_wpn_node(const std::string &p_key, Node *p_proto_parent, WpnNodeInfo &out) {
+    Node3D *raw = load_wpn_raw(p_key, p_proto_parent);
+    if (raw == nullptr) return nullptr;
+
+    // 做成实例：原始根是隐藏的、且被缓存复用；直接拿去摆会连原型一起动。
+    Node *dup = raw->duplicate();
+    Node3D *inst = Object::cast_to<Node3D>(dup);
+    if (inst == nullptr) {
+        if (dup != nullptr) dup->queue_free();
+        return nullptr;
+    }
+    // **必须显式打开可见性**：duplicate() 会把原型上的 visible=false 一起复制过来，
+    // 而原型是隐藏的（它挂在场景里纯粹为了不报 RID 泄漏）。
+    // 漏了这一行的症状是"手里什么都没有"，但日志里一切正常 ——
+    // 角色模型那条路踩过同一个坑（make_unit_node_by_key 里有一模一样的注释），
+    // 本轮又踩了一次。
+    inst->set_visible(true);
+
+    // 0) 量**旋转之前**的包围盒：最长边就是枪身长度方向，用它算缩放最稳。
+    //    （旋转之后再量的话，一旦朝向校正给错，"最长边"会变成枪的厚度，缩放就飞了 ——
+    //      而缩放错了会连带枪口位置一起错，两个症状叠在一起更难查。）
+    AABB raw_box;
+    bool has = false;
+    collect_aabb(inst, Transform3D(), raw_box, has);
+    if (!has || raw_box.size.length() <= 1e-6f) {
+        UtilityFunctions::print(String::utf8("[wpn] 模型没有网格 "), String::utf8(p_key.c_str()));
+        inst->queue_free();
+        return nullptr;
+    }
+    const float raw_long = std::max(raw_box.size.x, std::max(raw_box.size.y, raw_box.size.z));
+
+    // 1) 全长：默认取真枪全长（毫米 → 米），VA_WPN_LEN 可整体覆盖。
+    const WpnArtDef *def = wpn_art_def(p_key);
+    float len_m = (def != nullptr) ? def->len_mm / 1000.0f : 1.0f;
+    // 真值只在这一处算 —— 归一化与对外报告的"全长 / 枪口 z"都从它派生，
+    // 不会出现"模型按 1.232 缩放、枪口焰按 0.9 摆"这种对不上的情况。
+    if (const char *e = std::getenv("VA_WPN_LEN")) {
+        const float f = (float)std::strtod(e, nullptr);
+        if (f > 0.05f && f < 10.0f) len_m = f;
+    }
+
+    // 2) 朝向校正（VA_WPN_ROT="俯仰,偏航,侧倾"，现场调朝向用）
+    Vector3 euler(0.0f, WPN_YAW_DEG, 0.0f);
+    if (const char *e = std::getenv("VA_WPN_ROT")) {
+        float a = 0.0f, b = 0.0f, c = 0.0f;
+        if (std::sscanf(e, "%f,%f,%f", &a, &b, &c) == 3) euler = Vector3(a, b, c);
+    }
+    const float D2R = 3.14159265358979323846f / 180.0f;
+    inst->set_transform(Transform3D(Basis::from_euler(euler * D2R), Vector3()));
+
+    Node3D *norm = memnew(Node3D);
+    norm->add_child(inst);
+
+    // 3) 量旋转之后的包围盒（此时 norm 还是单位变换），据此定缩放与落位。
+    AABB box;
+    bool has2 = false;
+    collect_aabb(norm, Transform3D(), box, has2);
+    if (!has2 || box.size.z <= 1e-6f) {
+        UtilityFunctions::print(String::utf8("[wpn] 模型在 Z 轴上没有厚度，朝向校正可能给错了 "),
+                                String::utf8(p_key.c_str()), String::utf8(" 校正后尺寸 "), box.size);
+        norm->queue_free();
+        return nullptr;
+    }
+
+    const float k = len_m / std::max(raw_long, 1e-6f);
+
+    Vector3 place;
+    if (def != nullptr) place = Vector3(def->place[0], def->place[1], def->place[2]);
+    if (const char *e = std::getenv("VA_WPN_PLACE")) {
+        float a = 0.0f, b = 0.0f, c = 0.0f;
+        if (std::sscanf(e, "%f,%f,%f", &a, &b, &c) == 3) place = Vector3(a, b, c);
+    }
+
+    // 4) 落位：x/y 以包围盒中心为准（再用 place 微调），z 把**包围盒的 +Z 端**
+    //    顶到 WPN_STOCK_Z。于是枪口自然落在 WPN_STOCK_Z - 全长，
+    //    与程序化枪模的"原点=机匣后端、枪口在 -Z"完全一致。
+    const Vector3 c = box.get_center();
+    const float pos_z = WPN_STOCK_Z - (box.position.z + box.size.z) * k;
+    Basis sb;
+    sb.scale(Vector3(k, k, k));
+    norm->set_transform(Transform3D(sb, Vector3(-c.x * k + place.x,
+                                                -c.y * k + place.y,
+                                                pos_z + place.z)));
+
+    // 5) **不在这里设渲染层与阴影**。枪模要挂在"只照枪的那五盏灯"所在的层上，
+    //    而那个层是 ViewModel 的光照安排的产物 —— 由它自己走一遍子树去设。
+    //    写在这里的话，scene_builder 就得知道 viewmodel.cpp 里的 VM_LAYER，
+    //    两个模块会为了一个常量互相依赖。
+    out.length = box.size.z * k;
+    out.muzzle_z = WPN_STOCK_Z - out.length;
+    out.raw_size = raw_box.size;
+    out.scale = k;
+    // 双手在枪上的落点：没有登记过的键就退回程序化枪模那组位置
+    // （宁可手放得不准，也不要让手消失）。
+    out.hand_r_z = (def != nullptr) ? def->hand_r_z : WPN_HAND_R0;
+    out.hand_l_z = (def != nullptr) ? def->hand_l_z : WPN_HAND_L0;
+
+    UtilityFunctions::print(String::utf8("[wpn] 模型 "), String::utf8(p_key.c_str()),
+                            String::utf8(" 原始包围盒 "), raw_box.size,
+                            String::utf8(" 校正后 "), box.size,
+                            String::utf8(" 缩放 "), k,
+                            String::utf8(" 全长 "), out.length,
+                            String::utf8(" 枪口 z "), out.muzzle_z);
+    return norm;
 }
 
 Transform3D unit_transform(float p_x, float p_y, float p_facing, bool p_downed) {

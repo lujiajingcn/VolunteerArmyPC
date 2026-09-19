@@ -39,6 +39,12 @@
 # 它们与 .glb 内容重复，且同样可以重新生成 —— 入库只会让 11 个模型
 # 平白多出 33 个重复贴图文件。
 /assets/art/char/model/*_texture_pbr_*.jpg
+# 武器同理。眼下 wpn/model/ 里其实**没有**这些 jpg —— 因为武器走的是
+# scene_builder 的 load_glb_root()，用 GLTFDocument::append_from_file
+# 在**运行期**解析 .glb，整个绕过了 Godot 导入器（所以那边也没有 .import）。
+# 但只要有谁在编辑器里打开一次工程，导入器照样会把内嵌贴图抽出来，
+# 规则先摆着，免得 3 个模型平白多出 9 个重复 jpg 被误提交。
+/assets/art/wpn/model/*_texture_pbr_*.jpg
 
 # --- 开发期取证截图与运行日志（体积大，随时可用 tools/capture.sh 重新生成）---
 # 写成 "/sweep/*" + 反选而不是 "/sweep/"：目录本身若被排除，里面的

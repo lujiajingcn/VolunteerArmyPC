@@ -48,16 +48,21 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <vector>
 
 #include <godot_cpp/classes/box_mesh.hpp>
 #include <godot_cpp/classes/cylinder_mesh.hpp>
 #include <godot_cpp/classes/directional_light3d.hpp>
+#include <godot_cpp/classes/material.hpp>
+#include <godot_cpp/classes/mesh.hpp>
 #include <godot_cpp/classes/mesh_instance3d.hpp>
 #include <godot_cpp/classes/sphere_mesh.hpp>
 #include <godot_cpp/classes/standard_material3d.hpp>
 #include <godot_cpp/core/memory.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
+#include "node/scene_builder.h"
 #include "sim/va_math.h"
 #include "sim/va_world.h"
 
@@ -133,9 +138,149 @@ Ref<StandardMaterial3D> vm_glow(const Color &c, float energy) {
     return m;
 }
 
+// ---- 真模型材质的标定旋钮（只读一次）----
+//
+// 为什么需要三个旋钮而不是一个：图生3D 给出的 PBR 材质是"给离线渲染器看的"
+// （albedo 纯白、metallic 1.0、roughness 1.0），而这套光照是为程序化枪模
+// 手写标定出来的，两边对不上。三个参数各自解决一个症状：
+//
+// VA_VM_ART_ALB（默认 0.42）：albedo 乘数。
+//   症状：过曝成纯白。来历是照枪的五盏灯按程序化枪模那套**很深的**
+//   albedo（0.17 sRGB）扫描标定到 3.8 能量，而真模型贴图是正常枪械色。
+//   为什么压 albedo 而不是压灯：灯是枪模与**那两块程序化前臂**共用的，
+//   压灯会把前臂一起变暗；外观切换只该影响枪本身。
+//   允许 >1（上限 2.0）：贴图本身偏暗时还要往上抬。
+//
+//   【0.42 是量出来的，不是拍的】用 tools/vm_art_probe.py：同一场景同一秒、
+//   只改这一个系数拍若干张，用**差分**取掩码（背景一模一样，变的一定是枪），
+//   再在同一掩码上统计亮度分布（莫辛，ROI 900×549）：
+//
+//     系数   中位亮   死黑<20   正常70-110   过曝>200
+//     0.42    131      1.1%       27.9%       15.5%   ← 采用
+//     0.55    158      0.3%       14.9%       22.5%
+//     0.80    200      0.1%        2.3%       50.3%
+//     1.00    226      0.1%        0.9%       78.4%
+//
+//   单调，所以判据是"在哪一档开始崩"：0.80 起高光成片顶到白（一半以上像素
+//   过曝），1.00 时枪机与拉机柄已经糊成白块。0.42 / 0.55 都在可用区，
+//   取 0.42 是因为中调占比高一倍、死黑仍只有 1.1%（远低于 10% 上限）；
+//   三把枪逐一对照确认 DP-27 那种深蓝钢也没塌黑。
+//   ⚠️ 差分掩码天然偏向"两档差得多的像素"（偏亮的），所以**绝对占比不要与
+//   tools/vm_eval.py 的数字直接比** —— 它只用于相对比较。
+//
+// VA_VM_ART_METAL（默认 0.12）：metalness 强制值。
+//   症状：高金属度 + 场景里没有反射探针 = 镜面路径采不到环境，只剩黑。
+//   本文件里程序化枪身那段注释记过同一个实测（metallic 0.78 的导轨
+//   显示 RGB(0,1,10)，整条直接消失）。
+//
+// VA_VM_ART_ROUGH（默认 0.40）：roughness 强制值。
+//   为什么不能留 1.0：roughness=1 的高光被完全摊平，金属件退化成一块
+//   没有体积感的塑料；压到 0.4 才有窄高光把圆柱面（枪管、弹鼓）的
+//   曲面感拉回来。这三档与程序化枪身那几档材质是同一个思路。
+float art_albedo_scale() {
+    static const float s = [] {
+        const char *e = std::getenv("VA_VM_ART_ALB");
+        const float v = (e != nullptr && *e != '\0') ? (float)std::strtod(e, nullptr) : 0.42f;
+        return (v > 0.01f && v <= 2.0f) ? v : 0.42f;
+    }();
+    return s;
+}
+
+float art_metal() {
+    static const float s = [] {
+        const char *e = std::getenv("VA_VM_ART_METAL");
+        const float v = (e != nullptr && *e != '\0') ? (float)std::strtod(e, nullptr) : 0.12f;
+        return (v >= 0.0f && v <= 1.0f) ? v : 0.12f;
+    }();
+    return s;
+}
+
+float art_roughness() {
+    static const float s = [] {
+        const char *e = std::getenv("VA_VM_ART_ROUGH");
+        const float v = (e != nullptr && *e != '\0') ? (float)std::strtod(e, nullptr) : 0.40f;
+        return (v > 0.0f && v <= 1.0f) ? v : 0.40f;
+    }();
+    return s;
+}
+
+// VA_VM_ART_QUIET=1 关掉材质参数的一次性打印。
+bool art_report_enabled() {
+    static const bool s = (std::getenv("VA_VM_ART_QUIET") == nullptr);
+    return s;
+}
+
 void vm_layer(MeshInstance3D *mi) {
     mi->set_layer_mask(VM_LAYER);
     mi->set_cast_shadows_setting(GeometryInstance3D::SHADOW_CASTING_SETTING_OFF);
+}
+
+// 把整棵子树挪到枪模专用渲染层，并关掉阴影接收。
+//
+// 【为什么必须做这一步】真模型自带 MeshInstance3D，默认落在 layer 1。
+// 而本文件照枪的那五盏平行光 cull_mask 只到 VM_LAYER —— 留在默认层的话
+// 它们照不到枪，世界光却照得到：玩家一转身背对太阳，手里的枪就塌成黑剪影，
+// 正是下面"光照隔离"那一段要避免的现象。角色模型不需要这一步，
+// 因为角色本来就该被世界光照亮。
+//
+// 材质是**共享**的（duplicate 不会深拷贝 Mesh），所以这里改的是被缓存的那一份 ——
+// 无所谓：武器模型只有视图模型在用。
+//
+// 【为什么还要改材质本身】真模型带的是图生3D 给的 PBR 材质，直接上会踩三个坑
+// （每个坑对应上面一个旋钮，实测数据写在旋钮的注释里）：
+//   1) **过曝**：照枪的那五盏平行光，能量是按程序化枪模那套**很深的** albedo
+//      （0.17 sRGB）扫描标定的（VA_VMK 定在 3.8）。真模型的贴图是正常的枪械色、
+//      亮得多，同一套灯照上去就整片顶到纯白 —— 实测莫辛的枪管与机匣是纯白，
+//      木质枪托反而正常（因为木色偏深）。
+//   2) metallic 高：缺反射探针时镜面路径采不到环境，只剩黑。
+//      本文件里程序化枪身那段注释记过同一个实测（metallic 0.78 的导轨显示
+//      RGB(0,1,10)，整条直接消失）。
+//   3) roughness 1.0：高光被完全摊平，圆柱面（枪管、弹鼓、圆盘弹匣）
+//      退化成没有体积感的塑料片。
+// 处理办法是把这三个参数按枪模那套标定改写，而不是去改灯：
+// 改灯会连带把手里那两块程序化前臂（同一套灯）一起变暗。
+void adopt_gun_subtree(Node *p_node) {
+    MeshInstance3D *mi = Object::cast_to<MeshInstance3D>(p_node);
+    if (mi != nullptr) {
+        vm_layer(mi);
+        Ref<Mesh> mesh = mi->get_mesh();
+        if (mesh.is_valid()) {
+            const int ns = mesh->get_surface_count();
+            for (int i = 0; i < ns; ++i) {
+                StandardMaterial3D *sm =
+                    Object::cast_to<StandardMaterial3D>(mesh->surface_get_material(i).ptr());
+                if (sm == nullptr) continue;
+                // 枪离相机只有几十厘米，阴影贴图的精度远远不够，
+                // 蹭上一点就是一道跟着视角爬的条纹，比没有阴影难看得多。
+                sm->set_flag(BaseMaterial3D::FLAG_DONT_RECEIVE_SHADOWS, true);
+
+                // 只打一次原始参数：这是标定 albedo 系数的依据，
+                // 而"看过一眼就不需要再看"—— 每次加载都刷一遍会淹掉别的日志。
+                static bool s_reported = false;
+                if (!s_reported && art_report_enabled()) {
+                    s_reported = true;
+                    UtilityFunctions::print(String::utf8("[vm] 真模型材质 #"), i,
+                                            String::utf8(" albedo="), sm->get_albedo(),
+                                            String::utf8(" metallic="), sm->get_metallic(),
+                                            String::utf8(" roughness="), sm->get_roughness(),
+                                            String::utf8(" 有贴图="), sm->get_texture(BaseMaterial3D::TEXTURE_ALBEDO).is_valid());
+                }
+
+                // 三个旋钮**恒定覆盖**，不再做条件判断：
+                // 原始参数是图生3D 给离线渲染器的（1.0 / 1.0），
+                // 留哪一项都会留一个坑。alpha 钉 1.0 —— 透明度没开，
+                // 但带着小于 1 的 alpha 会让下一次读参数时误判。
+                const float a = art_albedo_scale();
+                sm->set_albedo(Color(a, a, a, 1.0f));
+                sm->set_metallic(art_metal());
+                sm->set_roughness(art_roughness());
+            }
+        }
+    }
+    const int nc = p_node->get_child_count();
+    for (int i = 0; i < nc; ++i) {
+        adopt_gun_subtree(p_node->get_child(i));
+    }
 }
 
 MeshInstance3D *part(Node3D *parent, const Ref<Mesh> &mesh, const Vector3 &pos,
@@ -196,9 +341,10 @@ MeshInstance3D *limb(Node3D *parent, const Vector3 &a, const Vector3 &b, float r
 
 } // namespace
 
-void ViewModel::build(Camera3D *p_cam) {
+void ViewModel::build(Camera3D *p_cam, Node *p_proto_parent) {
     if (p_cam == nullptr) return;
     cam = p_cam;
+    proto_parent = p_proto_parent;
 
     // 开发期旋钮：不动代码就能扫姿态。VA_VM_HIP / VA_VM_AIM / VA_VM_ROT。
     env_vec3("VA_VM_HIP", hip_pos);
@@ -243,30 +389,60 @@ void ViewModel::build(Camera3D *p_cam) {
     const Ref<StandardMaterial3D> sleeve = vm_mat(dbg_mat ? Color(0, 0, 1) : Color(0.170f, 0.178f, 0.138f), 0.0f, 0.95f);
 
     // ------------------------------------------------------------------
+    // 分组：枪身 / 双手 / 真模型。
+    //
+    // 【为什么要分组】武器外观切换要能把"程序化枪身"整块换成"真模型"，
+    // 而双手与前臂必须留着 —— 参考图是**光枪**，生成的模型里没有手，
+    // 一起藏掉的话画面上就是一把悬空的枪。
+    // 分组之后，"换外观"就退化成三个 set_visible，不必记住哪几十个部件属于枪身。
+    // ------------------------------------------------------------------
+    proc_body = memnew(Node3D);
+    proc_body->set_name("ProcBody");
+    gun->add_child(proc_body);
+
+    hands = memnew(Node3D);
+    hands->set_name("Hands");
+    gun->add_child(hands);
+
+    // 再拆左右两组：每把枪的握持点差得很远（见 WpnNodeInfo::hand_r_z），
+    // 换外观时要整组沿 z 平移。分组之后"挪手"就是两个 set_position，
+    // 不需要逐个记住哪几块几何体属于右手。
+    hand_r = memnew(Node3D);
+    hand_r->set_name("HandR");
+    hands->add_child(hand_r);
+    hand_l = memnew(Node3D);
+    hand_l->set_name("HandL");
+    hands->add_child(hand_l);
+
+    art_holder = memnew(Node3D);
+    art_holder->set_name("ArtHolder");
+    gun->add_child(art_holder);
+
+    // ------------------------------------------------------------------
     // 枪身。gun 局部原点 = 机匣后端（枪托接口）；-Z 为枪口方向；y=0 是枪管轴线。
     // 枪托向 +Z 伸到 +0.173，枪管向 -Z 伸到 -0.575，总长 0.748 m。
     // ------------------------------------------------------------------
     // 枪托往 +Z 只伸到 +0.134。别小看这 4 cm：开镜时枪托是整把枪离眼睛最近的部分，
     // 它每远 1 cm，屏幕上的面积就小一截。原来伸到 +0.173 时，开镜画面正中下方被
     // 托底板糊掉一大块（实测占屏宽 27%）。
-    part(gun, box(0.046f, 0.084f, 0.018f), Vector3(0, -0.020f, 0.125f), Vector3(), poly);          // 托底板
-    part(gun, box(0.042f, 0.064f, 0.108f), Vector3(0, -0.016f, 0.062f), Vector3(), poly);          // 伸缩托
-    part(gun, box(0.034f, 0.016f, 0.096f), Vector3(0, 0.020f, 0.062f), Vector3(), poly);           // 托腮板
+    part(proc_body, box(0.046f, 0.084f, 0.018f), Vector3(0, -0.020f, 0.125f), Vector3(), poly);          // 托底板
+    part(proc_body, box(0.042f, 0.064f, 0.108f), Vector3(0, -0.016f, 0.062f), Vector3(), poly);          // 伸缩托
+    part(proc_body, box(0.034f, 0.016f, 0.096f), Vector3(0, 0.020f, 0.062f), Vector3(), poly);           // 托腮板
 
-    part(gun, box(0.056f, 0.078f, 0.210f), Vector3(0, -0.014f, -0.105f), Vector3(), poly);         // 下机匣
-    part(gun, box(0.058f, 0.030f, 0.212f), Vector3(0, 0.028f, -0.105f), Vector3(), metal);         // 上机匣
-    part(gun, box(0.038f, 0.012f, 0.298f), Vector3(0, 0.045f, -0.112f), Vector3(), metal);         // 皮卡汀尼导轨
-    part(gun, box(0.048f, 0.050f, 0.170f), Vector3(0, -0.006f, -0.310f), Vector3(), poly);         // 护木
-    part(gun, box(0.030f, 0.010f, 0.120f), Vector3(0, -0.036f, -0.312f), Vector3(), metal);        // 护木下导轨
-    part(gun, tube(0.0100f, 0.150f), Vector3(0, 0.000f, -0.470f), Vector3(90, 0, 0), metal);       // 枪管
-    part(gun, tube(0.0175f, 0.045f, 8), Vector3(0, 0.000f, -0.552f), Vector3(90, 0, 0), metal);    // 枪口制退器
-    part(gun, box(0.024f, 0.024f, 0.046f), Vector3(0, 0.017f, -0.416f), Vector3(), metal);         // 导气箍
-    part(gun, box(0.014f, 0.030f, 0.013f), Vector3(0, 0.029f, -0.532f), Vector3(), metal);         // 准星
+    part(proc_body, box(0.056f, 0.078f, 0.210f), Vector3(0, -0.014f, -0.105f), Vector3(), poly);         // 下机匣
+    part(proc_body, box(0.058f, 0.030f, 0.212f), Vector3(0, 0.028f, -0.105f), Vector3(), metal);         // 上机匣
+    part(proc_body, box(0.038f, 0.012f, 0.298f), Vector3(0, 0.045f, -0.112f), Vector3(), metal);         // 皮卡汀尼导轨
+    part(proc_body, box(0.048f, 0.050f, 0.170f), Vector3(0, -0.006f, -0.310f), Vector3(), poly);         // 护木
+    part(proc_body, box(0.030f, 0.010f, 0.120f), Vector3(0, -0.036f, -0.312f), Vector3(), metal);        // 护木下导轨
+    part(proc_body, tube(0.0100f, 0.150f), Vector3(0, 0.000f, -0.470f), Vector3(90, 0, 0), metal);       // 枪管
+    part(proc_body, tube(0.0175f, 0.045f, 8), Vector3(0, 0.000f, -0.552f), Vector3(90, 0, 0), metal);    // 枪口制退器
+    part(proc_body, box(0.024f, 0.024f, 0.046f), Vector3(0, 0.017f, -0.416f), Vector3(), metal);         // 导气箍
+    part(proc_body, box(0.014f, 0.030f, 0.013f), Vector3(0, 0.029f, -0.532f), Vector3(), metal);         // 准星
 
-    part(gun, box(0.026f, 0.148f, 0.082f), Vector3(0, -0.108f, -0.115f), Vector3(-8, 0, 0), dark); // 弹匣
-    part(gun, box(0.032f, 0.100f, 0.048f), Vector3(0, -0.090f, -0.020f), Vector3(18, 0, 0), dark); // 握把
-    part(gun, box(0.028f, 0.008f, 0.050f), Vector3(0, -0.052f, -0.062f), Vector3(), metal);        // 扳机护圈
-    part(gun, box(0.016f, 0.011f, 0.042f), Vector3(0.028f, 0.040f, -0.020f), Vector3(), metal);    // 拉机柄
+    part(proc_body, box(0.026f, 0.148f, 0.082f), Vector3(0, -0.108f, -0.115f), Vector3(-8, 0, 0), dark); // 弹匣
+    part(proc_body, box(0.032f, 0.100f, 0.048f), Vector3(0, -0.090f, -0.020f), Vector3(18, 0, 0), dark); // 握把
+    part(proc_body, box(0.028f, 0.008f, 0.050f), Vector3(0, -0.052f, -0.062f), Vector3(), metal);        // 扳机护圈
+    part(proc_body, box(0.016f, 0.011f, 0.042f), Vector3(0.028f, 0.040f, -0.020f), Vector3(), metal);    // 拉机柄
 
     // ------------------------------------------------------------------
     // 分件细节。整把枪如果只有一档灰，在画面上会读成一块平板 —— 加细节比调亮度
@@ -275,39 +451,39 @@ void ViewModel::build(Camera3D *p_cam) {
     // 导轨齿：皮卡汀尼导轨的灵魂，沿 z 排 14 道
     for (int i = 0; i < 14; ++i) {
         const float z = -0.258f + (float)i * 0.0212f;
-        part(gun, box(0.036f, 0.006f, 0.011f), Vector3(0, 0.051f, z), Vector3(), metal);
+        part(proc_body, box(0.036f, 0.006f, 0.011f), Vector3(0, 0.051f, z), Vector3(), metal);
     }
     // 护木散热孔：两侧各 6 个，用深色件陷入
     for (int i = 0; i < 6; ++i) {
         const float z = -0.372f + (float)i * 0.0258f;
-        part(gun, box(0.007f, 0.019f, 0.015f), Vector3(0.026f, -0.008f, z), Vector3(), dark);
-        part(gun, box(0.007f, 0.019f, 0.015f), Vector3(-0.026f, -0.008f, z), Vector3(), dark);
+        part(proc_body, box(0.007f, 0.019f, 0.015f), Vector3(0.026f, -0.008f, z), Vector3(), dark);
+        part(proc_body, box(0.007f, 0.019f, 0.015f), Vector3(-0.026f, -0.008f, z), Vector3(), dark);
     }
     // 机匣侧面：抛壳口 / 快慢机 / 弹匣释放钮 / 拉机柄槽
-    part(gun, box(0.010f, 0.026f, 0.074f), Vector3(0.030f, 0.006f, -0.148f), Vector3(), dark);   // 抛壳口
-    part(gun, tube(0.011f, 0.012f, 8), Vector3(0.030f, -0.030f, -0.086f), Vector3(0, 0, 90), metal); // 快慢机
-    part(gun, box(0.010f, 0.016f, 0.018f), Vector3(0.030f, -0.046f, -0.052f), Vector3(), metal); // 弹匣释放钮
-    part(gun, box(0.008f, 0.010f, 0.090f), Vector3(0.030f, 0.026f, -0.150f), Vector3(), dark);   // 拉机柄槽
+    part(proc_body, box(0.010f, 0.026f, 0.074f), Vector3(0.030f, 0.006f, -0.148f), Vector3(), dark);   // 抛壳口
+    part(proc_body, tube(0.011f, 0.012f, 8), Vector3(0.030f, -0.030f, -0.086f), Vector3(0, 0, 90), metal); // 快慢机
+    part(proc_body, box(0.010f, 0.016f, 0.018f), Vector3(0.030f, -0.046f, -0.052f), Vector3(), metal); // 弹匣释放钮
+    part(proc_body, box(0.008f, 0.010f, 0.090f), Vector3(0.030f, 0.026f, -0.150f), Vector3(), dark);   // 拉机柄槽
     // 枪托：托底板的调节卡榫 + 背带环
-    part(gun, box(0.028f, 0.012f, 0.016f), Vector3(0, -0.052f, 0.076f), Vector3(), metal);       // 卡榫
-    part(gun, tube(0.008f, 0.010f, 8), Vector3(-0.022f, -0.028f, 0.104f), Vector3(0, 0, 90), metal); // 背带环
+    part(proc_body, box(0.028f, 0.012f, 0.016f), Vector3(0, -0.052f, 0.076f), Vector3(), metal);       // 卡榫
+    part(proc_body, tube(0.008f, 0.010f, 8), Vector3(-0.022f, -0.028f, 0.104f), Vector3(0, 0, 90), metal); // 背带环
 
     // 光学瞄具（红点）。开镜时它必须正好压住准心。
     // 外壳做成**框架**而不是实心 box：实心 box 会把镜片完全挡住，从后方看就是一个
     // 不透明的白方块（第一版就是这个效果，完全不像瞄具）。
-    part(gun, box(0.040f, 0.008f, 0.104f), Vector3(0, 0.092f, -0.095f), Vector3(), dark);          // 上框
-    part(gun, box(0.040f, 0.008f, 0.104f), Vector3(0, 0.058f, -0.095f), Vector3(), dark);          // 下框
-    part(gun, box(0.008f, 0.026f, 0.104f), Vector3(-0.016f, 0.075f, -0.095f), Vector3(), dark);    // 左框
-    part(gun, box(0.008f, 0.026f, 0.104f), Vector3(0.016f, 0.075f, -0.095f), Vector3(), dark);     // 右框
-    part(gun, box(0.036f, 0.014f, 0.098f), Vector3(0, 0.049f, -0.095f), Vector3(), metal);         // 底座
-    part(gun, box(0.026f, 0.028f, 0.004f), Vector3(0, 0.075f, -0.132f), Vector3(),
+    part(proc_body, box(0.040f, 0.008f, 0.104f), Vector3(0, 0.092f, -0.095f), Vector3(), dark);          // 上框
+    part(proc_body, box(0.040f, 0.008f, 0.104f), Vector3(0, 0.058f, -0.095f), Vector3(), dark);          // 下框
+    part(proc_body, box(0.008f, 0.026f, 0.104f), Vector3(-0.016f, 0.075f, -0.095f), Vector3(), dark);    // 左框
+    part(proc_body, box(0.008f, 0.026f, 0.104f), Vector3(0.016f, 0.075f, -0.095f), Vector3(), dark);     // 右框
+    part(proc_body, box(0.036f, 0.014f, 0.098f), Vector3(0, 0.049f, -0.095f), Vector3(), metal);         // 底座
+    part(proc_body, box(0.026f, 0.028f, 0.004f), Vector3(0, 0.075f, -0.132f), Vector3(),
          vm_glow(Color(0.15f, 0.33f, 0.46f), 0.50f));                                              // 镀膜镜片
     Ref<SphereMesh> dot = memnew(SphereMesh);
     dot->set_radius(0.0060f);
     dot->set_height(0.012f);
     dot->set_radial_segments(8);
     dot->set_rings(4);
-    part(gun, dot, Vector3(0, 0.075f, -0.135f), Vector3(),
+    part(proc_body, dot, Vector3(0, 0.075f, -0.135f), Vector3(),
          vm_glow(Color(1.00f, 0.14f, 0.10f), 3.0f));                                               // 红点
 
     // ------------------------------------------------------------------
@@ -320,12 +496,12 @@ void ViewModel::build(Camera3D *p_cam) {
     //      不像枪了。外移到 ±0.30 之后，右臂斜向右下 (u 0.67→0.82)、左臂斜向左下
     //      (u 0.58→0.29)，画面中下部才让给枪身。
     // ------------------------------------------------------------------
-    part(gun, box(0.050f, 0.074f, 0.080f), Vector3(0, -0.080f, -0.015f), Vector3(14, 0, 0), glove); // 右手
-    part(gun, box(0.012f, 0.020f, 0.055f), Vector3(0, -0.044f, -0.072f), Vector3(), glove);         // 右手食指
-    limb(gun, Vector3(0.005f, -0.082f, -0.010f), Vector3(0.300f, -0.440f, -0.130f), 0.032f, sleeve); // 右前臂
+    part(hand_r, box(0.050f, 0.074f, 0.080f), Vector3(0, -0.080f, WPN_HAND_R0), Vector3(14, 0, 0), glove); // 右手
+    part(hand_r, box(0.012f, 0.020f, 0.055f), Vector3(0, -0.044f, WPN_HAND_R0 - 0.057f), Vector3(), glove); // 右手食指
+    limb(hand_r, Vector3(0.005f, -0.082f, -0.010f), Vector3(0.300f, -0.440f, -0.130f), 0.032f, sleeve); // 右前臂
 
-    part(gun, box(0.058f, 0.062f, 0.088f), Vector3(-0.010f, -0.032f, -0.260f), Vector3(), glove);   // 左手
-    limb(gun, Vector3(-0.006f, -0.034f, -0.260f), Vector3(-0.330f, -0.420f, -0.150f), 0.032f, sleeve); // 左前臂
+    part(hand_l, box(0.058f, 0.062f, 0.088f), Vector3(-0.010f, -0.032f, WPN_HAND_L0), Vector3(), glove);   // 左手
+    limb(hand_l, Vector3(-0.006f, -0.034f, WPN_HAND_L0), Vector3(-0.330f, -0.420f, -0.150f), 0.032f, sleeve); // 左前臂
 
     // ------------------------------------------------------------------
     // 枪口 + 枪口焰
@@ -397,6 +573,116 @@ void ViewModel::build(Camera3D *p_cam) {
     // 消融开关：把整把枪藏起来再拍一张，两张的像素差就是"枪真正占了哪些像素"。
     // 靠肉眼在截图里猜哪块几何体是枪，上一轮已经猜错过一次。
     if (std::getenv("VA_VM_HIDE") != nullptr) root->set_visible(false);
+
+    // ------------------------------------------------------------------
+    // 武器外观：优先用手里的真模型，没有就保持程序化枪模。
+    // 放在最后是因为它要改 proc_body / hands 的可见性，而这两组刚刚才建完。
+    // ------------------------------------------------------------------
+    art_slots = std::min<int>(MAX_SKINS, (int)all_wpn_keys().size());
+    if (std::getenv("VA_VM_NO_ART") != nullptr) {
+        // 消融：强制用程序化枪模，用来对比"真模型到底改了什么"。
+        UtilityFunctions::print(String::utf8("[vm] VA_VM_NO_ART：强制程序化枪模"));
+    } else {
+        int start = 0;
+        // VA_WM_SKIN=<键 或 序号>：直接指定初始外观。
+        // 为什么需要它：按键注入要精确定位窗口、还要碰鼠标捕获，
+        // 而"拍一张第 2 把枪的腰射"这种事不该依赖按键 —— 有它就能一条命令拍完。
+        if (const char *e = std::getenv("VA_WM_SKIN")) {
+            const std::vector<std::string> &keys = all_wpn_keys();
+            for (int i = 0; i < (int)keys.size(); ++i) {
+                if (keys[i] == e) {
+                    start = i;
+                    break;
+                }
+            }
+            if (start == 0 && std::strlen(e) == 1 && e[0] >= '0' && e[0] <= '9') {
+                const int n = (int)keys.size();
+                if (n > 0) start = ((e[0] - '0') % n + n) % n;
+            }
+        }
+        if (!load_skin(start)) {
+            UtilityFunctions::print(String::utf8("[vm] 没有可用的武器模型，继续用程序化枪模"));
+        }
+    }
+}
+
+// 把第 p_index 个外观挂上去。已经建过就只切可见性 ——
+// 每次按键都重新 duplicate 一棵 5 万面的子树是白花时间，而且旧节点要等
+// 帧末才真正释放，来回切会出现"两把枪同时在手里"的一帧。
+bool ViewModel::load_skin(int p_index) {
+    if (art_holder == nullptr || art_slots <= 0) return false;
+    p_index = ((p_index % art_slots) + art_slots) % art_slots;
+
+    if (art_nodes[p_index] == nullptr) {
+        const std::string &key = all_wpn_keys()[p_index];
+        WpnNodeInfo info;
+        Node3D *n = make_wpn_node(key, proto_parent, info);
+        if (n == nullptr) return false;
+        // 真模型的渲染层必须在这里补上，理由见 adopt_gun_subtree。
+        adopt_gun_subtree(n);
+        n->set_name(String("Art_") + String::utf8(key.c_str()));
+        art_holder->add_child(n);
+        art_nodes[p_index] = n;
+        art_mz[p_index] = info.muzzle_z;
+        art_len[p_index] = info.length;
+        art_hr[p_index] = info.hand_r_z;
+        art_hl[p_index] = info.hand_l_z;
+    }
+    art_muzzle_z = art_mz[p_index];
+
+    // 双手按这把枪的握持点整组平移。基准就是程序化枪模那两只手的落点，
+    // 偏移量 = 本枪落点 − 基准（程序化时两者相等，偏移为 0，原样不动）。
+    // 不做这一步的症状见 WpnArtDef 里 hand_*_z 的注释：手悬在枪身外面。
+    // 只平移 z —— 竖直方向每把枪的握把高度差在**前臂会跟着动**的前提下
+    // 会变成"手整体浮起或下陷"，而枪本身已经用 place.y 对齐了枪管轴线，
+    // 所以竖直方向留给后续按截图微调，不在这里猜。
+    if (hand_r != nullptr) hand_r->set_position(Vector3(0, 0, art_hr[p_index] - WPN_HAND_R0));
+    if (hand_l != nullptr) hand_l->set_position(Vector3(0, 0, art_hl[p_index] - WPN_HAND_L0));
+
+    for (int i = 0; i < art_slots; ++i) {
+        if (art_nodes[i] != nullptr) art_nodes[i]->set_visible(i == p_index);
+    }
+    art_index = p_index;
+
+    // 位置与朝向都由 scene_builder 归一化进 gun 局部系了，这里不再动 art_holder。
+    if (muzzle != nullptr) muzzle->set_position(Vector3(0.0f, 0.0f, art_muzzle_z));
+
+    // 真模型接管枪身，程序化枪身整块让位。
+    //
+    // 双手**默认藏**：程序化那双手是给程序化枪模配的粗方块（前臂是一整根
+    // 方柱），跟真模型那种硬表面细节放一起非常突兀 —— 实测在波波沙与
+    // DP-27 上比枪本身还抢眼（弹鼓/圆盘弹匣反而被两块灰板压住）。
+    // 参考图是光枪，生成的模型里本来也没有手，所以"藏掉"比"硬套方块"
+    // 更接近素材原貌。
+    // VA_VM_HANDS=1 放回来 —— 将来有配得上的手模/手套时，每把枪的握持点
+    // 已经标定在 kWpnArt 的 hand_r_z / hand_l_z 里，直接接上即可。
+    if (proc_body != nullptr) proc_body->set_visible(false);
+    if (hands != nullptr) hands->set_visible(std::getenv("VA_VM_HANDS") != nullptr);
+
+    UtilityFunctions::print(String::utf8("[vm] 武器外观 "), (int)p_index + 1, "/", art_slots,
+                            " ", String::utf8(skin_label()),
+                            String::utf8(" 全长 "), art_len[p_index],
+                            String::utf8(" 枪口 z "), art_muzzle_z);
+    return true;
+}
+
+bool ViewModel::next_skin(int p_step) {
+    if (art_slots <= 0) return false;
+    // 跳过没有模型的槽位：少一个 .glb 不该让"按键切外观"整个失灵。
+    for (int i = 1; i <= art_slots; ++i) {
+        const int idx = ((art_index + p_step * i) % art_slots + art_slots) % art_slots;
+        if (load_skin(idx)) return true;
+    }
+    return false;
+}
+
+const char *ViewModel::skin_key() const {
+    if (art_slots <= 0 || art_index < 0 || art_index >= art_slots) return "";
+    return all_wpn_keys()[art_index].c_str();
+}
+
+const char *ViewModel::skin_label() const {
+    return wpn_label(skin_key());
 }
 
 void ViewModel::on_shot() {

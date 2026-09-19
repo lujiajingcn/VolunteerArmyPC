@@ -111,6 +111,47 @@ const std::vector<std::string> &all_art_keys();
 // Unit -> 模型键
 std::string unit_model_key(const va::Unit &u);
 
+// ---- 武器三维模型（图生3D 产物，tools/fetch_wpn_refs.sh + tools/gen3d_batch.py）----
+//
+// 约定：assets/art/wpn/model/<键>.glb。载入失败一律返回 nullptr，由调用方回退程序化枪模 ——
+// 少一个模型文件不该让玩家手里没有枪。
+//
+// 返回的节点已经**归一化到 ViewModel 的 gun 局部坐标系**：
+//   原点在枪托尾端平面，枪口朝 -Z，y≈0 是枪管轴线，单位是米。
+// 归一化放在这里而不是 ViewModel：它要用到与角色模型同一套"量包围盒 + 对轴 + 按实长缩放"，
+// 而 collect_aabb 是本文件的内部函数。
+//
+// 注意：**渲染层与阴影不在这个函数里设**。枪模要挂到"只照枪的那几盏灯"所在的层上，
+// 那是 ViewModel 的光照安排的产物，由它自己走一遍子树去设。
+// 程序化枪模上双手的落点（gun 局部系 z，米）。
+// 【为什么放在头文件里】真模型的握持点是**相对它**做偏移的
+// （见 WpnNodeInfo::hand_r_z），两边必须是同一个数 —— 各写一份就一定会漂移，
+// 而漂移的症状是"手慢慢从枪上滑开"，一次几厘米根本看不出来。
+// viewmodel.cpp 里建那两只程序化手时也直接引用这两个常量。
+constexpr float WPN_HAND_R0 = -0.015f;   // 右手（握把）
+constexpr float WPN_HAND_L0 = -0.260f;   // 左手（护木）
+
+struct WpnNodeInfo {
+    float         length = 0.0f;     // 归一化后的全长（米）
+    float         muzzle_z = 0.0f;   // 枪口在返回节点局部系的 z（负值）
+    float         scale = 0.0f;      // 施加的缩放倍率（排查用）
+    float         hand_r_z = 0.0f;   // 右手在枪上的落点（gun 局部 z）
+    float         hand_l_z = 0.0f;   // 左手在枪上的落点
+    godot::Vector3 raw_size;         // 归一化**之前**模型自身的尺寸（排查用）
+};
+
+// 全部武器键，顺序 = 游戏里切换外观的顺序，也是检阅台 / 自检的顺序。
+const std::vector<std::string> &all_wpn_keys();
+
+// 武器的中文显示名（HUD 提示用）。未知键返回"未知武器"而不是空串 ——
+// 空串在界面上表现为"什么都没显示"，会被误读成"没切成"。
+const char *wpn_label(const std::string &p_key);
+
+// 造一个归一化的武器节点。p_proto_parent 是原始场景根的挂载点（要挂进场景树，
+// 否则退出时会被 Godot 报 RID 泄漏）。失败返回 nullptr 并把 out 留空。
+godot::Node3D *make_wpn_node(const std::string &p_key, godot::Node *p_proto_parent,
+                             WpnNodeInfo &out);
+
 // 程序化纹理（保持"零外部资源"）
 godot::Ref<godot::Texture2D> tex_grass();
 godot::Ref<godot::Texture2D> tex_road();
