@@ -89,15 +89,16 @@ godot::Node3D *make_box_node();
 // vehicle_of() 认的那四个键（jeep / apc / tank / truck），与程序化那套同名同数。
 // 载入失败一律回退到程序化图元 —— 少一个模型文件不该让战场上少一辆车。
 //
-// 【与角色/武器最本质的差别：目标尺寸来自 VehicleSpec，而不是现实尺寸】
-// 武器的归一化目标写死为"真枪全长"（莫辛 1232 mm）。载具不行：
-// `VehicleSpec.len / wid` 同时是 **sim 用来判遮挡与碰撞的车体**（vehicle_blocked），
-// 而它是按玩法需要定的、比实物短得多 —— 吉普 len=46 逻辑单位 = **2.3 米**
-// （实物 Willys MB 是 3.35 米）、卡车 3.3 米（实物 CCKW 6.9 米）。
-// 若照实物缩放，画面上就会出现"子弹从车厢里穿过去"这种视线与判定脱节 ——
-// 而 va_config.cpp 在 src/sim/ 里，是**不许动**的。
-// 所以这里的归一化目标是**车长 = spec.len × S**，与程序化车体同一占地：
-// 换成真模型只改"长什么样"，不改"占多大地方"。
+// 【目标尺寸 = spec.len × S，而 spec.len 自 2026-09-20 起就是实车尺寸】
+// 与武器那条"归一化到真枪全长"是同一个口径了：车长按实车尺寸归一化。
+// 曾经不是 —— 那时 `VehicleSpec.len/wid` 是一套"还没有模型时的占位碰撞盒"
+// （吉普 2.3 米 / 实物 3.35 米），所以当时的规则是"只改长什么样、不改占多大地方"。
+// 那套尺寸在 1.68 m 的兵旁边读起来像高尔夫球车，已改成实车尺寸（见 README
+// 「载具形象」一节，含 8/10 → 6/10 的平衡代价与归因）。
+//
+// 注意 `len/wid` 同时是 sim 判遮挡与碰撞的车体盒（`vehicle_blocked`）与
+// **殉爆半径**的来源：后者已拆成显式 `VehicleSpec.blast_r`，不再跟着 len 漂。
+// 改 len 之前先看 README 那张"受牵连常量"表，别只改一处。
 godot::Node3D *make_vehicle_node_by_key(const std::string &p_type, godot::Node *p_proto_parent);
 
 // ---- 角色三维模型（图生3D 产物，tools/gen3d.py + tools/slim_glb.py）----

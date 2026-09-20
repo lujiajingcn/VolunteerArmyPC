@@ -128,7 +128,13 @@ void update_vehicles(float dt) {
         }
         if (wreck) v->blockedT += dt;
         float speed = 0;
-        if (wreck && distf(v->x, v->y, wreck->x, wreck->y) <= 52) {
+        /* 跟停距离按**两车半长之和**算，不再写死 52。
+           52 是"车长 3 米时代"的数（两车中心距 2.6 m）：那时就已经让后车叠进
+           前车 0.7 m，只是车小看不太出来；车长改成实车尺寸后会叠进去 4 米 ——
+           一辆 6.9 m 的卡车有一半插在另一辆里。改成"半长之和 + 8 单位（0.4 m）"，
+           车多大就停多远，以后加车也不用再回来调。 */
+        const float stopGap = wreck != nullptr ? (v->len + wreck->len) * 0.5f + 8.0f : 0.0f;
+        if (wreck && distf(v->x, v->y, wreck->x, wreck->y) <= stopGap) {
             speed = 0;
             if (!v->dismounted && v->type != "tank" && v->blockedT > 1.5f) dismount(v);
         } else if (v->isReinforcement) {

@@ -117,18 +117,24 @@ void spawn_shell(Vehicle *v, float tx, float ty) {
 
 void spawn_tank_mg(Vehicle *v, float tx, float ty) {
     const float base = std::atan2(ty - v->y, tx - v->x) + (RNG.next() + RNG.next() - 1.0f) * 0.10f;
+    /* 枪口偏移按车长推导，不再写死 30（= 1.5 m）。
+       30 是旧车长（3.3 m，半长 1.65 m）时代的数：当时刚好在车体边缘外。
+       车长改实车尺寸后，6.93 m 的卡车半长 3.47 m —— 写死 30 会把弹丸和枪口焰
+       生成在**车厢内部**，看起来像从货物堆里往外打。 */
+    const float muz = v->len * 0.5f + 10.0f;
+    const float mx = v->x + std::cos(base) * muz, my = v->y + std::sin(base) * muz;
     Projectile p;
     p.kind = ProjKind::TankMG;
-    p.x = v->x + std::cos(base) * 30; p.y = v->y + std::sin(base) * 30;
+    p.x = mx; p.y = my;
     p.vx = std::cos(base) * 950; p.vy = std::sin(base) * 950;
     p.dmg = v->spec->mg_dmg * BAL.veh_mg_dmg; p.pen = 0.12f;
     p.team = v->team; p.ownerVeh = v; p.ownerT = Target(v);
     p.life = 0.6f; p.t = 0; p.sup = v->spec->mg_sup;
     W.projectiles.push_back(p);
-    { FxItem f; f.type = "flash"; f.x = v->x + std::cos(base) * 30; f.y = v->y + std::sin(base) * 30;
+    { FxItem f; f.type = "flash"; f.x = mx; f.y = my;
       f.life = 0.05f; f.a = base; fx_push(f); }
     /* 车载机枪：走 enemyMG 音色但压低一点，免得抢过步兵步枪的方位感 */
-    sfx("enemyMG", v->x + std::cos(base) * 30, v->y + std::sin(base) * 30, 0.85f);
+    sfx("enemyMG", mx, my, 0.85f);
 }
 
 bool vehicle_hit(const Vehicle &v, float x, float y) {

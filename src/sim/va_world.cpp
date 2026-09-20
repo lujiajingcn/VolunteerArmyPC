@@ -411,11 +411,17 @@ void build_convoy() {
         v.id = type + std::to_string(idx[ti]);
         v.name = std::string(names[ti]) + std::to_string(idx[ti]);
         v.team = Team::Enemy;
-        v.x = 2320 + i * 132; v.y = 700; v.angle = 3.141592653589793f;
+        /* 展开间距与停车排队间距（CFG.convoyGap）**必须是同一个数**：
+           原先这里是硬编码的 132、而停车排队用 CFG.convoyGap=145，两个数各说各话。
+           车长改实车尺寸后这条就绷不住了 —— 6.93 m 的卡车（139 单位）比 132 还长，
+           行进中会与前后车穿模。现在统一走 CFG.convoyGap，只留一个真值。
+           另外注意：领头车（i==0）的 dist 恒为 0，所以改间距**不影响**伏击触发的
+           时刻（伏击判据用的是领头车的 x），只让后续车依次晚到。 */
+        v.x = 2320 + (float)i * CFG.convoyGap; v.y = 700; v.angle = 3.141592653589793f;
         v.speed = 0;
         const VehicleSpec *sp = vehicle_of(type);
         v.baseSpeed = sp->speed * 0.30f;
-        v.dist = -i * 132.0f;
+        v.dist = -(float)i * CFG.convoyGap;
         v.hp = sp->hp; v.maxHp = sp->hp;
         v.spec = sp;
         v.len = sp->len; v.wid = sp->wid; v.armor = sp->armor;

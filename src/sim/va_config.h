@@ -23,7 +23,7 @@ struct LevelCfg {
     float missionEnd = 600;    // 10:00 强制结束
     float tailSpeedUp = 250;   // 车队接近西侧出口
     float convoyStopX = 1020;  // 伏击圈停车线
-    float convoyGap = 145;     // 各车间距
+    float convoyGap = 145;     // 各车间距（= 位置真值，生成与停车排队共用）
 };
 extern const LevelCfg CFG;
 

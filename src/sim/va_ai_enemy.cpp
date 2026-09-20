@@ -24,6 +24,11 @@ void dismount(Vehicle *v) {
     for (int i = 0; i < n; ++i) {
         const int side = RNG.next() < 0.5f ? 1 : -1;
         const float a = 3.141592653589793f / 2 * side + rr(-0.5f, 0.5f);
+        /* 下车位置必须在**车体之外**。偏移原先写死 rr(16,42)（0.8~2.1 m），
+           那是按旧车宽 1.2 m 定的；车宽改成实车（最大半宽 1.5 m）之后，
+           rr(16,·) 会让士兵直接**生成在车厢内部**。改成从半宽起算。 */
+        const float outA = v->wid * 0.5f + rr(10.0f, 34.0f);
+        const float outB = v->wid * 0.5f + rr(10.0f, 34.0f);
         const bool isOfficer = (W.officerVeh == v) && !W.officerSpawned && i == 0;
         if (isOfficer) W.officerSpawned = true;
         const bool isLmg = (i % 5 == 0);
@@ -143,15 +148,20 @@ void spawn_reinforcement() {
         v.type = "truck";
         v.name = "增援卡车" + std::to_string(k + 1);
         v.team = Team::Enemy;
-        v.x = 2320 + k * 140; v.y = 700; v.angle = 3.141592653589793f;
+        v.x = 2320 + (float)k * CFG.convoyGap; v.y = 700; v.angle = 3.141592653589793f;
         v.speed = 26; v.baseSpeed = 26;
         v.hp = tsp->hp; v.maxHp = tsp->hp; v.spec = tsp;
-        v.len = 66; v.wid = 30; v.armor = 0.34f;
+        /* 尺寸一律从 spec 取。原先这里硬写着 `v.len = 66; v.wid = 30;` ——
+           正好等于当时卡车 spec 的值，所以看起来"没毛病"；但 spec 一改
+           （本轮改实车尺寸）这里就会静默地留在旧尺寸上，让增援卡车比车队里的
+           卡车**小一圈**且不报任何错。armor 保留显式覆写：增援车有意更软，
+           那是玩法设定，不是从 spec 抄漏了。 */
+        v.len = tsp->len; v.wid = tsp->wid; v.armor = 0.34f;
         v.destroyed = false; v.burning = 0;
         v.turret = 3.141592653589793f; v.fireCd = 99; v.wpnCd = 2;
         v.capacity = 6; v.dismountT = -1; v.dismounted = false;
         v.state = "drive"; v.line = 1; v.speedMul = 1;
-        v.dist = -(float)k * 140;
+        v.dist = -(float)k * CFG.convoyGap;
         v.hasBox = false; v.hitFlash = 0; v.stopT = 0;
         v.troopPlan = 6; v.isReinforcement = true; v.blockedT = 0;
     }

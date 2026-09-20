@@ -137,7 +137,12 @@ void damage_vehicle(Vehicle *v, float dmg, const std::string &kind, Unit *byUnit
 void destroy_vehicle(Vehicle *v, Unit *byUnit) {
     if (!v || v->destroyed) return;
     v->destroyed = true; v->burning = 30; v->hp = 0;
-    explosion(v->x, v->y, v->len * 0.9f, v->type == "tank" ? 160.0f : 90.0f, Team::Enemy, "vehicle");
+    /* 殉爆半径走 spec->blast_r（0 才回退到 len × 0.9，见 va_types.h）。
+       不再直接用 len：车长改实车尺寸时，写死 len × 0.9 会让杀伤半径跟着放大
+       1.5~2.1 倍 —— 而伏击是贴身打，等于凭空提高难度（实测掉 1 胜 / 10 种子）。 */
+    const float blastR = (v->spec != nullptr && v->spec->blast_r > 0.0f)
+                       ? v->spec->blast_r : v->len * 0.9f;
+    explosion(v->x, v->y, blastR, v->type == "tank" ? 160.0f : 90.0f, Team::Enemy, "vehicle");
     sfx("metal", v->x, v->y, 0.8f);          // 车体撕裂的金属余音
     decal_rgba(v->x, v->y, v->len * 0.6f, 30, 26, 22, 0.55f);
     if (byUnit && byUnit->team == Team::Ally) byUnit->kills++;

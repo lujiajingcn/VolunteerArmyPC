@@ -1135,9 +1135,10 @@ static Node3D *load_vehicle_proto(const std::string &p_type, Node *p_parent) {
     constexpr float PI = 3.14159265358979323846f;
     Basis b(Vector3(0.0f, 1.0f, 0.0f), yaw_deg * PI / 180.0f);
 
-    // 车长按 spec 走（理由见头文件），**不是**按实物长度 —— 它是被 sim 用来判
-    // 遮挡与碰撞的那个尺寸，改成实物尺寸就会视线与判定脱节，而 va_config.cpp
-    // 在 src/sim/ 里、不许动。
+    // 车长按 spec 走（理由见头文件）。`spec.len` 自 2026-09-20 起就是实车尺寸，
+    // 所以这条同时是"按实车长度归一化"——与武器那套口径一致。
+    // 它**同时**是 sim 判遮挡/碰撞的车体盒，改它会连带一串按旧车长调过的常量
+    // （README「载具形象」有清单），不要只改这里。
     const va::VehicleSpec *sp = va::vehicle_of(p_type);
     const float target_len = sp->len * S;
 
