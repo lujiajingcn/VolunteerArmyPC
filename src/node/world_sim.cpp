@@ -103,6 +103,18 @@ void WorldSim::aim_at_road() {
      VA_UNIT_SHOW=one:<键>[:<度>]  近景单体：把<键>那个模型单独摆到镜头前 5 米，
                                   看朝向 / 脚底 / 比例（可加第三段临时偏航角度）
 
+   载具另有两条（前面多了 veh: 前缀，不与角色撞键）：
+     VA_UNIT_SHOW=veh:<类型>[:<度>]  单车近景，类型 = jeep | apc | tank | truck
+     VA_UNIT_SHOW=veh:row           四辆车的陈列排（按 jeep/apc/tank/truck 固定顺序）
+
+   【载具为什么要单独一条通道】战场截图答不了载具的三个问题：车头朝哪个方向、
+   跟人比有多大、轮子是踩在地上还是悬在半空。车队在公路上、离玩家几十到上百米，
+   画面上就是一小块，还常被地形切掉一半 —— 与角色那轮的处境一模一样。
+
+   近景里 dyaw=0 时看到的**应当是车头正面**（推导见 veh: 分支里的注释），
+   这既是"车头在 +X"这条约定的判据，也是 VEH_MODEL_YAW_DEG 该取几度的判据。
+   扫角度：VA_UNIT_SHOW=veh:jeep:90 就是"把模型再绕 Y 转 90°"。
+
    为什么需要它：把角色换成三维模型之后，"朝向校对了没有 / 身高比例对不对 /
    脚是踩在地上还是悬空 / 倒地的姿态是躺下还是穿模"这四件事，**战场截图一件都答不了**。
    场上每个单位在 2560 宽的画面上只有几十像素高，还大半时间背对镜头或被掩体挡住；
@@ -189,6 +201,101 @@ void WorldSim::build_unit_showcase() {
         return;
     }
 
+    if (mode.rfind("veh:", 0) == 0) {
+        /* ---- 载具近景 / 陈列排：veh:<type>[:<临时偏航角>] 或 veh:row ----
+         【为什么载具要单独一条通道】战场截图答不了载具的三个问题：
+         朝向对不对（车头朝哪）、比例对不对（跟人比多大）、轮子有没有踩在地上。
+         车队在公路上、离玩家几十到上百米，画面上就一小块，还常被地形切掉一半。
+         取证口径与角色那条完全一致（同一套 make_vehicle_node_by_key + 同一套
+         量化日志），只是取景要重算 —— 载具比人矮而长（吉普 2.3×1.2 m、
+         坦克 3.7×1.9 m），照抄角色那套 4.8 m / 1.05 m 会把车拍到画面下缘外。 */
+        std::string rest = mode.substr(4);
+        std::string key = rest, yaw_s;
+        const size_t c = rest.find(':');
+        if (c != std::string::npos) { key = rest.substr(0, c); yaw_s = rest.substr(c + 1); }
+        float dyaw = 0.0f;
+        if (!yaw_s.empty()) dyaw = (float)std::strtod(yaw_s.c_str(), nullptr) * PI / 180.0f;
+
+        const bool row = (key == "row");
+        const char *kinds[4] = { "jeep", "apc", "tank", "truck" };
+        const int   n = row ? 4 : 1;
+
+        // 取景：横向半视场 = 0.2867 × (2560/1369) ≈ 0.536（FOV 32 时），
+        // 竖直半视场 = 16° = 0.2793 rad。按"最宽的也要留约 20% 余量"定：
+        //   单车 —— 画面里还要站一个 1.68 m 的兵做比例尺（见下），他落在
+        //           车右侧 2.4 m 处，最坏情况（坦克侧视，半长 1.85 m）也在框内；
+        //           0.536×D ≥ (2.4+人身半宽 0.3)×1.2 → D ≥ 6.0。
+        //   陈列排 —— 四辆按 2.0 m 间距共 6.0 m，再加最宽的坦克半个身位 0.83 m，
+        //           0.536×D ≥ 3.83×1.2 → D ≥ 8.6。
+        // 机高取 1.6~2.1：**不能照抄角色那套 1.05 m** —— 相机比车顶还低的话
+        // 看到的是纯正面，车厢里装了什么、轮子有几个全被车头挡住。
+        const float DIST_M = row ? 8.8f : 6.2f;
+        const float CAM_H  = row ? 2.05f : 1.60f;
+        const float PITCH  = row ? -0.15f : -0.19f;
+        const float GAP_M  = 2.0f;
+        const float REF_OFF_M = 2.4f;   // 比例尺参照兵与车心的横向间距（仅单车模式）
+
+        int built = 0;
+        for (int i = 0; i < n; ++i) {
+            const std::string type = row ? std::string(kinds[i]) : key;
+            Node3D *nd = make_vehicle_node_by_key(type, refs_.vehicles);
+            if (nd == nullptr) {
+                // 与角色那条同一个口径：缺模型**留空位**并打一行日志，
+                // 而不是把后面的往前挪 —— 挪了就再也看不出"少哪一个"。
+                UtilityFunctions::print(String::utf8("[show] 缺载具模型，第 "), i,
+                                        String::utf8(" 格（"), String::utf8(type.c_str()),
+                                        String::utf8("）空置"));
+                continue;
+            }
+            const float off_m = row ? ((float)i - (n - 1) * 0.5f) * GAP_M : 0.0f;
+            const float lx = p->x + fx * DIST_M * U + rx * off_m * U;
+            const float ly = p->y + fy * DIST_M * U + ry * off_m * U;
+            // 与角色同口径：模型前方 = +X，facing = a + π 就是把+X转过来对着相机。
+            // 所以 dyaw=0 时看到的应当是**车头正面** —— 这正是"朝向标定对不对"的判据。
+            nd->set_transform(unit_transform(lx, ly, a + PI + dyaw, false));
+            stage->add_child(nd);
+            ++built;
+        }
+
+        /* 比例尺参照兵（只在单车模式）。
+           "跟人比多大"是这条通道三个待答问题里的第二个，而它**只能靠同框回答** ——
+           分开两张图各量像素再去比，中间隔着两次取景、两个距离，误差比结论还大。
+           用具名模型而不是画个高度标尺：标尺能被当成装饰忽略，一个人不会被忽略；
+           而且他与陈列排里的角色是同一个模型，读数可以直接互相印证。
+           站右侧而不是左侧：横向视场在 dx>0 方向与本工程其余取证图的读数习惯一致。
+           注意必须在下面 hide 之前建 —— duplicate() 会把原型的 visible 一起复制。 */
+        if (!row) {
+            if (Node3D *ref = make_unit_node_by_key("char_rifleman", refs_.units)) {
+                const float lx = p->x + fx * DIST_M * U + rx * REF_OFF_M * U;
+                const float ly = p->y + fy * DIST_M * U + ry * REF_OFF_M * U;
+                ref->set_transform(unit_transform(lx, ly, a + PI, false));
+                stage->add_child(ref);
+                UtilityFunctions::print(String::utf8("[show] 比例尺参照兵 char_rifleman 距车心 "),
+                                        REF_OFF_M, "m");
+            } else {
+                UtilityFunctions::print(String::utf8("[show] 比例尺参照兵缺失（char_rifleman）"));
+            }
+        }
+
+        cam_->set_position(to3(p->x, p->y, CAM_H));
+        cam_->set_rotation(Vector3(PITCH, yaw_, 0));
+        if (std::getenv("VA_FOV") == nullptr) cam_->set_fov(32.0f);
+        UtilityFunctions::print(String::utf8("[show] 载具 "), String::utf8(key.c_str()),
+                                String::utf8(" 距离 "), DIST_M, String::utf8("m 机高 "), CAM_H,
+                                String::utf8(" 临时偏航 "), dyaw * 180.0f / PI,
+                                String::utf8(" 度 建出 "), built, "/", n);
+        /* 藏掉真单位、真车队、以及**道具层**。
+           道具这一条在角色那条通道里是"保留"的（当尺寸参照），载具这边必须反过来藏：
+           实测第一张吉普近景里，一块岩石**正好压在车身右半侧**上，
+           车顶线与岩石轮廓糊在一起，"车厢有多高、轮胎露几个"当场读不出来 ——
+           与角色那轮"一根树干立在视线中轴"是同一个坑。
+           载具的尺寸参照已经由上面那个人给了，不再需要岩石，所以道具在这里是纯干扰。 */
+        if (refs_.units != nullptr) refs_.units->set_visible(false);
+        if (refs_.vehicles != nullptr) refs_.vehicles->set_visible(false);
+        if (refs_.props != nullptr) refs_.props->set_visible(false);
+        return;
+    }
+
     // ---- 陈列排 ----
     const std::vector<std::string> &keys = all_art_keys();
     // 末位那一个是**倒在地上的步枪手** —— 倒地姿态只有摆出来才能确认，
@@ -241,14 +348,17 @@ void WorldSim::build_unit_showcase() {
     UtilityFunctions::print(String::utf8("[show] 检阅台：陈列 "), built, "/", n, String::utf8(" 个模型，间距 "),
                             GAP_M, String::utf8("m，前排 "), ROW0_M, String::utf8("m 后排 "), ROW1_M, "m");
 
-    /* 藏掉场上**真单位**、以及**道具层**。
+    /* 藏掉场上**真单位**、**真车队**、以及**道具层**。
        真单位用的是同一批模型，又正好冻在出生点（大多就在玩家身边几米内），
        同框会读不出"这一排到底几个、第几格是谁"—— 而这恰恰是检阅台唯一要回答的问题。
-       道具层是同一个道理的另一半：上一版就这么拍了一张，
+       真车队是同一个道理的另一半：四辆车停在公路上，`veh:row` 那一排同样四辆，
+       同框就会数出**八辆**，而"这一排到底几辆、顺序对不对"正是载具陈列排唯一要回答的问题。
+       道具层又是另一半：上一版就这么拍了一张，
        一根树干**正好立在视线中轴**上，把中间两格劈成两半。
        道具在陈列排这种"整排平铺"的取景里没有净收益（尺寸参照用不上整排），
        要参照尺寸请走近景单体模式，那里背景道具是保留的。 */
     if (refs_.units != nullptr) refs_.units->set_visible(false);
+    if (refs_.vehicles != nullptr) refs_.vehicles->set_visible(false);
     if (refs_.props != nullptr) refs_.props->set_visible(false);
 }
 
@@ -724,7 +834,7 @@ void WorldSim::spawn_entity_nodes() {
         unit_nodes_.push_back(n);
     }
     for (auto &v : va::W.vehicles) {
-        Node3D *n = make_vehicle_node(v.type);
+        Node3D *n = make_vehicle_node(v.type, refs_.vehicles);
         refs_.vehicles->add_child(n);
         veh_nodes_.push_back(n);
     }
@@ -748,7 +858,7 @@ void WorldSim::sync_entity_nodes() {
         for (auto *n : veh_nodes_) n->queue_free();
         veh_nodes_.clear();
         for (auto &v : va::W.vehicles) {
-            Node3D *n = make_vehicle_node(v.type);
+            Node3D *n = make_vehicle_node(v.type, refs_.vehicles);
             refs_.vehicles->add_child(n);
             veh_nodes_.push_back(n);
         }

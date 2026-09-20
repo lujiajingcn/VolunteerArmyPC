@@ -1042,7 +1042,177 @@ Transform3D unit_transform(float p_x, float p_y, float p_facing, bool p_downed) 
     return Transform3D(b, to3(p_x, p_y, ground_h(p_x, p_y)));
 }
 
-Node3D *make_vehicle_node(const std::string &type) {
+// ---------------------------------------------- 载具三维模型（图生3D 产物）
+//
+// 参考图与生成方式：tools/prep_veh_refs.sh（取图 + 统一车头朝向 + 补方）
+// → tools/gen3d_batch.py --kind veh → assets/art/veh/model/veh_<type>.glb。
+//
+// 【归一化目标坐标系】= make_vehicle_node 那套程序化车体的局部系：
+//     原点在**车体中心的地面投影**（车轮着地 y=0）、车头朝 **+X**、
+//     车长沿 X、车宽沿 Z，单位是**米**。
+// 与程序化车模完全同构，所以 world_sim 那两处 `set_rotation(0,-angle,0)`
+// 一行都不用改 —— 这也是"车头必须朝 +X"的由来（依据见头文件注释）。
+//
+// 【朝向校正角是实测项，不是推导项】
+// 图生3D 把"图像的哪个方向"映到"模型的哪个轴"由服务端决定，只能量出来。
+// 武器那批的实测结论是"图像右 = +X"（三张参考图枪口朝右，成品枪口也在 +X）。
+// 载具的参考图同样是**侧视图**（图像横向 = 车长方向），所以先按 **0°** 起步 ——
+// 与武器那条"把 +X 转到 -Z 需要 90°"并不矛盾：那 90° 是为了转到**另一个**目标系
+// （枪口朝 -Z），而这里的目标系本来就是"车头朝 +X"。
+// 能靠截图量出来改，就不该靠重编译猜，所以留 VA_VEH_YAW 现场扫。
+//
+// ⚠️ 【但"长轴在 X 上"这件事**不能**只靠一个常量假定 —— 它逐辆不同】
+// 实测四辆里 jeep / apc 出来长轴就在 X，而 **tank 出来长轴在 Z**
+// （原始包围盒 (0.526, 0.532, 1.085)）。所以这里把朝向拆成两段：
+//   ① `align`（自动，几何决定，无猜测）：把**最长的水平轴**转到 X；
+//   ② `veh_extra_yaw_deg()`（逐辆实测的残余角）：只管剩下的 180°
+//      ——"哪一端是车头"几何上定不了（车头和车尾都是一样的长），只能看图。
+float veh_extra_yaw_deg(const std::string &p_type) {
+    // 四个值都是 2026-09-20 用 `VA_UNIT_SHOW=veh:<键>` 看出来的
+    // （判据：偏航 0° 时画面里应当是**车头正面** —— 格栅 / 大灯 / 保险杠正对镜头）。
+    static const std::map<std::string, float> k = {
+        { "jeep",  0.0f },   // 实测 0° 看到格栅 + 大灯 + 挡风玻璃 ✓；侧视车头朝左、备胎在尾
+        { "apc",   0.0f },   // 实测 0° 看到绞盘保险杠 + 天线 ✓；侧视前轮 + 后履带（确为半履带车）
+        { "tank",  0.0f },   // 长轴在 Z → align 自动转 90°；残余 0°，侧视主动轮在前、炮管与车头同向 ✓
+        { "truck", 0.0f },   // 长轴在 X（align 0）；侧视六轮（三轴）+ 帆布车厢 + GMC 百叶窗机盖，
+                             // 车头朝左、与其余三辆一致 ✓
+    };
+    auto it = k.find(p_type);
+    return (it == k.end()) ? 0.0f : it->second;
+}
+
+static std::map<std::string, Node3D *> s_veh_proto;   // 键 -> 外层原型（含完整的归一化子树）
+static std::map<std::string, bool> s_veh_failed;      // 失败过就别每辆车再试一次
+
+static Node3D *load_vehicle_proto(const std::string &p_type, Node *p_parent) {
+    auto it = s_veh_proto.find(p_type);
+    if (it != s_veh_proto.end()) {
+        return it->second;
+    }
+    if (s_veh_failed.count(p_type) != 0) {
+        return nullptr;
+    }
+
+    const String path = String("res://assets/art/veh/model/veh_") +
+                        String::utf8(p_type.c_str()) + String(".glb");
+    Node3D *raw = load_glb_root(path, "veh");
+    if (raw == nullptr) {
+        s_veh_failed[p_type] = true;
+        return nullptr;
+    }
+
+    AABB box;
+    bool has = false;
+    collect_aabb(raw, Transform3D(), box, has);
+    // 判据用"两个水平尺寸都非零"而不是"体积非零"：载具是躺着的东西，
+    // 万一生成成一个竖片（贴图平面），体积照样非零，但摆到地上就是一块纸板。
+    if (!has || box.size.x <= 1e-4f || box.size.z <= 1e-4f) {
+        UtilityFunctions::print(String::utf8("[veh] 模型没有网格或尺寸退化 "), path,
+                                String::utf8(" 包围盒 "), box.size);
+        raw->queue_free();
+        s_veh_failed[p_type] = true;
+        return nullptr;
+    }
+
+    /* ---- ① 先把"车长"对齐到局部 X（逐辆自动，不靠常量假定）----
+       判据是**水平两轴的实测长度**：车长必然是水平方向上更长的那一维
+       （四辆车的实物长宽比都在 2:1 以上），所以只有 0° / 90° 两个候选，
+       没有猜的成分。不先做这一步就会踩到下面这个坑 ——
+       它是**静默**的，所以值得把症状写清楚：
+         tank 原始包围盒 (0.526, 0.532, 1.085)，长轴在 Z；
+         若直接拿 size.x=0.526 当车长，缩放到 3.7 m 需要 k=7.03，
+         于是坦克变成 **7.6 m 长、3.7 m 高**的巨物（目标其实是 3.7 × 1.9）。
+         全程不报一条错，只表现为"这坦克怎么比房子还大"。 */
+    const float align_deg = (box.size.z > box.size.x) ? 90.0f : 0.0f;
+
+    float yaw_deg = align_deg + veh_extra_yaw_deg(p_type);
+    if (const char *e = std::getenv("VA_VEH_YAW")) {
+        // 现场扫角度用：覆盖的是**总**偏航（align 也算在内）。
+        // 别拿它单独覆盖残余角 —— 那样 align 会被一起冲掉，越扫越乱。
+        yaw_deg = (float)std::atof(e);
+    }
+
+    constexpr float PI = 3.14159265358979323846f;
+    Basis b(Vector3(0.0f, 1.0f, 0.0f), yaw_deg * PI / 180.0f);
+
+    // 车长按 spec 走（理由见头文件），**不是**按实物长度 —— 它是被 sim 用来判
+    // 遮挡与碰撞的那个尺寸，改成实物尺寸就会视线与判定脱节，而 va_config.cpp
+    // 在 src/sim/ 里、不许动。
+    const va::VehicleSpec *sp = va::vehicle_of(p_type);
+    const float target_len = sp->len * S;
+
+    // 先量"转过之后"的包围盒，再按它定缩放 —— 顺序反了就会拿原始 X 当车长，
+    // 而原始 X 在 yaw=±90 时其实是车宽。
+    const AABB rbox = Transform3D(b).xform(box);
+    const float cur_len = std::max(rbox.size.x, 1e-5f);
+    const float k = target_len / cur_len;
+    b.scale(Vector3(k, k, k));
+    const AABB kbox = Transform3D(b).xform(box);
+
+    /* 黄牌：车高不该超过车长。四辆车的实物都是"长 > 高"（比值 1.5~2.4），
+       正常成品不该越过 0.95。越过了就说明"车长"这一维仍然取错
+       （上面那步对齐没生效 / 生成器给了个竖着的东西），
+       这时宁可日志里喊一声也不要默默摆一辆巨车上场。 */
+    if (kbox.size.y > kbox.size.x * 0.95f) {
+        UtilityFunctions::print(String::utf8("[veh] ⚠ 车高 "), kbox.size.y,
+                                String::utf8(" 不短于车长 "), kbox.size.x,
+                                String::utf8(" —— 长轴可能仍未对齐，请核对该行日志"));
+    }
+
+    const Vector3 c = kbox.get_center();
+
+    Node3D *outer = memnew(Node3D);
+    Node3D *norm = memnew(Node3D);
+    // 一次给全：绕 Y 转 yaw、等比缩放到目标车长、车底落到 y=0、水平居中到原点。
+    // 平移量取**缩放之后的包围盒中心**，而不是原包围盒中心乘 k ——
+    // yaw=±90 时两者并不相等（x/z 互换），照抄角色那套会横着偏出半个车长。
+    norm->set_transform(Transform3D(b, Vector3(-c.x, -kbox.position.y, -c.z)));
+    norm->add_child(raw);
+    outer->add_child(norm);
+
+    if (p_parent != nullptr) {
+        p_parent->add_child(outer);
+        outer->set_visible(false);
+    } else {
+        UtilityFunctions::print(String::utf8("[veh] 警告：没有原型挂载点，模型资源会在退出时报泄漏"));
+    }
+
+    UtilityFunctions::print(String::utf8("[veh] 模型 "), String::utf8(p_type.c_str()),
+                            String::utf8(" 原始包围盒 "), box.size,
+                            String::utf8(" 校正后 "), kbox.size,
+                            String::utf8(" 缩放 "), k,
+                            String::utf8(" 对齐角 "), align_deg,
+                            String::utf8(" 总偏航 "), yaw_deg,
+                            String::utf8(" 目标车长 "), target_len);
+    s_veh_proto[p_type] = outer;
+    return outer;
+}
+
+Node3D *make_vehicle_node_by_key(const std::string &p_type, Node *p_proto_parent) {
+    Node3D *proto = load_vehicle_proto(p_type, p_proto_parent);
+    if (proto == nullptr) {
+        return nullptr;
+    }
+    Node *dup = proto->duplicate();
+    Node3D *n = Object::cast_to<Node3D>(dup);
+    if (n != nullptr) {
+        // 与角色那条路同一个坑：duplicate() 会把原型上的 visible=false 一起复制过来，
+        // 不显式打开的话整支车队在画面上集体消失。
+        n->set_visible(true);
+        return n;
+    }
+    if (dup != nullptr) {
+        dup->queue_free();
+    }
+    return nullptr;
+}
+
+Node3D *make_vehicle_node(const std::string &type, Node *p_proto_parent) {
+    if (Node3D *real = make_vehicle_node_by_key(type, p_proto_parent)) {
+        return real;
+    }
+    // 回退：程序化图元车（少一个模型文件不该让战场上少一辆车）。
+    // 这套图元同时是"真模型接坏了吗"的对照基准，所以**不要删**。
     Node3D *n = memnew(Node3D);
     const va::VehicleSpec *sp = va::vehicle_of(type);
     const float L = sp->len * S;

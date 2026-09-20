@@ -9,6 +9,14 @@
     两档的键名不同、任务 id 不同，混在一个目录里之后"这个 json 是哪批的"只能靠脑子记。
     键名一律带前缀（wpn_ / char_），所以就算目录合并也不会撞名 —— 分家是为了可读，不是防重名。
 
+【三档：载具（veh），2026-09-20 加】
+    载具：输入 assets/art/veh/<键>.png       → 成品 assets/art/veh/model/<键>.glb
+             中间产物 sweep/gen3d_veh/<键>.json
+    `--kind veh`。产物**不走 Godot 导入器**（与武器一样由 scene_builder 的
+    load_glb_root() 在运行期解析），所以不会像角色那样在 model/ 旁边冒出
+    "_texture_pbr_*.jpg"；.gitignore 里武器那条同理先摆着。
+    参考图来源见 ref/veh/SOURCES.md（Bing 图片搜索，非维基 —— 维基本轮整站不通）。
+
 【为什么要有这一层，而不是在 shell 里 for 循环】
 一次图生3D 是「提交 → 轮询 1~5 分钟 → 拿到 URL → 下载 42MB → 瘦身到 1.5MB」，
 四个环节各有各的失败方式（提交被限流、轮询超时、COS 链接断流、GLB 里 BIN 块没取到）。
@@ -79,6 +87,19 @@ PROFILES = {
         # 顺序 = scene_builder.cpp 里 all_wpn_keys() 的顺序，也是游戏里 V 键循环的顺序。
         # 1951 年志愿军制式：步枪 / 冲锋枪 / 轻机枪。
         "keys": ["wpn_mosin", "wpn_ppsh", "wpn_dp27"],
+    },
+    "veh": {
+        "label": "载具",
+        "src_dir": os.path.join(ROOT, "assets", "art", "veh"),
+        "model_dir": os.path.join(ROOT, "assets", "art", "veh", "model"),
+        "work": os.path.join(ROOT, "sweep", "gen3d_veh"),
+        # 顺序 = make_vehicle_node 的 type 字符串，也是 va_config.cpp 里
+        # vehicle_of() 认的四个键。1951 年朝鲜战场**美军**车队制式
+        # （敌方身份由角色立绘 char_enemy_rifle 钉死：M1 钢盔 + M1 加兰德 +
+        #  M1943 野战夹克），所以四辆车全部取美军型号：
+        #   吉普 → Willys MB / 装甲车 → M3 Half-track / 坦克 → M4A3E8 Sherman
+        #   / 卡车 → GMC CCKW
+        "keys": ["veh_jeep", "veh_apc", "veh_tank", "veh_truck"],
     },
 }
 
