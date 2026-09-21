@@ -1026,6 +1026,324 @@ Node3D *make_wpn_node(const std::string &p_key, Node *p_proto_parent, WpnNodeInf
     return norm;
 }
 
+// ---------------------------------------------- 第一人称手模（图生3D 产物）
+//
+// 参考图与生成方式：tools/gen3d_batch.py --kind vm → assets/art/vm/model/<键>.glb。
+// 接口与取舍见 scene_builder.h 那一节；这里只记**实测出来的那部分**。
+//
+// 【实测记录（2026-09-21，vm_hand_r）】
+//   原始包围盒 (0.723, 0.916, 0.416) —— **长轴在 Y**，不是 X。
+//   三视图判读（tools/glb_preview.py，图见 ref/vm/SOURCES.md）：
+//     XY 正视图：手**背**朝 +Z（看得到指节、拇指搭在食指上）
+//     ZY 侧视图：**腕在 −Y、指节在 +Y**
+//     XZ 俯视图：手指**卷曲轴 = X**、拇指在 −X
+//   即"一只右手、手背朝 +Z、手指指 +Y、拇指在左"。
+//   ⚠️ **"自然读法"不等于"拿在手里就自然"**：对轴（Y→−Z）只保证长轴躺平，
+//   剩下的滚转/翻面它一概不管。首版残余角给 0，渲染出来是"一大块肉"（腕口
+//   切面正对相机）。所以残余角是**解出来的**，不是 0，也不是扫出来的 ——
+//   见下面 kVmHandArt 的注释与 VA_VM_HAND_ROT。
+//
+// ⚠️ **不要假定"长轴在 X"**。武器那批恰好都在 X，人形也在 X，于是很容易顺手写成
+// "最长轴 = X"；载具那批已经用坦克（长轴在 Z）证明过这个假定的代价是静默放大 7 倍、
+// 一条错都不报。所以这里的对轴是**算了再转**，不是常量。
+//
+// ⚠️ **两个键共用一份模型时，左手必须镜像**。右拳模型直接套给左手，拇指会跑到
+// 手背的错侧 —— 而拇指是"这是哪只手"最省笔墨的判据。镜像用负缩放实现，
+// 同时把材质设成 CULL_DISABLED（负行列式会翻转三角形绕序，不关剔除会看穿手掌）。
+
+struct VmHandArtDef {
+    const char *key;
+    const char *label;
+    float       len_m;     // 手长（腕→指节，米）—— 归一化按它缩放
+    float       rot[3];    // 对轴之后**残余**的朝向校正（俯仰,偏航,侧倾，度）
+    float       place[3];  // 落位微调（米）
+    // 自己的 glb 缺失时借谁的模型（nullptr = 不借，直接回退程序化图元）。
+    // 借来的一律左右镜像 —— 见上面那条 ⚠️。真给左手生成了自己的模型之后
+    // 这个字段就自动失效（先查自己的文件），不必改代码。
+    const char *borrow;
+};
+
+// 【实测出来的那三档（2026-09-21，莫辛腰射，同种子同帧对照）】
+//   len_m = 0.115 m —— 扫过 0.185/0.145/0.135/0.115/0.095 后 0.115 最好。
+//     **不要用"腕→中指尖 18.5 cm"**：这个模型的长轴里含一截腕柱，按 18.5 cm
+//     归一化等于整只手放大 1.6 倍，画面上是一大块肉。0.115 恰好接近"腕横纹→
+//     指节"的真人口径（~0.10 m），也就是这个模型长轴的真实语义。
+//   rot = 4.1,20.2,48.5 —— 不是扫出来的，是**解出来的**：
+//     要求"腕端(模型 −Y)指向肘、手背(模型 +Z)指向相机"，联立解得欧拉角，
+//     回代误差 2.2e-16。另一组解 (−31.0,−20.7,39.6) 会让腕口切面正对相机
+//     （画面里出现一个大圆盘），已否掉。
+//   place = −0.016,0.015,0.007 —— 包围盒中心 ≠ 握拳中心（拳在长轴末端），
+//     实测沿长轴偏 ~0.08 m，靠这一项补回来。
+//   对照数据（同一掩码口径 |常规−藏|）：程序化手 VM 合计 5.76%、手套 1.59%(L=92)、
+//     枪身 3.28%(L=155)；真手模 5.81% / 2.46%(L=76) / 2.46%(L=133)。
+//     即**总占屏几乎不变** —— 真手是"盖住了一部分枪身"，不是额外糊上去一块。
+//     袖子两版逐位相同（0.89%、L=42），证明前臂那条链没被带动。
+static const VmHandArtDef kVmHandArt[] = {
+    { "vm_hand_r", "右手（扳机手）", 0.115f, { 4.1f, 20.2f, 48.5f }, { -0.016f, 0.015f, 0.007f }, nullptr },
+    { "vm_hand_l", "左手（支撑手）", 0.115f, { 4.1f, 20.2f, 48.5f }, { -0.016f, 0.015f, 0.007f }, "vm_hand_r" },
+};
+constexpr int kVmHandCount = (int)(sizeof(kVmHandArt) / sizeof(kVmHandArt[0]));
+
+const std::vector<std::string> &all_vm_hand_keys() {
+    static const std::vector<std::string> k = { "vm_hand_r", "vm_hand_l" };
+    return k;
+}
+
+static const VmHandArtDef *vm_hand_def(const std::string &p_key) {
+    for (int i = 0; i < kVmHandCount; ++i) {
+        if (p_key == kVmHandArt[i].key) return &kVmHandArt[i];
+    }
+    return nullptr;
+}
+
+const char *vm_hand_label(const std::string &p_key) {
+    const VmHandArtDef *d = vm_hand_def(p_key);
+    return (d != nullptr) ? d->label : "未知手模";
+}
+
+static std::map<std::string, Node3D *> s_vm_hand_raw;      // 键 -> 未归一化的原始场景根
+static std::map<std::string, bool>     s_vm_hand_borrowed; // 键 -> 这份是借来的吗
+static std::map<std::string, bool>     s_vm_hand_failed;
+
+// 把**最长的那一维**转到 −Z 的对轴基。
+// 只做坐标轴之间 90° 整数倍的旋转，所以结果仍是轴对齐的，不会把模型转出斜角。
+// 返回的基作用在"已经转过残余角"的模型上（见 make_vm_hand_node 的合成顺序）。
+static Basis vm_hand_align(const Vector3 &p_size) {
+    const float x = p_size.x, y = p_size.y, z = p_size.z;
+    const float PI2 = 1.57079632679489661923f;
+    if (y >= x && y >= z) return Basis(Vector3(1, 0, 0), -PI2);   // 长轴 Y -> −Z
+    if (x >= y && x >= z) return Basis(Vector3(0, 1, 0),  PI2);   // 长轴 X -> −Z
+    return Basis();                                              // 长轴已经在 Z
+}
+
+// 原始场景根：挂在 p_parent 下并隐藏（生命周期交给场景树）。
+// 与武器那条同构 —— 不进场景树的话，它持有的 mesh / material / 贴图会在进程退出时
+// 被 Godot 报成 "RID allocations ... leaked at exit" 的 ERROR，
+// 而"日志里有没有 ERROR"正是本工程的回归判据。
+//
+// 【借用链】自己的文件不存在时读 def->borrow 那份（左手借右手），并置 out_borrowed。
+// **先判存在再解析**，所以正常情况下不会为"左手还没生成"刷一条 ERROR 级噪声。
+static Node3D *load_vm_hand_raw(const std::string &p_key, Node *p_parent, bool &out_borrowed) {
+    out_borrowed = false;
+    {
+        auto it = s_vm_hand_raw.find(p_key);
+        if (it != s_vm_hand_raw.end()) {
+            out_borrowed = s_vm_hand_borrowed[p_key];
+            return it->second;
+        }
+    }
+    if (s_vm_hand_failed.count(p_key) != 0) return nullptr;
+
+    const VmHandArtDef *def = vm_hand_def(p_key);
+    String path = String("res://assets/art/vm/model/") +
+                  String::utf8(p_key.c_str()) + String(".glb");
+    Node3D *raw = nullptr;
+    if (FileAccess::file_exists(path)) {
+        raw = load_glb_root(path, "vm");
+    } else if (def != nullptr && def->borrow != nullptr) {
+        const String bp = String("res://assets/art/vm/model/") +
+                          String::utf8(def->borrow) + String(".glb");
+        raw = load_glb_root(bp, "vm");
+        out_borrowed = (raw != nullptr);
+        if (raw != nullptr) {
+            UtilityFunctions::print(String::utf8("[vm] 手模 "), String::utf8(p_key.c_str()),
+                                    String::utf8(" 没有自己的模型，借 "),
+                                    String::utf8(def->borrow), String::utf8(" 并左右镜像"));
+        }
+    }
+    // 不再自己打一条"缺手模文件"：load_glb_root 已经会把路径打出来，
+    // 两条对着同一件事报两遍（实测日志里就是连着两行），只会淹掉真正的信息。
+    if (raw == nullptr) {
+        s_vm_hand_failed[p_key] = true;
+        return nullptr;
+    }
+    if (p_parent != nullptr) {
+        p_parent->add_child(raw);
+        raw->set_visible(false);
+    } else {
+        UtilityFunctions::print(String::utf8("[vm] 警告：没有原型挂载点，手模资源会在退出时报泄漏"));
+    }
+    s_vm_hand_raw[p_key] = raw;
+    s_vm_hand_borrowed[p_key] = out_borrowed;
+    return raw;
+}
+
+// 逐键旋钮：VA_VM_HAND_<X>_ROT / _LEN / _PLACE，其中 <X> 取键名的**最后一个字母**
+// 的大写（vm_hand_r → VA_VM_HAND_R_ROT）。找不到键级变量时才回落到全局的
+// VA_VM_HAND_*（全局一次改两只，扫档用；键级用来分开微调）。
+//
+// 【为什么要有键级】两只手共用一份 .glb，但**落位的容错空间不是一回事**：模型是
+// "握拳 + 一截腕柱"，包围盒中心落在腕柱上，于是把中心对到握持点时，拳会被顺着
+// 长轴推出去一截。右手那边多出来的正好是拳、压在握把上；左手那边就是腕柱顶进
+// 护木里。2026-09-21 扫过 8 档（4 朝向 × 4 落位），结论是**这一版两只手用同一组
+// 值最好** —— 看着更"松"的那几档要么把腕口切面转正对相机（画面里出现一块平板），
+// 要么把支撑手拖到与扳机手重叠。所以键级旋钮留着当**重标定工具**：
+// 换手模、换枪的握持点之后，先全局扫一遍再单独校一只，不必改代码。
+static bool hand_env3(const std::string &p_key, const char *p_field, float p_out[3]) {
+    if (p_key.empty()) return false;
+    std::string n = "VA_VM_HAND_";
+    n += (char)std::toupper((unsigned char)p_key[p_key.size() - 1]);
+    n += "_";
+    n += p_field;
+    const char *e = std::getenv(n.c_str());
+    if (e == nullptr) return false;
+    return std::sscanf(e, "%f,%f,%f", &p_out[0], &p_out[1], &p_out[2]) == 3;
+}
+
+static bool hand_env1(const std::string &p_key, const char *p_field, float &p_out) {
+    if (p_key.empty()) return false;
+    std::string n = "VA_VM_HAND_";
+    n += (char)std::toupper((unsigned char)p_key[p_key.size() - 1]);
+    n += "_";
+    n += p_field;
+    const char *e = std::getenv(n.c_str());
+    if (e == nullptr) return false;
+    const float f = (float)std::strtod(e, nullptr);
+    if (!(f > 0.02f && f < 1.0f)) return false;
+    p_out = f;
+    return true;
+}
+
+Node3D *make_vm_hand_node(const std::string &p_key, Node *p_proto_parent, VmHandNodeInfo &out) {
+    bool borrowed = false;
+    Node3D *raw = load_vm_hand_raw(p_key, p_proto_parent, borrowed);
+    if (raw == nullptr) return nullptr;
+
+    // 做成实例：原始根是隐藏的、且被缓存复用；直接拿去摆会连原型一起动。
+    Node *dup = raw->duplicate();
+    Node3D *inst = Object::cast_to<Node3D>(dup);
+    if (inst == nullptr) {
+        if (dup != nullptr) dup->queue_free();
+        return nullptr;
+    }
+    // **必须显式打开可见性**：duplicate() 会把原型上的 visible=false 一起复制过来
+    // （原型是隐藏的，它挂在场景里纯粹为了不报 RID 泄漏）。武器那条踩过同一个坑。
+    inst->set_visible(true);
+
+    // 0) 量**旋转之前**的包围盒，用来定"哪一维是长轴"。
+    AABB raw_box;
+    bool has = false;
+    collect_aabb(inst, Transform3D(), raw_box, has);
+    if (!has || raw_box.size.length() <= 1e-6f) {
+        UtilityFunctions::print(String::utf8("[vm] 手模没有网格 "), String::utf8(p_key.c_str()));
+        inst->queue_free();
+        return nullptr;
+    }
+    const float raw_long = std::max(raw_box.size.x, std::max(raw_box.size.y, raw_box.size.z));
+
+    // 黄牌：最长轴与次长轴几乎相等 → 对轴是"抛硬币"，朝向可能整体差 90°。
+    // 载具那批的教训：轴向错了不会报错，只会静默地把模型转错方向。
+    {
+        float a = raw_box.size.x, b = raw_box.size.y, c = raw_box.size.z;
+        if (a > b) { const float t = a; a = b; b = t; }
+        if (b > c) { const float t = b; b = c; c = t; }
+        if (a > b) { const float t = a; a = b; b = t; }
+        // 现在 a <= b <= c：c 最长、b 次长
+        if (b > c * 0.97f) {
+            UtilityFunctions::print(String::utf8("!! 手模 "), String::utf8(p_key.c_str()),
+                                    String::utf8(" 的长轴与次长轴几乎相等（原始包围盒 "), raw_box.size,
+                                    String::utf8("）—— 自动对轴在抛硬币，朝向可能整体差 90°。"
+                                                 "请用 VA_VM_HAND_ROT 现场校，别直接采信。"));
+        }
+    }
+
+    // 1) 朝向 = 残余角 × 对轴。**合成顺序**：先转残余角（在模型自己的坐标系里），
+    //    再做对轴。于是对轴永远是"把最长的那一维送到 −Z"，而残余角负责
+    //    "手背朝哪边、拇指在哪侧"这类几何上定不了的事。
+    const VmHandArtDef *def = vm_hand_def(p_key);
+    Vector3 euler(0.0f, 0.0f, 0.0f);
+    if (def != nullptr) euler = Vector3(def->rot[0], def->rot[1], def->rot[2]);
+    // VA_VM_HAND_ROT="俯仰,偏航,侧倾"（度）：覆盖残余角。**注意它是在模型自己的
+    // 坐标系里给的**，所以 "0,90,0" 读作"把这只手绕它自己的 Y 轴转 90°"。
+    // 键级 VA_VM_HAND_R_ROT / VA_VM_HAND_L_ROT 优先（见 hand_env3 的说明）。
+    {
+        float v[3];
+        if (hand_env3(p_key, "ROT", v)) {
+            euler = Vector3(v[0], v[1], v[2]);
+        } else if (const char *e = std::getenv("VA_VM_HAND_ROT")) {
+            float a = 0.0f, b = 0.0f, c = 0.0f;
+            if (std::sscanf(e, "%f,%f,%f", &a, &b, &c) == 3) euler = Vector3(a, b, c);
+        }
+    }
+    const float D2R = 3.14159265358979323846f / 180.0f;
+    inst->set_transform(Transform3D(Basis::from_euler(euler * D2R) * vm_hand_align(raw_box.size),
+                                    Vector3()));
+
+    Node3D *norm = memnew(Node3D);
+    norm->add_child(inst);
+
+    // 2) 量旋转之后的包围盒（此时 norm 还是单位变换），据此定缩放与落位。
+    AABB box;
+    bool has2 = false;
+    collect_aabb(norm, Transform3D(), box, has2);
+    if (!has2 || box.size.z <= 1e-6f) {
+        UtilityFunctions::print(String::utf8("[vm] 手模在 Z 轴上没有厚度，对轴可能给错了 "),
+                                String::utf8(p_key.c_str()), String::utf8(" 对轴后尺寸 "), box.size);
+        norm->queue_free();
+        return nullptr;
+    }
+
+    // 3) 手长：默认取真人口径，VA_VM_HAND_LEN 可整体覆盖（排查"手太大/太小"用）。
+    float len_m = (def != nullptr) ? def->len_m : 0.185f;
+    if (!hand_env1(p_key, "LEN", len_m)) {
+        if (const char *e = std::getenv("VA_VM_HAND_LEN")) {
+            const float f = (float)std::strtod(e, nullptr);
+            if (f > 0.02f && f < 1.0f) len_m = f;
+        }
+    }
+    // 用**旋转之前**的长边算缩放，与武器那条同一个理由：一旦朝向给错，
+    // 旋转后的"最长边"会变成手的厚度，缩放跟着一起飞。对轴是算出来的，
+    // 所以这两个量在正常情况下只差数值噪声。
+    const float k = len_m / std::max(raw_long, 1e-6f);
+
+    Vector3 place;
+    if (def != nullptr) place = Vector3(def->place[0], def->place[1], def->place[2]);
+    {
+        float v[3];
+        if (hand_env3(p_key, "PLACE", v)) {
+            place = Vector3(v[0], v[1], v[2]);
+        } else if (const char *e = std::getenv("VA_VM_HAND_PLACE")) {
+            float a = 0.0f, b = 0.0f, c = 0.0f;
+            if (std::sscanf(e, "%f,%f,%f", &a, &b, &c) == 3) place = Vector3(a, b, c);
+        }
+    }
+
+    // 4) 落位：把包围盒中心搬到原点（再按 place 微调）。
+    //    【为什么是按包围盒居中，而不是"把手腕对到原点"】手腕那一点在模型里
+    //    没有可靠标记，而包围盒是量出来的。而 ViewModel 那边对前臂的处理本来就
+    //    允许有偏差：前臂从 `掌心 + WRIST_*_OFF` 起笔，真手比程序化手大 3.4 倍，
+    //    起笔点必然落在手掌实体**内部** —— 那正好，前臂从拳头里长出来，
+    //    不会露出接缝。所以这里只要"手掌中心 ≈ 原点"就够了。
+    //
+    //    ⚠️ place 是**在引擎系里加的**（见 scene_builder.h 的坐标系说明），
+    //    所以它要按"校准之后想让手往哪挪"来给，而不是按模型自己的轴。
+    //    VA_VM_HAND_NOMIRROR=1 借来的模型**不做镜像**（A/B 用：判定"左右手
+    //    亮度不一样"到底是镜像翻了法线，还是那只手本来就更背光）。
+    bool mirror = borrowed;
+    if (mirror && std::getenv("VA_VM_HAND_NOMIRROR") != nullptr) mirror = false;
+    const float mx = mirror ? -k : k;
+    const Vector3 c = box.get_center();
+    Basis sb;
+    sb.scale(Vector3(mx, k, k));
+    norm->set_transform(Transform3D(sb, Vector3(-mx * c.x + place.x,
+                                                -k * c.y + place.y,
+                                                -k * c.z + place.z)));
+
+    out.length = raw_long * k;
+    out.scale = k;
+    out.raw_size = raw_box.size;
+    out.mirrored = mirror;
+
+    UtilityFunctions::print(String::utf8("[vm] 手模 "), String::utf8(p_key.c_str()),
+                            " ", String::utf8(vm_hand_label(p_key)),
+                            String::utf8(" 原始包围盒 "), raw_box.size,
+                            String::utf8(" 对轴后 "), box.size,
+                            String::utf8(" 缩放 "), k,
+                            String::utf8(" 手长 "), out.length,
+                            String::utf8(" 镜像 "), String::utf8(mirror ? "是" : "否"));
+    return norm;
+}
+
 Transform3D unit_transform(float p_x, float p_y, float p_facing, bool p_downed) {
     // 模型前方 = +X（与逻辑层一致），绕 Y 旋转角 = -facing；
     // 倒地再叠一个绕 Z 的 84° 侧翻。

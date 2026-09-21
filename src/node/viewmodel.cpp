@@ -334,6 +334,80 @@ bool hands_enabled() {
     return s;
 }
 
+// ---- 真手模（图生3D 产物）----
+//
+// VA_VM_HAND_ART=0 关掉真手模、回到程序化图元（消融对照用）。**默认开**。
+// 语义与 VA_VM_HANDS 一致：只有显式 "0" 才算关（本工程统一约定）。
+//
+// 【为什么要两个开关，而不是一个】它们回答的是**两个不同的问题**：
+//   VA_VM_HANDS     → "这双手画不画"（玩家有没有手）
+//   VA_VM_HAND_ART  → "手是程序化图元还是真模型"（真模型到底改了什么）
+// 合成一个开关之后，"手不见了"这个症状就有两种成因且分不开 ——
+// 而本工程对归属类问题的口径是"一次消融只动一个变量"。
+//
+// 回退链与枪模/载具/角色同构：**真模型 → 程序化图元**。
+// 少一个 .glb 不该让玩家手里没手。
+bool hand_art_enabled() {
+    static const bool s = [] {
+        const char *e = std::getenv("VA_VM_HAND_ART");
+        return !(e != nullptr && e[0] == '0' && e[1] == '\0');
+    }();
+    return s;
+}
+
+// ---- 真手模的材质旋钮（只读一次）----
+//
+// ⚠️ **与上面那三个武器旋钮的单位不一样，别混**：
+//   VA_VM_ART_ALB   是**线性空间的标量乘数**（默认 0.42）—— 它是标定出来的补偿量；
+//   VA_VM_HAND_TINT 是**sRGB 的色相**（默认 0.50,0.42,0.36）—— 它是一项美术选择。
+// 不统一的理由：枪那边只需要"整体压暗"，一个标量就够；手这边要的是
+// "把皮肤改成皮革色"，必须按通道给、而且应当按人眼习惯的 sRGB 给。
+// 混用的后果是标定值不可移植（同一串数字在两个旋钮上差 2 倍多）。
+//
+// 【为什么手只乘色调、不像枪那样压成一个灰】参考图是**空手握拳**的实拍
+// （取图与选图口径见 ref/vm/SOURCES.md），贴图上带着指节褶皱、掌纹、指缝阴影 ——
+// 这些细节是"这是一只手而不是一块肉色几何体"的**全部**信息来源。
+// 枪那边把 albedo 压成标量是为了消过曝，代价是丢掉贴图细节；
+// 手不能付这个代价，所以改成乘一个色相：既把皮肤改成皮革色、又原样留住细节。
+//
+// 默认值不是拍的，是照"与现有程序化手套同档"反推的起点：
+//   参考图皮肤 ≈ sRGB(0.90,0.71,0.63)；程序化手套的 albedo 是 (0.540,0.410,0.173)。
+//   按通道相除得 ≈ (0.60,0.58,0.27) —— 蓝要压得比红绿狠得多，因为手套是**皮革**，
+//   而皮肤在蓝通道上高出一大截。这里先取往红绿再收一点的起点，
+//   实际定档用 tools/vm_hand_probe.py 扫（口径见该工具的文件头）。
+//   目标读数：手套那一行的中位亮度落在现有程序化手套附近（L96 RGB(119,90,83)）。
+Vector3 hand_tint() {
+    static const Vector3 s = [] {
+        const char *e = std::getenv("VA_VM_HAND_TINT");
+        float a = 0.50f, b = 0.42f, c = 0.36f;
+        if (e != nullptr && *e != '\0') std::sscanf(e, "%f,%f,%f", &a, &b, &c);
+        return Vector3(va::clampf(a, 0.02f, 2.0f), va::clampf(b, 0.02f, 2.0f),
+                       va::clampf(c, 0.02f, 2.0f));
+    }();
+    return s;
+}
+
+float hand_metal() {
+    static const float s = [] {
+        const char *e = std::getenv("VA_VM_HAND_METAL");
+        const float v = (e != nullptr && *e != '\0') ? (float)std::strtod(e, nullptr) : 0.0f;
+        return (v >= 0.0f && v <= 1.0f) ? v : 0.0f;
+    }();
+    return s;
+}
+
+// 默认 0.88：皮革手套是哑光的，和程序化手套那档（0.92）同量级。
+// 别往低里调去"救"它 —— 低粗糙度会在指节这种小而圆的面上打出一堆亮点，
+// 读出来是"塑料手"。要提亮应该走 VA_VM_HAND_TINT。
+float hand_rough() {
+    static const float s = [] {
+        const char *e = std::getenv("VA_VM_HAND_ROUGH");
+        const float v = (e != nullptr && *e != '\0') ? (float)std::strtod(e, nullptr) : 0.88f;
+        return (v > 0.0f && v <= 1.0f) ? v : 0.88f;
+    }();
+    return s;
+}
+
 // ---- 枪口焰的时长 ----
 //
 // 时长默认 0.045 秒（约等于真枪的两次曝光，视觉上就是"一闪"）。
@@ -359,72 +433,151 @@ void vm_layer(MeshInstance3D *mi) {
     mi->set_cast_shadows_setting(GeometryInstance3D::SHADOW_CASTING_SETTING_OFF);
 }
 
-// 把整棵子树挪到枪模专用渲染层，并关掉阴影接收。
+// ---- 真模型材质的"配方" ----
+// 光照隔离 + 材质标定这套道理，枪与手**完全一样**（同一盏灯、同一个层、
+// 同样要躲开阴影条纹、同样要覆盖图生3D 给的 PBR 默认值），差别只在三个参数
+// 与日志标签。所以走同一个函数、只换配方 —— 分成两份实现的话，
+// 下次给第三个部件（比如刺刀、弹匣）接真模型时一定会漏掉其中一处。
+struct VmMatCfg {
+    const char *tag;       // 日志标签（同时也是报告去重的键）
+    Color       tint;      // albedo 乘数（**线性空间**，直接乘在贴图上）
+    float       metal;
+    float       rough;
+    // 关背面剔除。⚠️ 负缩放（左右镜像）的子树**必须**开这个：
+    // 负行列式会翻转三角形绕序，Godot 不会自动纠正，不关的话手掌会被
+    // 剔成"半透明"、直接看穿到内壁。
+    bool        cull_off;
+    // 清掉生成器给的 roughness / metallic **贴图**，让上面那两个标量说了算。
+    //
+    // 【为什么必须清】Godot 的 `set_roughness()` 是**乘数**，不是赋值：
+    // 模型自带 roughness 贴图时，最终 roughness = 标量 × 贴图。图生3D 给的是
+    // 给离线渲染器看的 PBR，贴图里大量区域接近 0，于是标量写 0.88 也照样出来
+    // 一层镜面高光 —— 实测手模渲染成"抛光皮手套 / 乳胶"，症状与"标量太小"
+    // 一模一样，但调标量永远调不好（0.88 → 1.0 几乎没变）。
+    // 枪那边不开这个：它的三个参数是在**带贴图**的前提下逐档扫出来的，
+    // 中途改口径会让那套标定数字全部作废。
+    bool        clear_pbr_maps;
+};
+
+// 把整棵子树挪到第一人称专用渲染层、关阴影接收、按配方改写材质。
 //
-// 【为什么必须做这一步】真模型自带 MeshInstance3D，默认落在 layer 1。
-// 而本文件照枪的那五盏平行光 cull_mask 只到 VM_LAYER —— 留在默认层的话
-// 它们照不到枪，世界光却照得到：玩家一转身背对太阳，手里的枪就塌成黑剪影，
-// 正是下面"光照隔离"那一段要避免的现象。角色模型不需要这一步，
+// 【为什么必须做第一步】真模型自带 MeshInstance3D，默认落在 layer 1。
+// 而本文件照第一人称模型的五盏平行光 cull_mask 只到 VM_LAYER —— 留在默认层
+// 的话它们照不到，世界光却照得到：玩家一转身背对太阳，手里的枪与手就塌成
+// 黑剪影，正是文件头"光照隔离"那一段要避免的现象。角色模型不需要这一步，
 // 因为角色本来就该被世界光照亮。
 //
-// 材质是**共享**的（duplicate 不会深拷贝 Mesh），所以这里改的是被缓存的那一份 ——
-// 无所谓：武器模型只有视图模型在用。
+// 【材质是共享的】duplicate 不会深拷贝 Mesh / 材质，所以这里改的是被缓存的
+// 那一份 —— 无所谓：第一人称的模型只有视图模型在用。
 //
 // 【为什么还要改材质本身】真模型带的是图生3D 给的 PBR 材质，直接上会踩三个坑
-// （每个坑对应上面一个旋钮，实测数据写在旋钮的注释里）：
-//   1) **过曝**：照枪的那五盏平行光，能量是按程序化枪模那套**很深的** albedo
-//      （0.17 sRGB）扫描标定的（VA_VMK 定在 3.8）。真模型的贴图是正常的枪械色、
-//      亮得多，同一套灯照上去就整片顶到纯白 —— 实测莫辛的枪管与机匣是纯白，
-//      木质枪托反而正常（因为木色偏深）。
+// （每个坑对应配方里一个参数，实测数据写在各自旋钮的注释里）：
+//   1) **过曝**：那五盏灯的色相与能量是按**程序化**模型的 albedo 标定出来的，
+//      真模型贴图亮得多，同一套灯照上去就整片顶到纯白。
 //   2) metallic 高：缺反射探针时镜面路径采不到环境，只剩黑。
 //      本文件里程序化枪身那段注释记过同一个实测（metallic 0.78 的导轨显示
 //      RGB(0,1,10)，整条直接消失）。
-//   3) roughness 1.0：高光被完全摊平，圆柱面（枪管、弹鼓、圆盘弹匣）
+//   3) roughness 1.0：高光被完全摊平，圆柱面（枪管、弹鼓、指节）
 //      退化成没有体积感的塑料片。
-// 处理办法是把这三个参数按枪模那套标定改写，而不是去改灯：
-// 改灯会连带把手里那两块程序化前臂（同一套灯）一起变暗。
-void adopt_gun_subtree(Node *p_node) {
+// 处理办法是改写这三个参数，而不是去改灯：改灯会连带把**另一类**部件一起变暗
+// （灯是枪与手共用的），而外观切换只该影响它自己。
+//
+// p_reported 由调用方持有（每份配方一个），用来"只打一次原始参数" ——
+// 这是标定的依据，看过一眼就够，每次加载都刷会淹掉别的日志。
+//
+// p_id_override 非空时（VA_VM_MAT=1）整块换成识别色：走 material_override
+// 而不是改材质本体，因为本体是共享的、改了等于连原型一起改。
+void adopt_vm_subtree(Node *p_node, const VmMatCfg &p_cfg, bool &p_reported,
+                      const Ref<Material> &p_id_override) {
     MeshInstance3D *mi = Object::cast_to<MeshInstance3D>(p_node);
     if (mi != nullptr) {
         vm_layer(mi);
-        Ref<Mesh> mesh = mi->get_mesh();
-        if (mesh.is_valid()) {
-            const int ns = mesh->get_surface_count();
-            for (int i = 0; i < ns; ++i) {
-                StandardMaterial3D *sm =
-                    Object::cast_to<StandardMaterial3D>(mesh->surface_get_material(i).ptr());
-                if (sm == nullptr) continue;
-                // 枪离相机只有几十厘米，阴影贴图的精度远远不够，
-                // 蹭上一点就是一道跟着视角爬的条纹，比没有阴影难看得多。
-                sm->set_flag(BaseMaterial3D::FLAG_DONT_RECEIVE_SHADOWS, true);
+        if (p_id_override.is_valid()) {
+            mi->set_material_override(p_id_override);
+        } else {
+            Ref<Mesh> mesh = mi->get_mesh();
+            if (mesh.is_valid()) {
+                const int ns = mesh->get_surface_count();
+                for (int i = 0; i < ns; ++i) {
+                    StandardMaterial3D *sm =
+                        Object::cast_to<StandardMaterial3D>(mesh->surface_get_material(i).ptr());
+                    if (sm == nullptr) continue;
+                    // 模型离相机只有几十厘米，阴影贴图的精度远远不够，
+                    // 蹭上一点就是一道跟着视角爬的条纹，比没有阴影难看得多。
+                    sm->set_flag(BaseMaterial3D::FLAG_DONT_RECEIVE_SHADOWS, true);
+                    if (p_cfg.cull_off) sm->set_cull_mode(BaseMaterial3D::CULL_DISABLED);
 
-                // 只打一次原始参数：这是标定 albedo 系数的依据，
-                // 而"看过一眼就不需要再看"—— 每次加载都刷一遍会淹掉别的日志。
-                static bool s_reported = false;
-                if (!s_reported && art_report_enabled()) {
-                    s_reported = true;
-                    UtilityFunctions::print(String::utf8("[vm] 真模型材质 #"), i,
-                                            String::utf8(" albedo="), sm->get_albedo(),
-                                            String::utf8(" metallic="), sm->get_metallic(),
-                                            String::utf8(" roughness="), sm->get_roughness(),
-                                            String::utf8(" 有贴图="), sm->get_texture(BaseMaterial3D::TEXTURE_ALBEDO).is_valid());
+                    if (!p_reported && art_report_enabled()) {
+                        p_reported = true;
+                        UtilityFunctions::print(String::utf8(p_cfg.tag), String::utf8(" #"), i,
+                                                String::utf8(" albedo="), sm->get_albedo(),
+                                                String::utf8(" metallic="), sm->get_metallic(),
+                                                String::utf8(" roughness="), sm->get_roughness(),
+                                                String::utf8(" 贴图 反照="),
+                                                sm->get_texture(BaseMaterial3D::TEXTURE_ALBEDO).is_valid(),
+                                                String::utf8(" 粗糙="),
+                                                sm->get_texture(BaseMaterial3D::TEXTURE_ROUGHNESS).is_valid(),
+                                                String::utf8(" 金属="),
+                                                sm->get_texture(BaseMaterial3D::TEXTURE_METALLIC).is_valid(),
+                                                String::utf8(" 法线="),
+                                                sm->get_texture(BaseMaterial3D::TEXTURE_NORMAL).is_valid());
+                    }
+
+                    if (p_cfg.clear_pbr_maps) {
+                        sm->set_texture(BaseMaterial3D::TEXTURE_ROUGHNESS, Ref<Texture2D>());
+                        sm->set_texture(BaseMaterial3D::TEXTURE_METALLIC, Ref<Texture2D>());
+                    }
+
+                    // 三个参数**恒定覆盖**，不做条件判断：原始参数是图生3D
+                    // 给离线渲染器的（1.0 / 1.0），留哪一项都会留一个坑。
+                    // alpha 钉 1.0 —— 透明度没开，但带着小于 1 的 alpha
+                    // 会让下一次读参数时误判。
+                    sm->set_albedo(Color(p_cfg.tint.r, p_cfg.tint.g, p_cfg.tint.b, 1.0f));
+                    sm->set_metallic(p_cfg.metal);
+                    sm->set_roughness(p_cfg.rough);
                 }
-
-                // 三个旋钮**恒定覆盖**，不再做条件判断：
-                // 原始参数是图生3D 给离线渲染器的（1.0 / 1.0），
-                // 留哪一项都会留一个坑。alpha 钉 1.0 —— 透明度没开，
-                // 但带着小于 1 的 alpha 会让下一次读参数时误判。
-                const float a = art_albedo_scale();
-                sm->set_albedo(Color(a, a, a, 1.0f));
-                sm->set_metallic(art_metal());
-                sm->set_roughness(art_roughness());
             }
         }
     }
     const int nc = p_node->get_child_count();
     for (int i = 0; i < nc; ++i) {
-        adopt_gun_subtree(p_node->get_child(i));
+        adopt_vm_subtree(p_node->get_child(i), p_cfg, p_reported, p_id_override);
     }
+}
+
+// 枪模那份配方（值 = 上面三个武器旋钮；标定过程写在它们的注释里）。
+void adopt_gun_subtree(Node *p_node) {
+    static bool s_reported = false;
+    VmMatCfg cfg;
+    cfg.tag = "[vm] 真模型材质";
+    const float a = art_albedo_scale();
+    cfg.tint = Color(a, a, a, 1.0f);
+    cfg.metal = art_metal();
+    cfg.rough = art_roughness();
+    cfg.cull_off = false;
+    cfg.clear_pbr_maps = false;   // 枪的三个参数是"带贴图"扫出来的，别改口径
+    adopt_vm_subtree(p_node, cfg, s_reported, Ref<Material>());
+}
+
+// 手模那份配方。
+void adopt_hand_subtree(Node *p_node, bool p_dbg_mat) {
+    static bool s_reported = false;
+    VmMatCfg cfg;
+    cfg.tag = "[vm] 手模材质";
+    const Vector3 t = hand_tint();
+    // 手这边按 sRGB 给色相（见 hand_tint 的注释：单位与 VA_VM_ART_ALB 不同）。
+    cfg.tint = SRGB(t.x, t.y, t.z);
+    cfg.metal = hand_metal();
+    cfg.rough = hand_rough();
+    cfg.cull_off = true;          // 左手是负缩放镜像来的，必须关剔除
+    cfg.clear_pbr_maps = true;    // 见 VmMatCfg::clear_pbr_maps
+    // VA_VM_MAT=1 时手也要变成"手套绿"：tools/vm_hand_probe.py 是按
+    // "绿=手 / 蓝=袖 / 红=枪"分类像素的，不给真手模一个识别色，
+    // 那套口径会把整只手算进"枪身"那一行 —— 于是"手有多大、多亮"
+    // 两个数一起失真，而且失真的方向恰好是"让人以为手没问题"。
+    Ref<Material> idov;
+    if (p_dbg_mat) idov = id_mat(Color(0, 1, 0));
+    adopt_vm_subtree(p_node, cfg, s_reported, idov);
 }
 
 MeshInstance3D *part(Node3D *parent, const Ref<Mesh> &mesh, const Vector3 &pos,
@@ -581,8 +734,20 @@ void ViewModel::place_arms() {
     if (hands == nullptr) return;
     const float rw = env_f_clamped("VA_VM_ARM_W", ARM_R_WRIST, 0.008f, 0.080f);
     const float re = env_f_clamped("VA_VM_ARM_E", ARM_R_ELBOW, 0.008f, 0.090f);
-    const Vector3 wr = cur_hand_r + WRIST_R_OFF;
-    const Vector3 wl = cur_hand_l + WRIST_L_OFF;
+    // 双手的"姿态让位"（开镜时按 ads 让开照门，见 update() 里那一段）：
+    // **手掌与腕端必须带同一个位移**。只让手不让腕，腕口圆柱与手掌之间会裂开一个断口，
+    // 而开镜时那个断口正对着相机（画面中央），比手挡照门还难看。
+    const Vector3 off = hand_pose_off;
+    if (hand_r != nullptr) {
+        hand_r->set_position(cur_hand_r - HAND_R_BASE + off);
+        hand_r->set_scale(Vector3(hand_pose_scale, hand_pose_scale, hand_pose_scale));
+    }
+    if (hand_l != nullptr) {
+        hand_l->set_position(cur_hand_l - HAND_L_BASE + off);
+        hand_l->set_scale(Vector3(hand_pose_scale, hand_pose_scale, hand_pose_scale));
+    }
+    const Vector3 wr = cur_hand_r + WRIST_R_OFF + off;
+    const Vector3 wl = cur_hand_l + WRIST_L_OFF + off;
     set_forearm(fore_r, wr, ELBOW_R, rw, re);
     set_forearm(fore_l, wl, ELBOW_L, rw, re);
     set_cuff(cuff_r, wr, ELBOW_R, rw * CUFF_R_MUL);
@@ -613,6 +778,9 @@ void ViewModel::build(Camera3D *p_cam, Node *p_proto_parent) {
     // 0.27 是"托底退到画面下缘之外、枪身仍占满中央"的那一档；0.34 时枪身细成一条。
     // 注意改它**不影响开镜对准** —— 落点是由照门反推的，拉开距离只是等比缩小。
     aim_dist = env_f_clamped("VA_VM_AIMDIST", 0.270f, 0.060f, 0.600f);
+    // 开镜时双手的让位量（见 update() 里那一段）：缩小比例 + 位移。
+    hand_ads_shrink = env_f_clamped("VA_VM_ADS_HSHRINK", hand_ads_shrink, 0.0f, 0.85f);
+    env_vec3("VA_VM_ADS_HOFF", hand_ads_off);
 
     // 开镜视场由基础视场推导 —— 改世界 FOV 时枪的放大倍率自动跟随。
     fov_base = p_cam->get_fov();
@@ -855,11 +1023,21 @@ void ViewModel::build(Camera3D *p_cam, Node *p_proto_parent) {
     //   · 左手托护木时，近侧看到的是**手掌压在管子下面 + 手指从管子顶上扣过来**
     //     → 掌放高一点（够到管顶），再放三条横跨管顶的指头。
     // 拇指一律放在近侧，它是"这里有一只手"最省笔墨的信号。
-    // ---- 右手：握住握把，手背朝相机 ----
-    // ⚠️ 掌那块**本体**不能省。上一版改这一节时把它删掉了（只剩指节+腕+拇指），
-    // 结果画面上是一串**互相飘开**的棕方块 —— 指节本来是"贴在掌的棱上"的，
-    // 掌没了，它们就失去了参照物。这类"看起来像散件"的症状，先查主体在不在。
     // ---- 右手：攥住握把，手背朝相机（近侧看到的是手背那一坨 + 拇指） ----
+    //
+    // 【回退链】真模型优先，拿不到就退回下面的程序化图元。
+    // 程序化那套**必须留着**：少一个 .glb 不该让玩家手里没手，
+    // 而且它是"真模型接坏了吗"的对照基准（VA_VM_HAND_ART=0 现场切）。
+    // 与枪模那条回退链、载具那条、角色那条是同一个理由。
+    VmHandNodeInfo hri;
+    Node3D *hr_art = nullptr;
+    if (hand_art_enabled()) {
+        hr_art = make_vm_hand_node("vm_hand_r", proto_parent, hri);
+        if (hr_art != nullptr) {
+            adopt_hand_subtree(hr_art, dbg_mat);
+            hand_r->add_child(hr_art);
+        }
+    }
     // ⚠️ 掌那块**本体**不能省。上一版改这一节时把它删掉了（只剩指节+腕+拇指），
     // 结果画面上是一串**互相飘开**的棕方块 —— 指节本来是"贴在掌的棱上"的，
     // 掌没了，它们就失去了参照物。这类"看起来像散件"的症状，先查主体在不在。
@@ -872,29 +1050,28 @@ void ViewModel::build(Camera3D *p_cam, Node *p_proto_parent) {
     // 所以改成：胶囊绕 Z 倒 70°（几乎水平）、沿 y 以 1.7 cm 叠四道，
     // 并且**整列都收进掌的轮廓里**（掌半高抬到 0.042）—— 这样既不会露出
     // 悬空的指节，四个指尖还会从掌的远侧探出去一点，读成"手指绕过去了"。
-    ball(hand_r, Vector3(0.026f, 0.042f, 0.036f),                                                // 右手背
-         HAND_R_BASE + Vector3(-0.006f, 0.000f, 0.000f), Vector3(10, 0, 6), glove);
-    for (int i = 0; i < 4; ++i) {
-        cigar(hand_r, 0.0092f, 0.046f,
-              HAND_R_BASE + Vector3(0.002f, 0.016f - (float)i * 0.0170f, -0.026f),
-              Vector3(0, 0, -70.0f + (float)i * 5.0f), glove);
+    if (hr_art == nullptr) {
+        ball(hand_r, Vector3(0.026f, 0.042f, 0.036f),                                            // 右手背
+             HAND_R_BASE + Vector3(-0.006f, 0.000f, 0.000f), Vector3(10, 0, 6), glove);
+        for (int i = 0; i < 4; ++i) {
+            cigar(hand_r, 0.0092f, 0.046f,
+                  HAND_R_BASE + Vector3(0.002f, 0.016f - (float)i * 0.0170f, -0.026f),
+                  Vector3(0, 0, -70.0f + (float)i * 5.0f), glove);
+        }
+        ball(hand_r, Vector3(0.022f, 0.024f, 0.020f),                                            // 右手腕
+             HAND_R_BASE + Vector3(0.002f, -0.010f, 0.038f), Vector3(10, 0, 0), glove);
+        // 拇指从手背上沿往前指（真人握枪时拇指是搭在握把上侧的），
+        // 镜位在手背近侧，所以它要**贴着手背的左缘**再往外鼓一点才看得见。
+        cigar(hand_r, 0.0105f, 0.044f,                                                           // 右手拇指
+              HAND_R_BASE + Vector3(-0.030f, 0.023f, -0.025f), Vector3(-55, 0, -20), glove);
     }
-    ball(hand_r, Vector3(0.022f, 0.024f, 0.020f),                                                // 右手腕
-         HAND_R_BASE + Vector3(0.002f, -0.010f, 0.038f), Vector3(10, 0, 0), glove);
-    // 拇指从手背上沿往前指（真人握枪时拇指是搭在握把上侧的），
-    // 镜位在手背近侧，所以它要**贴着手背的左缘**再往外鼓一点才看得见。
-    cigar(hand_r, 0.0105f, 0.044f,                                                               // 右手拇指
-          HAND_R_BASE + Vector3(-0.030f, 0.023f, -0.025f), Vector3(-55, 0, -20), glove);
 
-    // ---- 左手：托在护木下，四指从管子顶上扣过来 ----
-    //
-    // ⚠️ 掌**必须压在木头下面**。掌心 y 的口径是"木头下缘 + 0.022"，
-    // 掌若做得太高，掌顶就盖到护木上面去 —— 画面上读出来是"一只手从两侧
-    // 夹住枪管"，不像托。半轴 0.030 之后掌顶刚好落在木头腰部，上面留给四指。
-    //
-    // 四指沿 **X** 横跨在护木上方（不是沿 z 排成一列）：手托护木时手指是
-    // 从近侧绕到管顶、**横着**搭过去的，四根指的走向与枪管垂直。
     // ---- 左手：从**左侧**托住护木，手背朝相机、四指从木头顶上扣过去 ----
+    //
+    // 【回退链同右手】真模型优先 → 程序化图元。
+    // 左手这份的特殊之处：**自己的 glb 可以不存在**，此时会自动借右手那份
+    // 并左右镜像（见 scene_builder.cpp 的 kVmHandArt.borrow）。
+    // 镜像用负缩放实现 —— 所以手模材质一律关了背面剔除，理由见 adopt_hand_subtree。
     //
     // 【这一节是 2026-09-19 重做的，症状是"四根竖着的香肠"】
     // 上一版是一块埋在木头里的掌 + 四根**竖直**胶囊。竖直胶囊在画面上就是
@@ -911,21 +1088,32 @@ void ViewModel::build(Camera3D *p_cam, Node *p_proto_parent) {
     //   ② 四指**斜搭**在木头左上棱上（绕 Z 倒 34°+）：指根在手背上、
     //      指尖越过顶面 1.7 cm 落在木头另一侧。有了这个方向，它们才不是柱子。
     //      四根沿 z 排开、间距 2.1 cm —— 对应护木上并排的四道指背。
-    ball(hand_l, Vector3(0.022f, 0.034f, 0.040f),                                                // 左手背
-         HAND_L_BASE + Vector3(-0.022f, 0.016f, 0.000f), Vector3(0, 0, 14), glove);
-    for (int i = 0; i < 4; ++i) {
-        cigar(hand_l, 0.0086f, 0.043f,
-              HAND_L_BASE + Vector3(-0.014f, 0.044f, ((float)i - 1.5f) * 0.0210f),
-              Vector3(0, 0, -34.0f + (float)i * 3.0f), glove);
+    VmHandNodeInfo hli;
+    Node3D *hl_art = nullptr;
+    if (hand_art_enabled()) {
+        hl_art = make_vm_hand_node("vm_hand_l", proto_parent, hli);
+        if (hl_art != nullptr) {
+            adopt_hand_subtree(hl_art, dbg_mat);
+            hand_l->add_child(hl_art);
+        }
     }
-    // 拇指**顺着护木往前指**（真人托护木就是这样的），而不是从掌顶翘起来。
-    // ⚠️ 它必须**压在手背上**（x ≈ -0.058），不能放到手背轮廓之外：
-    // 放到 -0.070 时它在染色图里是一个**和手完全分开的椭圆**（中间隔着世界色），
-    // 画面上读成"一根漂在枪旁边的香肠"。
-    cigar(hand_l, 0.0100f, 0.048f,                                                               // 左手拇指
-          HAND_L_BASE + Vector3(-0.032f, 0.002f, -0.026f), Vector3(-72, 0, -12), glove);
-    ball(hand_l, Vector3(0.021f, 0.024f, 0.020f),                                                // 左手腕
-         HAND_L_BASE + Vector3(0.002f, -0.010f, 0.042f), Vector3(10, 0, 0), glove);
+    if (hl_art == nullptr) {
+        ball(hand_l, Vector3(0.022f, 0.034f, 0.040f),                                            // 左手背
+             HAND_L_BASE + Vector3(-0.022f, 0.016f, 0.000f), Vector3(0, 0, 14), glove);
+        for (int i = 0; i < 4; ++i) {
+            cigar(hand_l, 0.0086f, 0.043f,
+                  HAND_L_BASE + Vector3(-0.014f, 0.044f, ((float)i - 1.5f) * 0.0210f),
+                  Vector3(0, 0, -34.0f + (float)i * 3.0f), glove);
+        }
+        // 拇指**顺着护木往前指**（真人托护木就是这样的），而不是从掌顶翘起来。
+        // ⚠️ 它必须**压在手背上**（x ≈ -0.058），不能放到手背轮廓之外：
+        // 放到 -0.070 时它在染色图里是一个**和手完全分开的椭圆**（中间隔着世界色），
+        // 画面上读成"一根漂在枪旁边的香肠"。
+        cigar(hand_l, 0.0100f, 0.048f,                                                           // 左手拇指
+              HAND_L_BASE + Vector3(-0.032f, 0.002f, -0.026f), Vector3(-72, 0, -12), glove);
+        ball(hand_l, Vector3(0.021f, 0.024f, 0.020f),                                            // 左手腕
+             HAND_L_BASE + Vector3(0.002f, -0.010f, 0.042f), Vector3(10, 0, 0), glove);
+    }
 
     // 前臂与腕口挂在 hands 上（**不是** hand_r / hand_l）：那两组会随每把枪的
     // 握持点整体平移，而肘长在人身上、不跟着枪走。挂进 hand 组的话，支撑手一
@@ -960,6 +1148,18 @@ void ViewModel::build(Camera3D *p_cam, Node *p_proto_parent) {
     cur_hand_r = HAND_R_BASE;
     cur_hand_l = HAND_L_BASE;
     place_arms();
+
+    // 报一下两只手各自用的是真模型还是程序化图元。
+    // 【为什么值得打一行日志】"手里这只手是真模型吗"这个问题**不能靠看图回答** ——
+    // 程序化图元与真模型在缩小之后轮廓相近，而 VA_VM_HAND_ART=0 的消融图
+    // 又只能证明"有没有手"。日志里这一行才是那个可分的一手证据。
+    if (art_report_enabled()) {
+        UtilityFunctions::print(String::utf8("[vm] 双手 "),
+                                String::utf8(hr_art != nullptr ? "真模型" : "程序化"),
+                                String::utf8(" / "),
+                                String::utf8(hl_art != nullptr ? "真模型" : "程序化"),
+                                String::utf8(hl_art != nullptr && hli.mirrored ? "（左手为镜像）" : ""));
+    }
 
     // ------------------------------------------------------------------
     // 枪口 + 枪口焰
@@ -1116,10 +1316,10 @@ bool ViewModel::load_skin(int p_index) {
     Vector3 d;
     if (env_vec3("VA_VM_HANDOFF_R", d)) hr += d;
     if (env_vec3("VA_VM_HANDOFF_L", d)) hl += d;
-    if (hand_r != nullptr) hand_r->set_position(hr - HAND_R_BASE);
-    if (hand_l != nullptr) hand_l->set_position(hl - HAND_L_BASE);
 
     // 前臂的腕端跟着新的握持点走，肘不动。
+    // 手掌自己的位置与缩放也在 place_arms() 里设 —— 它要带上"开镜让位"，两处分开写
+    // 就一定有一处漏掉让位。
     cur_hand_r = hr;
     cur_hand_l = hl;
     place_arms();
@@ -1272,6 +1472,29 @@ void ViewModel::update(double p_dt, float move01, bool running, float pitch, flo
     // gun 只承担姿态角，位移留给 root。分开之后，开镜过渡不会被后坐的
     // 旋转叠加上去，瞄具才能稳定压住准心。
     gun->set_rotation_degrees(hip_rot.lerp(aim_rot, ads));
+
+    // ---- 开镜时双手让位（照门优先）----
+    //
+    // 【为什么需要单独一套姿态】真手模是**实尺**的（拳约 10 cm 宽），而开镜时枪轴
+    // 与视轴重合 —— 握把上的扳机手、护木上的支撑手**都**落在瞄准轴附近，两只手一起
+    // 压住照门。实测（`sweep/vmhand_hip2/` 的取证）：开镜时"最近的手像素到画面中心"
+    // = **0 px**（中心即瞄准点），中心 80 px 内 13005 px 是手；程序化手那时是 39 px /
+    // 3296 px，所以这不是"接真模型必然的代价"，是新引入的退化。
+    //   落位不是解：扫过 5 档（含下移 40 mm、后移 60 mm），最近距中心**始终 0**；
+    //   再把任一只手移出画面做消融，**另一只仍然压住中心**（两只手都挡）。
+    // 所以照真 FPS 的通行做法，给视图模型**分腰射/开镜两套姿态**：
+    // 随 ads 把双手缩一点、往中轴外让一点。缩放只作用在 hand_r / hand_l 自己身上
+    // （即绕握持点缩），**不缩 hands** —— 缩 hands 会把前臂一起缩细；位移则同时给
+    // 手掌与腕端（见 place_arms），否则腕口会裂开一个正对相机的断口。
+    {
+        const float hk = 1.0f - hand_ads_shrink * ads;
+        const Vector3 hoff = hand_ads_off * ads;
+        if (std::fabs(hk - hand_pose_scale) > 1e-6f || hoff.distance_to(hand_pose_off) > 1e-6f) {
+            hand_pose_scale = hk;
+            hand_pose_off = hoff;
+            place_arms();
+        }
+    }
 
     // ---- 合成位置 ----
     //

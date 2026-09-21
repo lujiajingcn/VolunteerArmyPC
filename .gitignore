@@ -74,10 +74,13 @@ run_ui_*.log.*
 /ref/*
 !/ref/wpn
 !/ref/veh
+!/ref/vm
 /ref/wpn/*
 !/ref/wpn/SOURCES.md
 /ref/veh/*
 !/ref/veh/SOURCES.md
+/ref/vm/*
+!/ref/vm/SOURCES.md
 
 # --- 载具参考图同理（但武器参考图是例外，见下）---
 # assets/art/veh/*.png 是四辆车的图生3D 输入，取自 Bing 图片搜索。
@@ -87,6 +90,15 @@ run_ui_*.log.*
 # 注意规则只匹配 veh/ 这一层的 png，**不会**波及 veh/model/*.glb
 # （成品是我们自己生成的，照常入库）。
 /assets/art/veh/*.png
+
+# --- 第一人称手模的参考图（同理不入库）---
+# assets/art/vm/*.png 是 vm_hand_r / vm_hand_l 的图生3D 输入：
+# Bing 图片搜索命中的实拍手部照，再经本地"刷白背景 + 抠底 + 补方"处理。
+# 与原图一样是第三方摄影作品 → 按 /ref/ 的处置，不入库；
+# 取法、选图口径（水印判定是硬门槛）、中选来源全在 ref/vm/SOURCES.md。
+# 规则只匹配 vm/ 这一层，**不会**波及 vm/model/*.glb（成品是我们自己生成的）。
+/assets/art/vm/*.png
+/assets/art/vm/model/*_texture_pbr_*.jpg
 
 # --- 角色立绘的未处理原始版（22MB）---
 # assets/art/char/raw/ 是生成器直接吐出来的原图：带半透明水印、尺寸不统一。

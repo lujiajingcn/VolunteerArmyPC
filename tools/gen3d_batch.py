@@ -17,6 +17,15 @@
     "_texture_pbr_*.jpg"；.gitignore 里武器那条同理先摆着。
     参考图来源见 ref/veh/SOURCES.md（Bing 图片搜索，非维基 —— 维基本轮整站不通）。
 
+【四档：第一人称手模（vm），2026-09-21 加】
+    手模：输入 assets/art/vm/<键>.png       → 成品 assets/art/vm/model/<键>.glb
+             中间产物 sweep/gen3d_vm/<键>.json
+    `--kind vm`。键名 vm_hand_r（扳机手/握把）、vm_hand_l（支撑手/护木），
+    与 viewmodel.cpp 里 hand_r / hand_l 两组一一对应。
+    **不属于任何"角色/载具"档位**是有意的：它既不站在战场上、也不像武器那样
+    被整个场景共用，而是挂在相机上、离眼睛 0.3~0.45 m 的一小块 ——
+    面数/贴图的取舍与它们完全不同（近距离看，贴图吃满屏）。
+
 【为什么要有这一层，而不是在 shell 里 for 循环】
 一次图生3D 是「提交 → 轮询 1~5 分钟 → 拿到 URL → 下载 42MB → 瘦身到 1.5MB」，
 四个环节各有各的失败方式（提交被限流、轮询超时、COS 链接断流、GLB 里 BIN 块没取到）。
@@ -100,6 +109,16 @@ PROFILES = {
         #   吉普 → Willys MB / 装甲车 → M3 Half-track / 坦克 → M4A3E8 Sherman
         #   / 卡车 → GMC CCKW
         "keys": ["veh_jeep", "veh_apc", "veh_tank", "veh_truck"],
+    },
+    "vm": {
+        "label": "第一人称手模",
+        "src_dir": os.path.join(ROOT, "assets", "art", "vm"),
+        "model_dir": os.path.join(ROOT, "assets", "art", "vm", "model"),
+        "work": os.path.join(ROOT, "sweep", "gen3d_vm"),
+        # 顺序 = viewmodel.cpp 里 hand_r / hand_l 两组的顺序。
+        # 先只做 r（扳机手）：握拳的手在引擎里旋转后左右手可以共用，
+        # 所以 r 是"先 1 张确认朝向"那一步，l 视效果再决定要不要单独生成。
+        "keys": ["vm_hand_r"],
     },
 }
 

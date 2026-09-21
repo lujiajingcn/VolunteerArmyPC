@@ -193,6 +193,62 @@ const char *wpn_label(const std::string &p_key);
 godot::Node3D *make_wpn_node(const std::string &p_key, godot::Node *p_proto_parent,
                              WpnNodeInfo &out);
 
+// ---- 第一人称手模（图生3D 产物，tools/gen3d_batch.py --kind vm）----
+//
+// 约定：assets/art/vm/model/<键>.glb。两个键 vm_hand_r（扳机手/握把）、
+// vm_hand_l（支撑手/护木），与 viewmodel.cpp 里 hand_r / hand_l 两组一一对应。
+// 载入失败一律返回 nullptr，由 ViewModel 回退到程序化手套图元 ——
+// 少一个模型文件不该让玩家手里没手（这条回退链与枪模、载具、角色是同一个理由）。
+//
+// 【归一化目标】= viewmodel.cpp 里 hand_r / hand_l 两组的局部系：
+//   原点在**手掌中心**，-Z 前方、+X 右、+Y 上，单位是米。
+// 为什么原点取"手掌中心"而不是"手腕"：hand_r 组的位置是 `hr - HAND_R_BASE`，
+// 而 hr 是 kWpnArt 里登记的那对**手掌中心**握持点。原点对齐之后，真模型与
+// 程序化图元共用同一条 set_position 路径 —— 换枪只挪一次，不必分两套逻辑。
+//
+// 【朝向 = 几何对轴 + 残余实测角，两段分开】与载具那条同构（见 .cpp 里 veh 段）：
+//   ① `align`（自动，几何决定，无猜测）：把**最长的那一维**转到 Z；
+//   ② `kVmHandArt[].rot`（逐张实测的残余角）：只管剩下的 ±180° 与绕长轴的滚转。
+// 归一化会**按最长轴缩放**，所以长轴在哪一维无所谓 —— 但"哪一端是手背"
+// 几何上定不了，只能看图（判读口径与三张截图见 ref/vm/SOURCES.md）。
+//
+// 【现场微调：两级旋钮】全局 VA_VM_HAND_ROT / _LEN / _PLACE 一次改两只（扫档用）；
+// 键级 VA_VM_HAND_R_ROT / _LEN / _PLACE（左手把 R 换成 L）只改一只，优先于全局。
+// 键级是**重标定工具**：模型是"握拳 + 一截腕柱"，包围盒中心落在腕柱上，两只手
+// 的容错空间不等（右手多出来的正好压在握把上，左手就是腕柱顶进护木）。2026-09-21
+// 扫 8 档的结果是这一版两只手同值最优，但换手模/换握持点之后要能分开校。
+//
+// 【朝向自动解，别手拧】rot 那三个数满足"腕端指向肘、手背指向相机"这组约束，
+// 用 ELBOW_* / WRIST_* 的位置解出来的（推导见 .cpp）。手拧出来的数能看着还行，
+// 但换枪时握持点一动就散。
+//
+// 注意：**渲染层与材质不在这个函数里设**。手模要挂到"只照第一人称模型的那几盏灯"
+// 所在的层上，那是 ViewModel 的光照安排的产物，由它自己走一遍子树去设 ——
+// 与 make_wpn_node 是同一条分工。
+struct VmHandNodeInfo {
+    float          length = 0.0f;    // 归一化后的长轴长度（米）
+    float          scale = 0.0f;     // 施加的缩放倍率（排查用）
+    godot::Vector3 raw_size;         // 归一化**之前**模型自身的尺寸（排查用）
+    // 是否左右镜像。**自己的 glb 缺失、借了另一只手的那份**时为 true ——
+    // 右拳模型拿来当左手用必须镜像，否则拇指会跑到手背的错侧。
+    bool           mirrored = false;
+};
+
+// 造一个归一化的手模节点。p_proto_parent 是原始场景根的挂载点（要挂进场景树，
+// 否则退出时会被 Godot 报 RID 泄漏）。失败返回 nullptr 并把 out 留空。
+godot::Node3D *make_vm_hand_node(const std::string &p_key, godot::Node *p_proto_parent,
+                                 VmHandNodeInfo &out);
+
+// 全部手模键，顺序 = 游戏里左右手的顺序，也是自检的顺序。
+// 【为什么要有一份总表】ViewModel 建两组手、检阅台/自检、以及"模型齐备"的日志
+// 三处会各走一遍键名，抄两遍就一定漏一处 —— 而漏掉的那一处只表现为
+// "某只手是程序化图元"，不报错。角色与武器两条路都吃过这个亏。
+const std::vector<std::string> &all_vm_hand_keys();
+
+// 手模的中文显示名（日志用）。未知键返回"未知手模"而不是空串 ——
+// 空串在日志里表现为"什么都没显示"，会被误读成"没接上"。
+const char *vm_hand_label(const std::string &p_key);
+
 // 程序化纹理（保持"零外部资源"）
 godot::Ref<godot::Texture2D> tex_grass();
 godot::Ref<godot::Texture2D> tex_road();
