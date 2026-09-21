@@ -381,10 +381,12 @@ void WorldSim::_ready() {
        掩体节点层会建成一个空容器：逻辑层有 69 处掩体、画面上一个都看不见，
        「掩体评分 / 掩体减伤」这套核心玩法在视觉上完全不可读。
        （实测第一版就是这么错的，截图里光秃秃一片。） */
-    va::init_world(new_seed());
-    va::W.started = true;
-    va::W.deployDone = true;
-    mission_started_ = true;
+    /* **必须走 init_level_world 而不是裸 init_world(seed)**：
+       裸调用等于 levelIdx < 0 → CAM.active = false → 整局跑的还是改动前那一关，
+       简报上的目标清单、撤离门槛、结算文案全都按旧单关卡走 ——
+       "六关战役"在游戏里就一次也不会发生（只有离线工具能跑到）。
+       这里只初始化逻辑世界：静态场景还在下面才建，而 build_scene 要读 W.props。 */
+    init_level_world();
     force_ads_ = (std::getenv("VA_ADS") != nullptr);
     autoplay_  = (std::getenv("VA_AUTO") != nullptr);
     if (const char *dt = std::getenv("VA_DOWN_AT"); dt != nullptr && *dt != '\0') {
@@ -736,11 +738,56 @@ void WorldSim::script_a_step() {
     }
     else if (i == 6 && va::W.t > T + 110.0f)  { out = "铁头，搬密码箱"; fired = true; }
     else if (i == 7 && va::W.t > T + 200.0f)  { out = "小满，救伤员"; fired = true; }
-    else if (i == 8 && va::W.t > T + 230.0f)  { out = "全体，撤离"; fired = true; }
+    /* 第 8 条（撤离）在战役下**不许走这条固定节奏**：它的"到点就喊撤"会在
+       阵地还没守住、敌人还没打瘫的时候把全队打发去撤离点（这条口令不是"待命"，
+       它直接把每个人的 moveGoal 指到撤离点），等于把主阵地拱手让出去。
+       战役的撤离时机由下面的 script_campaign_step 按**目标达成情况**决定。 */
+    else if (i == 8 && !va::CAM.active && va::W.t > T + 230.0f)  { out = "全体，撤离"; fired = true; }
 
-    if (!fired) return;
+    if (!fired) {
+        script_campaign_step();     // 战役的那几条按目标驱动，不占固定序号
+        return;
+    }
     va::run_command_text(out, "voice", true);
     ++script_cmd_;
+}
+
+/* 战役模式下的口令（与 tools/va_sweep 的 run_level 同一套规则）。
+
+   为什么实机也要有这一套：旧剧本是"发完 8 条就收工"的固定节奏，撤离令排到 T+230，
+   而战役第一关的时限只有 300 秒 —— 按旧节奏**每一关都会被判成超时失败**，
+   实机回归就再也验不到"过关 → 转进"这条链（离线工具验过了，但离线工具
+   不经过 WorldSim 的推进逻辑，而那里恰恰是最需要实机证据的一段）。
+   规则：非撤离类主目标一旦全达成就要撤；炸坝与夜袭夺回各自反复下令；
+   **撤退令一旦发出就不再往回派人**（否则会把刚发出去的撤离令当场覆盖掉，
+   实测离线工具踩过：第三关下了撤离令 40 秒里一个人都没往撤离点走）。 */
+void WorldSim::script_campaign_step() {
+    if (!va::CAM.active || !va::W.triggered) return;
+
+    if (va::cur_level().hasDam && va::W.t > va::W.triggerT + 25.0f
+        && va::W.t - camp_last_dam_ > 25.0f) {
+        camp_last_dam_ = va::W.t;
+        /* 呼号写"老白"没关系：issue_command 对 blowDam 有整条候选链
+           （老白 → 石头 → 带炸药的人 → 任何活人），爆破是班组能力。 */
+        va::run_command_text("老白，炸水库", "voice", true);
+        return;
+    }
+    if (!va::W.evacOrdered && va::LV.retakeArmed && va::W.t - camp_last_retake_ > 20.0f) {
+        camp_last_retake_ = va::W.t;
+        va::run_command_text("全体，前往A点", "voice", true);
+        return;
+    }
+    if (va::W.evacOrdered) return;          // 撤了就不再往回派
+    bool tacticsDone = true;
+    for (const auto &g : va::cur_level().goals) {
+        if (g.main && g.kind != va::GoalKind::Evac && !va::goal_done(g)) { tacticsDone = false; break; }
+    }
+    if (tacticsDone || va::W.t > va::CFG.missionEnd - 90.0f) {
+        if (va::W.t - camp_last_evac_ > 30.0f) {
+            camp_last_evac_ = va::W.t;
+            va::run_command_text("全体，撤离", "voice", true);
+        }
+    }
 }
 
 // ------------------------------------------- 战斗事件取证（VA_AUTO / VA_DOWN_AT）
@@ -1261,7 +1308,12 @@ void WorldSim::apply_key(Key p_code, bool p_down) {
         // 键位重叠不会产生歧义。
         case Key::KEY_R:
             if (p_down) {
-                if (hud_ != nullptr && hud_->mission_over()) reset_mission();
+                /* 结算界面上 R = 继续战役：**过关了就转进下一阵地**，
+                   没打过就重打这一关（advance_level 内部分这两支）。
+                   这里必须是 advance_level 而不是 reset_mission ——
+                   reset 只会重打当前关，那样"在一个关卡结束后率领队友撤往下一个阵地"
+                   就永远发生不了。 */
+                if (hud_ != nullptr && hud_->mission_over()) advance_level();
                 else va::IN.reload = true;
             }
             break;
@@ -1294,6 +1346,11 @@ void WorldSim::apply_key(Key p_code, bool p_down) {
                    键位重叠不产生歧义。顺带让界面外壳成为一个闭环，
                    而不是"进了战斗就再也回不到菜单"的单向门。 */
                 if (hud_ != nullptr && hud_->mission_over()) {
+                    /* Esc = 回主菜单。**顺手把"待转进"清掉**：回菜单意味着
+                       这一局的转进没被确认，下次从菜单进来是重打本关，
+                       而不是莫名其妙跳过关卡。 */
+                    camp_cleared_ = false;
+                    camp_won_ = false;
                     reset_mission();                    // 内部会把 W.over 清掉
                     hud_->set_screen(Hud::SCREEN_MENU);
                 }
@@ -1379,9 +1436,14 @@ void WorldSim::on_alert(const std::string &text, float dur) {
     if (hud_ != nullptr) hud_->ev_alert(text, dur);
 }
 void WorldSim::on_end(const std::string &kind, const std::string &text) {
-    // 结算本身由 HUD 的结算面板呈现（成败、评级、统计）；
-    // 这里只把逻辑层给的这段文案留个记录，方便对照逻辑输出。
+    /* 结算本身由 HUD 的结算面板呈现（成败、评级、统计）；
+       这里只把逻辑层给的这段文案留个记录，方便对照逻辑输出。 */
     UtilityFunctions::print(String::utf8("[结算] "), String::utf8(kind.c_str()), String::utf8("："), String::utf8(text.c_str()));
+    /* 「转进」= 这一关打下来了、还有下一关 —— 它和"成功/胜利/失败"不是一回事：
+       战绩全达标但没过关（比如撤离人数不够）也会走 end_game，那种不能推进关卡。
+       所以只认 end_game 给出的 kind，不自己看 stats 反推。 */
+    camp_cleared_ = (kind == "转进");
+    camp_won_     = (kind == "胜利");
 }
 void WorldSim::on_subs_dirty() {}
 void WorldSim::on_objectives_dirty() {}
@@ -1392,28 +1454,84 @@ void WorldSim::push_subtitle(const std::string &who, const std::string &text, co
 }
 
 // ------------------------------------------------------------- 对外接口
-void WorldSim::start_mission(bool p_skip_deploy) {
-    va::init_world(new_seed());
+/* 铺一关：把 camp_level_ 交给逻辑层，队伍从 carry_in_ 进来。
+   **为什么要传 carry 而不是让逻辑层自己记着**：逻辑层的 va_campaign 只有"当前这一关"，
+   没有"上一关"的概念 —— 跨关的那份花名册是外壳在推进关卡时抓下来、再交回去的。
+   这样逻辑层的接口保持成"给我一关 + 给我一队人"，离线工具能从任意一关起跑。 */
+/* 只把逻辑世界铺起来，不碰任何节点。
+   分成两半的原因是 _ready：那时静态场景还没建（build_scene 要读 W.props），
+   而 apply_weather / sync_entity_nodes 又都依赖已经建好的节点。 */
+void WorldSim::init_level_world() {
+    const va::CarryOver *c = (camp_level_ > 0 && carry_in_.valid) ? &carry_in_ : nullptr;
+    va::init_world(new_seed(), camp_level_, c);
     va::W.started = true;
-    va::W.deployDone = p_skip_deploy;
+    va::W.deployDone = true;
     mission_started_ = true;
-    apply_weather(refs_);          // 天气在 init_world 里重新抽过，布光必须跟着重打
+    /* 剧本游标与战役口令的节流时刻都是**每一局**的状态，必须在开新一局时归零。
+       漏了 `script_cmd_` 的后果不是"少发一条口令"，而是**重开之后一条都不发**：
+       游标停在 8，script_a_step 里那条 i==8 的分支再也不会命中，
+       伏击不引爆、车队一路开过去 —— 实测连按 R 重开第一关 5 次，
+       5 次都是同一句"车队冲过了西侧出口，伏击失败"。
+       （这个 bug 在改动前就在，只是那时没人连着重开。是验"转进"时撞出来的：
+        第一局正常、第二局开始全一样，正好说明游标没归零。） */
+    script_cmd_ = 0;
+    camp_last_dam_ = camp_last_retake_ = camp_last_evac_ = -100.0f;
+    /* 一行"现在是哪一关、带了几个人"。**这条日志是判据**：
+       战役有没有真的接进游戏，不看代码看这句 —— 只打"第 1 关"说明
+       整局还是被当成单关卡在跑（那正是接入前 _ready 裸调 init_world(seed) 的样子）。 */
+    UtilityFunctions::print(String::utf8("[战役] 第 "), camp_level_ + 1,
+                            String::utf8(" 关 · "), String::utf8(va::cur_level().name),
+                            String::utf8("  "), String::utf8(va::cur_level().date),
+                            String::utf8("  带队 "), c != nullptr ? (int)c->units.size() : (int)va::CARRY.units.size(),
+                            String::utf8(" 人"));
+}
+
+void WorldSim::begin_level() {
+    init_level_world();
+    // 每关的地形参数与掩体配方都不同（谷宽 / 路高 / 岩石与树林的撒法）
+    // → 布光与静态几何必须跟着重打，否则第二关会顶着第一关的山谷。
+    apply_weather(refs_);
+    if (refs_.root != nullptr) rebuild_props(refs_.root, refs_);
     aim_at_road();
+    /* 不在这里调 spawn_entity_nodes：那是"增援到齐"时补节点的，
+       重复调用会在场景里堆出第二套模型。**换关的人数一定会变**
+       （严格继承下只带撤出来的人），sync_entity_nodes 的"数量对不上就整体重建"
+       正好覆盖这一条，所以换关只需要 sync 一次。 */
     sync_entity_nodes();
+}
+
+/* 结算面板上按 R：过关了就往下走，没打过就重打这一关。 */
+void WorldSim::advance_level() {
+    if (camp_won_) {
+        /* 六关都打完了 → 重新入伍。**必须把 CARRY 清掉**：
+           不清的话新战役第一关会带着上一轮最后那几个人进来。 */
+        camp_level_ = 0;
+        carry_in_ = va::CarryOver{};
+        va::CARRY = va::CarryOver{};
+    } else if (camp_cleared_) {
+        /* 转进：**抓的是 check_end 里 capture_carry() 留下的那份快照** ——
+           只有真走到撤离点的人在里面，阵亡的不复活、没抬走的伤员不留。
+           这就是"率领队友撤往下一个阵地"的机制实现。 */
+        carry_in_ = va::CARRY;
+        camp_level_ = std::min(camp_level_ + 1, va::level_count() - 1);
+    }
+    camp_cleared_ = false;
+    camp_won_ = false;
+    reset_mission();
+}
+
+void WorldSim::start_mission(bool p_skip_deploy) {
+    begin_level();
+    va::W.deployDone = p_skip_deploy;
 }
 
 void WorldSim::reset_mission() {
     mission_started_ = false;
-    va::init_world(new_seed());
-    va::W.started = true;
-    va::W.deployDone = true;
-    mission_started_ = true;
-    // 新一局的掩体表可能不同（油桶已被殉爆打掉的需要复原）→ 视觉层一并重建
-    if (refs_.root != nullptr) rebuild_props(refs_.root, refs_);
-    apply_weather(refs_);
-    spawn_entity_nodes();
-    aim_at_road();
-    sync_entity_nodes();
+    /* 重打本关时**队伍要退回到"进这一关时"的那份花名册**（carry_in_），
+       不是刚才被打烂之后的状态 —— 否则第一次打得好不好会污染重试，
+       而且"失败 → 重打"会越打越弱，最后变成无解。
+       camp_level_ 不动：reset 是"重来这一关"，转进才改关卡下标。 */
+    begin_level();
 }
 
 Dictionary WorldSim::get_status() const {

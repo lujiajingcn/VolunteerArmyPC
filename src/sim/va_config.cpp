@@ -6,9 +6,12 @@
 namespace va {
 
 // ------------------------------------------------------------------ 关卡
-const LevelCfg CFG{};
+/* 下面这批"关卡常量"全部改成**可变容器**，进关时由 va_campaign 的 apply_level()
+   按关卡重写。默认值 = 第一关（玉女峰前哨）那一套，数值与改动前逐项相同 ——
+   这样不走战役流程的入口（tools/va_sweep 直接 init_world）拿到的还是原来那张图。 */
+LevelCfg CFG{};
 
-const TacPoint POINTS[7] = {
+std::vector<TacPoint> POINTS = {
     { "A", "A 南侧高地",  "A", 880,  900,  135, "树林+岩石，视野好，会被坦克炮击" },
     { "B", "B 北侧岩石",  "B", 1080, 330,  132, "巨石+壕沟，反坦克侧射位" },
     { "C", "C 桥梁/隘口", "C", 360,  650,  115, "窄路+桥，撤离点（可炸桥）" },
@@ -18,32 +21,35 @@ const TacPoint POINTS[7] = {
     { "G", "G 西侧出口",  "G", 120,  650,  110, "公路直道，敌人逃跑点" },
 };
 const TacPoint *point_of(const std::string &key) {
-    for (int i = 0; i < 7; ++i) if (key == POINTS[i].key) return &POINTS[i];
+    for (size_t i = 0; i < POINTS.size(); ++i) if (key == POINTS[i].key) return &POINTS[i];
     return nullptr;
 }
 
-const EvacPoint EVAC_DEFAULT{ "C", "C 桥梁/隘口", 360, 650 };
-const EvacPoint EVAC_ALT{ "E", "E 南侧树林", 760, 1090 };
+EvacPoint EVAC_DEFAULT{ "C", "C 桥梁/隘口", 360, 650 };
+EvacPoint EVAC_ALT{ "E", "E 南侧树林", 760, 1090 };
 
-const float ROAD_PATH[][2] = {
+std::vector<Vec2> ROAD_PATH = {
     { 2320, 700 }, { 2090, 668 }, { 1900, 655 }, { 1400, 648 }, { 900, 650 },
     { 520, 650 },  { 414, 650 },  { 306, 650 },  { 150, 650 },  { -60, 650 },
 };
-const int ROAD_PATH_N = 10;
+int ROAD_PATH_N = 10;
 std::vector<WayPt> CONVOY_WAY;
 
 void build_convoy_way() {
     CONVOY_WAY.clear();
+    ROAD_PATH_N = (int)ROAD_PATH.size();
+    if (ROAD_PATH_N < 2) return;
     for (int i = 0; i < ROAD_PATH_N - 1; ++i) {
-        const float x1 = ROAD_PATH[i][0], y1 = ROAD_PATH[i][1];
-        const float x2 = ROAD_PATH[i + 1][0], y2 = ROAD_PATH[i + 1][1];
+        const float x1 = ROAD_PATH[(size_t)i].x, y1 = ROAD_PATH[(size_t)i].y;
+        const float x2 = ROAD_PATH[(size_t)(i + 1)].x, y2 = ROAD_PATH[(size_t)(i + 1)].y;
         int n = (int)std::lround(distf(x1, y1, x2, y2) / 60.0f);
         if (n < 1) n = 1;
         for (int k = 0; k < n; ++k) {
             CONVOY_WAY.push_back({ lerpf(x1, x2, (float)k / (float)n), lerpf(y1, y2, (float)k / (float)n) });
         }
     }
-    CONVOY_WAY.push_back({ ROAD_PATH[ROAD_PATH_N - 1][0], ROAD_PATH[ROAD_PATH_N - 1][1] });
+    const Vec2 &last = ROAD_PATH.back();
+    CONVOY_WAY.push_back({ last.x, last.y });
 }
 
 // ------------------------------------------------------------------ 花名册
@@ -178,6 +184,17 @@ Prop make_wall(float x, float y, float r) {
     Prop p; p.type = PropType::Wall; p.x = x; p.y = y; p.r = r;
     p.cover = 1.0f; p.blocksLos = true; p.blocksBullet = true; p.hard = true; return p;
 }
+/* 水坝（内外加山）。**为什么做成"可爆炸的 prop"而不是新加一条指令**：
+   爆破手已经有"起爆"这一条命令链路，玩家打它、老白炸它、炮弹波及它都能触发，
+   于是"炸不炸、什么时候炸"完全交给玩家 —— 这正是史实里那个两难（水库一炸，
+   山上的 5 连自己也断了退路）。炸开后的后果在 chain_barrel 里。
+   hp 给 60：一颗手雷打不烂，得正经用爆破/火箭弹，避免手滑断掉自己的退路。 */
+Prop make_dam(float x, float y, float w) {
+    Prop p; p.type = PropType::Wall; p.x = x; p.y = y;
+    p.r = w * 0.5f; p.w = w; p.h = 34;
+    p.cover = 0.9f; p.blocksLos = false; p.blocksBullet = false; p.hard = true;
+    p.explosive = true; p.hp = 60; p.dam = true; return p;
+}
 Prop make_trench(float x, float y, float w, float h) {
     Prop p; p.type = PropType::Trench; p.x = x; p.y = y;
     p.r = std::max(w, h) / 2.0f; p.w = w; p.h = h;
@@ -210,14 +227,14 @@ std::vector<Prop> BASE_PROPS = {
     make_bush(1620, 760, 15), make_bush(1520, 900, 15), make_bush(1880, 720, 15),
 };
 
-const DeployZone DEPLOY_ZONES[4] = {
+std::vector<DeployZone> DEPLOY_ZONES = {
     { "南侧树林 / 高地",     600,  790, 1210, 1210, "适合火力组、狙击手" },
     { "北侧壕沟 / 岩石",     900,  230, 1320, 480,  "适合反坦克组" },
     { "东侧路边 / 伏击圈侧翼", 1120, 500, 1660, 920,  "适合爆破手埋雷 / 反坦克侧射" },
     { "后方 C 点",           180,  760, 520,  1090, "医疗兵与撤退点" },
 };
 
-const std::vector<RecommendPos> RECOMMEND = {
+std::vector<RecommendPos> RECOMMEND = {
     { "player",  872,  872  },
     { "laozhou", 946,  930  }, { "xiaoxia", 796, 856 },
     { "ajie",    902,  984  }, { "daliu",   828, 950 },

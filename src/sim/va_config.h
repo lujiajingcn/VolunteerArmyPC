@@ -25,7 +25,7 @@ struct LevelCfg {
     float convoyStopX = 1020;  // 伏击圈停车线
     float convoyGap = 145;     // 各车间距（= 位置真值，生成与停车排队共用）
 };
-extern const LevelCfg CFG;
+extern LevelCfg CFG;
 
 // ------------------------------------------------------------ 平衡旋钮
 /* 玩法平衡的可调项。**默认值 = 当前采用的平衡值**（见下面的实测依据）。
@@ -61,15 +61,18 @@ struct BalanceCfg {
 extern BalanceCfg BAL;
 
 struct TacPoint { const char *key; const char *name; const char *shortName; float x, y, r; const char *desc; };
-extern const TacPoint POINTS[7];       // A~G
+/* 逐关重写（apply_level）。**恒为 7 个点** A~G —— 指令文法里的地点词（LOC_KEYS）、
+   AI 里写死的下标（POINTS[2] 是撤离点、POINTS[6] 是西路出口、POINTS[0] 是主阵地）
+   全都依赖这个顺序，所以"每关换名字换坐标"可以，"每关换数量"不行。 */
+extern std::vector<TacPoint> POINTS;
 const TacPoint *point_of(const std::string &key);
 
 struct EvacPoint { std::string key, name; float x, y; };
-extern const EvacPoint EVAC_DEFAULT;
-extern const EvacPoint EVAC_ALT;
+extern EvacPoint EVAC_DEFAULT;
+extern EvacPoint EVAC_ALT;
 
-extern const float ROAD_PATH[][2];
-extern const int   ROAD_PATH_N;
+extern std::vector<Vec2>  ROAD_PATH;   // 由东向西，车队沿它走
+extern int                ROAD_PATH_N;
 struct WayPt { float x = 0, y = 0; };
 extern std::vector<WayPt> CONVOY_WAY;      // 由 build_convoy_way() 填充
 void build_convoy_way();
@@ -104,14 +107,15 @@ Prop make_tree(float x, float y, float r = 15);
 Prop make_bush(float x, float y, float r = 17);
 Prop make_barrel(float x, float y);
 Prop make_wall(float x, float y, float r);
+Prop make_dam(float x, float y, float w);      // 内外加山水库大坝（可炸，见 chain_barrel）
 Prop make_trench(float x, float y, float w, float h);
 extern std::vector<Prop> BASE_PROPS;
 
 struct DeployZone { const char *name; float x1, y1, x2, y2; const char *desc; };
-extern const DeployZone DEPLOY_ZONES[4];
+extern std::vector<DeployZone> DEPLOY_ZONES;
 
 struct RecommendPos { const char *id; float x, y; };
-extern const std::vector<RecommendPos> RECOMMEND;
+extern std::vector<RecommendPos> RECOMMEND;
 bool recommend_of(const std::string &id, float &ox, float &oy);
 
 // ------------------------------------------------------- 语音指令文法

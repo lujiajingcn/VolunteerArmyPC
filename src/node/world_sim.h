@@ -16,6 +16,7 @@
 #include "node/scene_builder.h"
 #include "node/viewmodel.h"
 #include "sim/va_world.h"
+#include "sim/va_campaign.h"   // 战役：关卡表 / 跨关花名册（CarryOver）
 
 namespace volunteer_army {
 
@@ -113,6 +114,24 @@ private:
     double acc_ = 0.0;
     bool  mission_started_ = false;
 
+    /* ---- 铁原战役：关卡推进 ------------------------------------------------
+       为什么状态放在表现层而不是逻辑层：逻辑层只认"这次给我哪一关、带哪些人进来"
+       （init_world(seed, levelIdx, carry)），**它不需要知道"打完该去哪"** ——
+       那是一次会话级的选择（玩家按了转进、还是从菜单重开），属于外壳的职责。
+       放在这里还有一个好处：逻辑层的 va_campaign 保持零引擎依赖，
+       而 tools/va_sweep 用同一套接口从任意一关起跑，不需要模拟"按了什么键"。 */
+    int  camp_level_ = 0;          // 当前关卡下标
+    bool camp_cleared_ = false;    // 本关已"转进"（结算面板上的按钮要变成"转进下一阵地"）
+    bool camp_won_ = false;        // 最后一关也打下来了（按钮变成"重新入伍"）
+    /* 进当前这一关时带进来的那份花名册。**"重打本关"要退回它** ——
+       否则第一次打得好不好会污染重试，失败几次之后越打越弱、最后无解。 */
+    va::CarryOver carry_in_;
+    // 战役口令的节流时刻（炸坝 / 夜袭 / 撤离）
+    float camp_last_dam_ = -100.0f, camp_last_retake_ = -100.0f, camp_last_evac_ = -100.0f;
+    void init_level_world();       // 只铺逻辑世界（_ready 用：那时静态场景还没建）
+    void begin_level();            // 按 camp_level_ 铺关并把队伍带进去
+    void advance_level();          // 结算面板按 R：过关就转进下一阵地，否则重打本关
+
     // 音频节流（同一音效 id 在极短时间内不重复触发）
     double last_sfx_t_ = 0.0;
 
@@ -168,6 +187,7 @@ private:
     bool   script_a_   = false;    // VA_SCRIPT_A=1
     int    script_cmd_ = 0;        // 已发出的剧本指令序号
     void   script_a_step();        // 每个固定步之后调用一次（与 va_sweep 的次序一致）
+    void   script_campaign_step(); // 战役模式下的目标驱动口令（见 .cpp 的说明）
 
     // 截图探针
     std::vector<double> cap_times_;

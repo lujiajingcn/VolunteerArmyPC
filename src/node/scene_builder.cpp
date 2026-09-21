@@ -2379,8 +2379,8 @@ void build_scene(Node3D *root, SceneRefs &out) {
     Node3D *road = memnew(Node3D);
     road->set_name("Road");
     for (int i = 0; i + 1 < va::ROAD_PATH_N; ++i) {
-        const float x1 = va::ROAD_PATH[i][0], y1 = va::ROAD_PATH[i][1];
-        const float x2 = va::ROAD_PATH[i + 1][0], y2 = va::ROAD_PATH[i + 1][1];
+        const float x1 = va::ROAD_PATH[(size_t)i].x, y1 = va::ROAD_PATH[(size_t)i].y;
+        const float x2 = va::ROAD_PATH[(size_t)(i + 1)].x, y2 = va::ROAD_PATH[(size_t)(i + 1)].y;
         const float len = va::distf(x1, y1, x2, y2);
         if (len < 1.0f) continue;
         const float cx = (x1 + x2) * 0.5f, cy = (y1 + y2) * 0.5f;
@@ -2404,8 +2404,8 @@ void build_scene(Node3D *root, SceneRefs &out) {
     {
         Ref<StandardMaterial3D> line_m = mat_solid(Color(0.62f, 0.60f, 0.50f), 0.85f);
         for (int i = 0; i + 1 < va::ROAD_PATH_N; ++i) {
-            const float x1 = va::ROAD_PATH[i][0], y1 = va::ROAD_PATH[i][1];
-            const float x2 = va::ROAD_PATH[i + 1][0], y2 = va::ROAD_PATH[i + 1][1];
+            const float x1 = va::ROAD_PATH[(size_t)i].x, y1 = va::ROAD_PATH[(size_t)i].y;
+            const float x2 = va::ROAD_PATH[(size_t)(i + 1)].x, y2 = va::ROAD_PATH[(size_t)(i + 1)].y;
             const float len = va::distf(x1, y1, x2, y2);
             if (len < 1.0f) continue;
             const int n = (int)(len / 80.0f);

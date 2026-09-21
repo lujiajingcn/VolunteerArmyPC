@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "sim/va_world.h"
+#include "sim/va_campaign.h"
 
 using namespace va;
 
@@ -177,6 +178,198 @@ Row run_one(const Scenario &sc, int seed) {
     return r;
 }
 
+// --------------------------------------------------------------- 战役模式
+/* 逐关打一遍：每关结束把撤出来的人交给下一关（capture_carry → CARRY → init_world）。
+   它回答的是"关卡能不能连起来"，**不是**"这六关难度合不合适" ——
+   剧本是同一套机械口令，不带玩家的临场判断，所以胜率没有参考价值；
+   有价值的是：六关都能铺出来、目标都能判、人确实在一关关减少、不崩、不卡死。 */
+bool goals_but_evac_done() {
+    for (const auto &g : cur_level().goals) {
+        if (g.main && g.kind != GoalKind::Evac && !goal_done(g)) return false;
+    }
+    return true;
+}
+
+struct LvRow {
+    int   lv = 0;
+    std::string name, kind;
+    int   alive = 0, dead = 0, downed = 0, evac = 0;
+    int   carry = 0;          // 带进下一关的人数
+    float t = 0;
+    std::string goals;        // 目标完成情况
+    std::string extra;        // 关卡机制的诊断
+    std::string text;         // 结束文案（失败原因）
+};
+
+LvRow run_level(int lv, uint32_t seed, bool verbose) {
+    init_world(seed, lv, (lv == 0) ? nullptr : &CARRY);
+    W.smokes.clear();
+    W.started = true;
+    W.deployDone = true;
+
+    int cmdIdx = 0;
+    float lastEvacCmd = -100.0f, lastDamCmd = -100.0f, lastRetakeCmd = -100.0f;
+    bool damOrdered = false, retakeOrdered = false;
+    const float tMax = CFG.missionEnd + 2.0f;
+    const int steps = (int)(tMax / DT) + 2;
+    for (int i = 0; i < steps; ++i) {
+        step_once(DT);
+        std::string c;
+        bool fire = false;
+        const float T = W.triggerT;
+        const Vehicle *lead = W.vehicles.empty() ? nullptr : &W.vehicles[0];
+        if (cmdIdx == 0 && W.t > 5) { c = "全体，隐蔽"; fire = true; }
+        else if (cmdIdx == 1 && lead != nullptr && lead->x < CFG.convoyStopX + 320) {
+            trigger_ambush("mine"); c = "老白，起爆"; fire = true;
+        }
+        if (!fire && W.triggered) {
+            if (cmdIdx == 2 && W.t > T + 12) { c = "全体，开火"; fire = true; }
+            else if (cmdIdx == 3 && W.t > T + 30) { c = "反坦克组，打坦克"; fire = true; }
+            else if (cmdIdx == 4 && W.t > T + 70) { c = box_order(); fire = true; }
+            else if (cmdIdx == 5 && W.t > T + 100) { c = "铁头，搬密码箱"; fire = true; }
+            else if (cmdIdx == 6 && W.t > T + 130) { c = "小满，救伤员"; fire = true; }
+        }
+        // 关卡特有：炸坝（内外加山）与夜袭夺回（种子山）
+        if (!fire && cur_level().hasDam && W.triggered && W.t > T + 25 && W.t - lastDamCmd > 25.0f) {
+            /* 呼号写"老白"没关系：issue_command 对 blowDam 有一整条候选链
+               （老白 → 石头 → 带炸药的人 → 任何活人），爆破是班组能力。 */
+            c = "老白，炸水库"; lastDamCmd = W.t; damOrdered = true; fire = true;
+        }
+        /* **撤退令优先于其它一切**：一旦下过撤离令，就不能再有人被派回阵地。
+           原先"夜袭夺回"的循环无条件每 20 秒发一次"前往A点"，把刚刚发出的
+           撤离令当场覆盖掉 —— 实测第三关 313 秒下令撤离，322 / 342 秒又把全队
+           叫回主峰，40 秒窗口里**没有一个人往撤离点走**（0 人撤离，整关判负）。
+           真人不会这么干：喊了撤就不会再把人往山上推。 */
+        const bool retreating = W.evacOrdered;
+        if (!fire && W.triggered && !retreating
+            && (goals_but_evac_done() || W.t > CFG.missionEnd - 90.0f)
+            && W.t - lastEvacCmd > 30.0f) {
+            c = "全体，撤离"; lastEvacCmd = W.t; fire = true;
+        }
+        /* 夜袭夺回要**反复下令**：一次"前往 A 点"之后，队伍会在半路被火力打散，
+           站上主峰需要持续压上去。史实里敢死队也是一波波冲的。 */
+        if (!fire && !retreating && LV.retakeArmed && W.t - lastRetakeCmd > 20.0f) {
+            c = "全体，前往A点"; lastRetakeCmd = W.t; retakeOrdered = true; fire = true;
+        }
+        if (fire && !c.empty()) {
+            if (cmdIdx < 7 && c != "老白，炸水库" && c != "全体，前往A点" && c != "全体，撤离") ++cmdIdx;
+            const ParsedCmd pc = run_command_text(c, "voice", true);
+            if (verbose) {
+                std::printf("   [%.0fs] %-14s -> act=%-10s 呼号=%s 地点=%s ok=%d\n",
+                            W.t, c.c_str(), pc.actId.c_str(), pc.csId.c_str(),
+                            pc.hasLoc ? pc.locKey.c_str() : "-", (int)pc.ok);
+            }
+        }
+        if (W.over) break;
+    }
+
+    LvRow r;
+    r.lv = lv;
+    r.name = cur_level().name;
+    r.kind = W.over ? (W.overKind.empty() ? std::string("未结束") : W.overKind) : std::string("未结束");
+    for (auto &u : W.units) {
+        if (u.team != Team::Ally) continue;
+        if (u.dead) r.dead++;
+        else if (u.downed) r.downed++;
+        else r.alive++;
+    }
+    r.evac = W.stats.evacCount;
+    r.t = W.t;
+    r.text = W.overText;
+    if (cur_level().hasDam) {
+        Unit *lb = ally_by_id("laobai");
+        /* "已炸(安放)" = 人跑上去安放了 8 秒炸药；"已炸(非安放)" = 被别的爆炸波及 ——
+           后者意味着"水淹七军"在玩家没做那个两难选择的情况下就被打勾了。 */
+        r.extra = std::string("坝:") + (LV.damBlown ? (LV.damByCharge ? "已炸(安放)" : "已炸(非安放!)")
+                                                    : "未炸");
+        r.extra += lb ? (lb->dead ? " 老白:阵亡" : (lb->downed ? " 老白:失能" : " 老白:在")) : " 老白:不在";
+        /* 这两个是**复用同一个字段的末刻快照**：damTask 在安放完成那一刻就被清掉，
+           所以"炸成功过"的局这里必然读 0/8 —— 别把它当成"没人干过活"。 */
+        r.extra += " 末刻派工" + std::to_string(LV.damWorkers) + "人 安放" +
+                   std::to_string((int)LV.damPlantT) + "/8";
+    }
+    if (cur_level().forceNight) {
+        r.extra = std::string("夜袭:") + (LV.retakeArmed ? "已发起" : "未到") +
+                  (LV.retaken ? " 已夺回" : " 未夺回") +
+                  " 站稳" + std::to_string((int)LV.retakeHold) + "s" +
+                  " 阵地 " + std::to_string(LV.holdAlly) + "比" + std::to_string(LV.holdEnemy) +
+                  " 已守" + std::to_string((int)LV.holdT) + "s";
+    }
+    for (const auto &g : cur_level().goals) {
+        r.goals += (goal_done(g) ? "[√]" : "[ ]");
+        r.goals += g.text;
+        r.goals += " ";
+    }
+    /* CARRY 在 check_end 里就抓好了（过关那一刻），这里只读。
+       **只在真的"转进"时才有意义** —— 没过关（失败）时 CARRY 还是上一关留下的，
+       直接打出来会被读成"这一关带出了这么多人"，所以标成 -1、表格里打 "-"。 */
+    r.carry = (W.overKind == "转进") ? (int)CARRY.units.size() : -1;
+    return r;
+}
+
+int run_campaign(int seed, bool verbose) {
+    CARRY = CarryOver{};
+    CAM = CampaignState{};
+    std::printf("铁原战役 · 六关连续跑（种子 %d，无敌方干预的机械剧本）\n\n", seed);
+    /* 「撤」= 本关结算时走出去的人数（统计口径）；「带」= 实际被 carry 进下一关的人数
+       （继承口径）。两者应当只差玩家 1 人（玩家永远进下一关，但不一定"撤出"）。
+       分开打出来，是为了让 capture_carry() 的判据（u.evacuated || 距离）出问题时
+       当场能看见 —— 实测踩过「撤 7 / 带 5」：撤离点改到南侧树林后，
+       已经走出旧撤离点的人被判成没带出来。 */
+    std::printf("%-4s %-22s %-6s %4s %4s %4s %4s %4s %6s  %s\n",
+                "关", "阵地", "结果", "活", "亡", "倒", "撤", "带", "用时", "目标");
+    /* VA_CAMP_START：从第几关开始（0 基）。**单独验证后面几关用** ——
+       第六关的炸坝、第三关的夜袭夺回，要一路打到那里才能测太费事，
+       而且前几关打输了就根本走不到。这只是验证入口，不是玩法。 */
+    int start = 0;
+    if (const char *e = std::getenv("VA_CAMP_START")) start = std::atoi(e);
+    if (start > 0) {
+        start = std::min(start, level_count() - 1);
+        CAM.levelIndex = start;
+        std::printf("（从第 %d 关开始，队伍按满编起算）\n", start + 1);
+    }
+    int cleared = 0;
+    int carryBad = 0;   // 「带」与「撤」对不上的关数（不变式见下）
+    for (int lv = start; lv < level_count(); ++lv) {
+        const LvRow r = run_level(lv, (uint32_t)seed + (uint32_t)lv * 7919u, verbose);
+        /* 「带」只在转进时有值；失败/末关打 "-"，免得把上一关的 CARRY 误读成本关成绩。 */
+        char carryStr[8];
+        if (r.carry < 0) std::snprintf(carryStr, sizeof carryStr, "-");
+        else             std::snprintf(carryStr, sizeof carryStr, "%d", r.carry);
+        std::printf("%-4d %-22s %-6s %4d %4d %4d %4d %4s %5.0fs  %s\n",
+                    r.lv + 1, r.name.c_str(), r.kind.c_str(),
+                    r.alive, r.dead, r.downed, r.evac, carryStr, r.t, r.goals.c_str());
+        if (!r.extra.empty()) std::printf("     └ %s\n", r.extra.c_str());
+        /* 结束原因：`W.overText` 是 end_game 写下的原话（"全队失能" / "时限已到" …）。
+           关卡"失败"有好几种成因，先看这句再猜是哪一条。 */
+        if (!r.text.empty()) std::printf("     × 结束原因：%s\n", r.text.c_str());
+        /* **不变式**：过了关的话，`带` 必须等于 `撤` 或 `撤+1`。
+           加 1 的那一种来自玩家 —— 玩家恒进下一关，但收拢时可能已经倒在场上、
+           没从撤离点走出去（所以 `撤` 里没有他）。除此之外任何差额都是 bug：
+           `撤 > 带` = capture_carry 把已经走出去的人漏了（撤离点中途改址踩过，
+           实测「撤 7 / 带 5」）；`带 > 撤+1` = 把人重复收了。 */
+        if (r.kind == "转进" && (r.carry < r.evac || r.carry > r.evac + 1)) {
+            std::printf("     !! 不变式破了：撤 %d / 带 %d（应满足 撤 <= 带 <= 撤+1）\n",
+                        r.evac, r.carry);
+            ++carryBad;
+        }
+        if (r.kind != "转进") {
+            /* VA_CAMP_FORCE：打输了也往下走一关。
+               **只是链路验证用的开关，不是玩法** —— 机械剧本打不掉坦克是常事
+               （真人玩家 8/10 能打掉，剧本只有一次口令、不会集火），
+               如果因此第二关就断掉，第五关的孤山、第六关的炸坝就永远测不到。 */
+            if (!std::getenv("VA_CAMP_FORCE")) break;
+            capture_carry();
+        }
+        ++cleared;
+    }
+    if (carryBad) std::printf("⚠ 有 %d 关的「撤/带」对不上，见上面 !! 行\n", carryBad);
+    std::printf("\n→ 过关 %d/%d   累计阵亡 %d   累计撤离 %d 人次   总用时 %.0f 秒\n",
+                cleared, level_count(), CAM.totalDead, CAM.totalEvac, CAM.totalTime);
+    for (const auto &l : CAM.log) std::printf("   · %s\n", l.c_str());
+    return cleared;
+}
+
 const char *weather_cn(const std::string &w) {
     if (w == "sunny") return "晴";
     if (w == "rain")  return "雨";
@@ -192,8 +385,12 @@ int main(int argc, char **argv) {
 
     const char *filter = nullptr;
     bool verbose = false;
+    int  campSeed = 20240915;
+    bool campaign = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-v") == 0) verbose = true;
+        else if (std::strcmp(argv[i], "campaign") == 0) campaign = true;
+        else if (campaign) campSeed = std::atoi(argv[i]);
         else filter = argv[i];
     }
 
@@ -210,6 +407,8 @@ int main(int argc, char **argv) {
     /* 在任何 apply() 之前抓一次默认值 —— 必须在循环外，且必须在第一次 apply 之前。
        这一句就是"扫描数字"与"实机行为"之间的那根绳子。 */
     g_bal_defaults = BAL;
+
+    if (campaign) { run_campaign(campSeed, verbose); return 0; }
 
     std::printf("VolunteerArmyPC · 无头平衡扫描（无渲染 / 无引擎）\n");
     std::printf("剧本 = 网页版 sweep.js 的 SCRIPT_A；种子表也一致；dt=%.2f 上限 %.0f 秒\n\n", DT, T_MAX);

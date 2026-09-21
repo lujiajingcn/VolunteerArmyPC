@@ -1,5 +1,6 @@
 // VolunteerArmyPC —— 世界状态 / 单位工厂 / 车队 / 地形与视线（对应网页版第二章）
 #include "sim/va_world.h"
+#include "sim/va_campaign.h"
 
 #include <algorithm>
 #include <cmath>
@@ -308,8 +309,17 @@ Unit *make_unit(const RosterDef &def, float x, float y, Team team, bool isPlayer
 // 玩家的合成花名册项（网页版直接内联字面量）
 static const RosterDef PLAYER_DEF{ "player", "你（队长）", "队长", "1组", "rifle", false, false, {} };
 
-void init_world(uint32_t seed) {
+void init_world(uint32_t seed, int p_level, const CarryOver *p_carry) {
     RNG.reseed(seed);
+    /* 铺关必须排在所有 RNG 抽取**之前**：apply_level 用的是自己那条独立随机流
+       （见 va_campaign.cpp），所以插在这里不会平移主 RNG 的序列 ——
+       天气 / 地雷 / 密码箱 / 车队顺序与改动前逐次相同。 */
+    if (p_level >= 0) {
+        apply_level(p_level, seed);
+        CAM.active = true;
+    } else {
+        CAM.active = false;
+    }
     W.seed = seed;
 
     W.props.assign(BASE_PROPS.begin(), BASE_PROPS.end());
@@ -329,7 +339,7 @@ void init_world(uint32_t seed) {
     W.triggered = false; W.triggerT = 0;
     W.reinforceDone = false; W.reinforceT = CFG.reinforceAt;
     W.convoyStarted = false; W.convoyEscaped = false;
-    W.bridgeAlive = true; W.evac = EVAC_DEFAULT; W.evacArmed = false;
+    W.bridgeAlive = true; W.evac = EVAC_DEFAULT; W.evacArmed = false; W.evacOrdered = false;
     W.hasMarker = false; W.deployDone = false; W.noise = 0; W.noiseT = 0;
     W.started = false; W.paused = false;
 
@@ -345,6 +355,10 @@ void init_world(uint32_t seed) {
     // 天气变体（重玩性）—— 注意只调用一次 RNG
     const float wr = RNG.next();
     W.weather = wr < 0.45f ? "sunny" : (wr < 0.8f ? "rain" : "night");
+    /* 种子山那一关是**夜战**（史实：6 月 3 日凌晨夜袭夺回阵地），所以强制夜间。
+       放在抽取之后覆盖而不是跳过抽取：少一次 RNG.next() 就会把后面的地雷、
+       密码箱、车队顺序整体平移一格，旧基线的数据全废。 */
+    if (p_level >= 0 && level_at(p_level).forceNight) W.weather = "night";
 
     // 玩家 + 10 名队友
     float px = 872, py = 872;
@@ -353,11 +367,42 @@ void init_world(uint32_t seed) {
     pl->facing = -3.141592653589793f / 2.0f;
     W.player = pl;
 
-    for (const auto &r : ROSTER) {
-        float rx = 880, ry = 900;
-        recommend_of(r.id, rx, ry);
-        Unit *u = make_unit(r, rx + rr(-8, 8), ry + rr(-8, 8), Team::Ally, false);
-        u->hasHome = true; u->homePos = { rx, ry };
+    /* 战役第二关起走 p_carry：只把上一关**撤出来的人**建出来，血量 / 弹药 / 士气
+       原样带过来，阵亡的直接不出现。这是"严格继承"的落点 —— 人越打越少，
+       后面每一关的撤离门槛也跟着逐关下调（LEVELS 里的 evacNeed）；
+       门槛要是不动，第二关就必输，玩家只会觉得游戏在耍赖。 */
+    const bool carried = (p_carry != nullptr && p_carry->valid);
+    if (carried) {
+        for (const auto &c : p_carry->units) {
+            if (c.id == "player") {
+                /* 队长不带"失能"进新关：玩家倒地要交出指挥权、还要 UI 配合，
+                   开局就躺着等于把操作权收走。带伤可以（hp 按带出来的值走）。 */
+                pl->hp = clampf(c.hp, 1.0f, c.maxHp);
+                pl->maxHp = c.maxHp; pl->morale = c.morale;
+                pl->ammo = c.ammo; pl->magAmmo = c.magAmmo;
+                pl->grenades = c.grenades; pl->smokes = c.smokes;
+                continue;
+            }
+            const RosterDef *r = roster_of(c.id);
+            if (r == nullptr) continue;
+            float rx = 880, ry = 900;
+            recommend_of(r->id, rx, ry);
+            Unit *u = make_unit(*r, rx + rr(-8, 8), ry + rr(-8, 8), Team::Ally, false);
+            u->hasHome = true; u->homePos = { rx, ry };
+            u->hp = clampf(c.hp, 1.0f, c.maxHp); u->maxHp = c.maxHp;
+            u->morale = c.morale;
+            u->ammo = c.ammo; u->magAmmo = c.magAmmo;
+            u->rockets = c.rockets; u->grenades = c.grenades; u->smokes = c.smokes;
+            u->kills = c.kills; u->shots = c.shots; u->hits = c.hits;
+            if (c.downed) { u->downed = true; u->downTimer = 45; u->state = "失能"; u->hp = 0; }
+        }
+    } else {
+        for (const auto &r : ROSTER) {
+            float rx = 880, ry = 900;
+            recommend_of(r.id, rx, ry);
+            Unit *u = make_unit(r, rx + rr(-8, 8), ry + rr(-8, 8), Team::Ally, false);
+            u->hasHome = true; u->homePos = { rx, ry };
+        }
     }
 
     // 地雷
@@ -379,14 +424,29 @@ void init_world(uint32_t seed) {
         W.boxWhere = (RNG.next() < 0.6f) ? "apc" : "officer";
     }
 
-    // 车队顺序随机
+    /* 车队顺序随机。**战役里换成关卡自己的编成表**：涟川山口来的是骑 1 师
+       （两辆装甲车 + 一辆坦克），内外加山是上百辆车的装甲集群（三辆坦克）——
+       逐关的"对面是谁"写在这张表里，而不是共用一个随机池。
+       抽取次数保持一次，理由同上（不能平移主 RNG 序列）。 */
     const float orderRoll = RNG.next();
-    if (orderRoll < 0.62f)      W.convoyOrder = { "jeep", "apc", "tank", "truck", "apc", "jeep" };
-    else if (orderRoll < 0.82f) W.convoyOrder = { "jeep", "tank", "apc", "truck", "apc", "jeep" };
-    else                        W.convoyOrder = { "apc", "jeep", "apc", "tank", "truck", "jeep" };
+    if (p_level >= 0 && !level_at(p_level).convoyOrders.empty()) {
+        const auto &os = level_at(p_level).convoyOrders;
+        W.convoyOrder = os[(size_t)(orderRoll * (float)os.size()) % os.size()];
+    } else if (orderRoll < 0.62f) {
+        W.convoyOrder = { "jeep", "apc", "tank", "truck", "apc", "jeep" };
+    } else if (orderRoll < 0.82f) {
+        W.convoyOrder = { "jeep", "tank", "apc", "truck", "apc", "jeep" };
+    } else {
+        W.convoyOrder = { "apc", "jeep", "apc", "tank", "truck", "jeep" };
+    }
 
-    W.infantryTotal = ri(10, 16);
+    W.infantryTotal = (p_level >= 0) ? ri(level_at(p_level).infantryMin, level_at(p_level).infantryMax)
+                                     : ri(10, 16);
     W.reinforceT = CFG.reinforceAt + std::round(rr(-30, 30));
+
+    // 开局人数：撤离门槛按它算（effective_evac_need），必须在建队之后统计
+    LV.startCount = 0;
+    for (auto &u : W.units) if (u.team == Team::Ally && !u.dead) LV.startCount++;
 
     build_convoy();
     update_evac_marker();

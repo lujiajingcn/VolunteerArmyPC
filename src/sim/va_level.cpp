@@ -1,5 +1,6 @@
 // VolunteerArmyPC —— 伤害 / 死亡 / 载具损毁 / 爆炸（对应网页版 logic_ref.js 856~1011 行）
 #include "sim/va_world.h"
+#include "sim/va_campaign.h"
 #include "sim/va_utf8.h"
 
 #include <algorithm>
@@ -229,11 +230,30 @@ void explosion(float x, float y, float r, float dmg, Team team, const std::strin
     }
     for (auto &p : W.props) {
         if (p.destroyed || !p.explosive) continue;
+        /* 水坝（dam）**不吃流弹** —— 只有人跑到坝上安放炸药才炸得开（damTask 分支）。
+           理由：坝是混凝土的，一发坦克炮弹或一个汽油桶的连锁爆炸不该把它打穿；
+           更要紧的是**目标不能被偶然完成** —— 坝体 150 宽、落点就在侧射阵位
+           （POINTS[1]）附近，而这里的判定是 r+8，只要肯让路过的爆炸生效，
+           "跑到坝上、自断退路"那个史实两难就可能被一次意外连锁悄悄替玩家完成。
+           是不是真的发生过，看 `LV.damByCharge`（工具侧打印"已炸(安放)/已炸(非安放)"）。 */
+        if (p.dam) continue;
         if (distf(x, y, p.x, p.y) < r + 8) { p.destroyed = true; chain_barrel(p); }
     }
 }
 
 void chain_barrel(Prop &p) {
+    /* 水坝（内外加山）。**史实的两难就在这**：水库一炸，南面平原变成泥沼，
+       美军的坦克陷在那里一整个上午；同时山上那两个排也再没有退路。
+       所以这里除了洪水，还要明确告诉玩家"退路也断了" ——
+       只报喜不报忧的话，等他发现撤不回去时只会觉得是被坑了。 */
+    if (p.dam) {
+        LV.damBlown = true;
+        explosion(p.x, p.y, 210, 70, Team::None, "barrel");
+        say("全体", "水库炸开了！南面的平原全淹了！", "sys");
+        set_alert("水淹七军 — 敌装甲陷入洪流；山上的退路也断了", 4.5f);
+        toast("水坝已炸开：南面平原变成泥沼");
+        return;
+    }
     explosion(p.x, p.y, 78, 85, Team::None, "barrel");
 }
 

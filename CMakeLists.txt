@@ -29,6 +29,7 @@ add_subdirectory(ext/godot-cpp)
 set(VA_SOURCES
     src/register_types.cpp
     src/sim/va_config.cpp
+    src/sim/va_campaign.cpp
     src/sim/va_grammar.cpp
     src/sim/va_parser.cpp
     src/sim/va_world.cpp

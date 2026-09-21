@@ -16,6 +16,8 @@
 
 namespace va {
 
+struct CarryOver;   // 战役层（va_campaign.h）的定义；这里只用指针，前向声明足够
+
 // ------------------------------------------------------------- 事件出口
 // 逻辑层要"对外说话"时调用这些；由引擎侧（world_sim.cpp）实现。
 struct SimEvents {
@@ -62,6 +64,13 @@ struct WorldState {
     Vec2  marker{};
     EvacPoint evac = EVAC_DEFAULT;
     bool  evacArmed = false;
+    /* 玩家**明确下过撤退令**（"全体，撤离" / "撤退"），或撤离人数已达标。
+       与 evacArmed 的区别：evacArmed 还在"拿到密码箱"时置位 —— 在原来那种
+       单关卡（拿箱 = 唯一目标 = 该走了）里两者等价，但战役里关卡目标可能是
+       "守住阵地 150 秒"，物件只是副目标，**拿箱不等于要走**。
+       用它来决定"收拢阶段"开不开门，否则会出现"箱子刚到手、人还没到撤离点，
+       收拢窗口就开完了"，整队人被判定为没带出来（实测第三关 0 人撤离）。 */
+    bool  evacOrdered = false;
     bool  bridgeAlive = true;
     bool  hasBox = false;
     BoxItem box;
@@ -181,7 +190,11 @@ inline float dist2_to(float x, float y, const Target &t) { return dist2f(x, y, t
 
 // --------------------------------------------------------------- 单位 / 车辆
 Unit *make_unit(const RosterDef &def, float x, float y, Team team, bool isPlayer);
-void  init_world(uint32_t seed);
+/* p_level < 0 = 不铺关（沿用容器里的当前关卡数据）。**这个分支是给 tools/va_sweep
+   之类的离线入口留的**：它们要的是"改动前那一关"的逐项行为，不能因为加了战役
+   就把时间轴、撤离门槛、目标清单一起换掉 —— 那样扫描出来的胜率与旧基线不可比。
+   进战役时必须显式传关卡下标（并可选传上一关带出来的队伍）。 */
+void  init_world(uint32_t seed, int p_level = -1, const CarryOver *p_carry = nullptr);
 void  build_convoy();
 bool  convoy_pos(const Vehicle &v, float progress, float &ox, float &oy);
 bool  way_point_at(float d, float &ox, float &oy, float &oa);

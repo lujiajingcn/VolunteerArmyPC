@@ -1,6 +1,7 @@
 // VolunteerArmyPC —— 玩家控制 + 车队行军 / 车载武器
 // 对应网页版 logic_ref.js 1994~2068（第六章：玩家）、2101~2206（车队）行
 #include "sim/va_world.h"
+#include "sim/va_campaign.h"
 
 #include <algorithm>
 #include <cmath>
@@ -157,6 +158,10 @@ void update_vehicles(float dt) {
                 if (v->blockedT > 2.5f || v->stopT > 5.5f) dismount(v);
             }
         }
+        /* 洪水（内外加山）：陷进泥水里的车还在爬，只是爬得极慢。
+           刻意不写 0 —— 史实是"整整一个上午无法前进"，不是"钉死不动"；
+           留一点速度，玩家能看见它们在往前拱，压迫感才在。 */
+        speed *= flood_speed_mul(v->x, v->y);
         if (speed > 0) {
             const float nd = v->dist + speed * dt;
             float px = 0, py = 0, pa = 0;

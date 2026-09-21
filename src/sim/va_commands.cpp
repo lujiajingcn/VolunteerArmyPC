@@ -1,6 +1,7 @@
 // VolunteerArmyPC —— 指令下发：呼号 → 队员；服从度 → 立即/延迟/拒绝
 // 对应网页版 logic_ref.js 1016~1388 行（第三章）
 #include "sim/va_world.h"
+#include "sim/va_campaign.h"
 
 #include <algorithm>
 #include <cmath>
@@ -36,7 +37,7 @@ float calc_obey(const Unit &u, const std::string &actId) {
     if (u.role == "反坦克手" && (id == "atTank" || id == "atAPC" || id == "rocket")) o += 0.25f;
     if (u.group == "火力组" && (id == "fire" || id == "suppress" || id == "focusFire")) o += 0.18f;
     if (u.group == "支援组" && id == "resupply") o += 0.3f;
-    if (u.role == "爆破手" && (id == "detonate" || id == "blowBridge")) o += 0.35f;
+    if (u.role == "爆破手" && (id == "detonate" || id == "blowBridge" || id == "blowDam")) o += 0.35f;
     if (u.state == "恐慌") o -= 0.35f;
     if (u.downed || u.dead) o = 0;
     return clampf(o, 0, 1);
@@ -203,12 +204,12 @@ void apply_order(Unit *u, const ParsedCmd &cmd) {
         u->hasMoveGoal = true;
         u->state = "移动";
     } else if (id == "retreat") {
-        W.evacArmed = true;
+        W.evacArmed = true; W.evacOrdered = true;
         u->moveGoal = { W.evac.x + rr(-50, 50), W.evac.y + rr(-50, 50) };
         u->hasMoveGoal = true;
         u->state = "撤退"; u->fireMode = "free";
     } else if (id == "evac") {
-        W.evacArmed = true;
+        W.evacArmed = true; W.evacOrdered = true;
         u->moveGoal = { W.evac.x + rr(-40, 40), W.evac.y + rr(-40, 40) };
         u->hasMoveGoal = true;
         u->state = "撤离";
@@ -350,12 +351,24 @@ void apply_order(Unit *u, const ParsedCmd &cmd) {
         u->bridgeTask = true; u->state = "移动";
         u->moveGoal = { POINTS[2].x, POINTS[2].y };   // C 点
         u->hasMoveGoal = true;
+    } else if (id == "blowDam") {
+        /* 炸水库。目标点取**当前关的水坝位置**（LV.damX/Y，铺关时落在 B 点），
+           不是 POINTS[1] —— LV 是"这一关到底有没有坝"的唯一真值，
+           在没坝的关下这条命令会给出"这里没有水库"，而不是把人派到 B 点干等。 */
+        if (!LV.damX && !LV.damY) {
+            say(u->name, "这附近没有水库可炸", "no");
+        } else {
+            u->damTask = true; u->state = "移动";
+            u->moveGoal = { LV.damX, LV.damY };
+            u->hasMoveGoal = true;
+            say(u->name, "我去炸大坝 —— 炸了我们就没退路了", "ok");
+        }
     } else if (id == "cancel") {
         u->order.active = false;
         u->hasMoveGoal = false; u->hasCoverPos = false;
         u->holdPosition = false; u->fireMode = "free";
         u->preferType.clear(); u->focusTarget = Target();
-        u->formationFollow = false; u->boxTask = false; u->bridgeTask = false;
+        u->formationFollow = false; u->boxTask = false; u->bridgeTask = false; u->damTask = false;
         u->state = "待命";
     } else {
         u->state = "警戒";
@@ -455,12 +468,24 @@ void issue_command(const ParsedCmd &cmd, bool silent) {
     auto targets = resolve_targets(cmd);
     const std::string &id = cmd.actId;
 
-    /* 全局指令：起爆 / 炸桥 */
-    if (id == "detonate" || id == "blowBridge") {
+    /* 全局指令：起爆 / 炸桥 / 炸水库 */
+    if (id == "detonate" || id == "blowBridge" || id == "blowDam") {
         Unit *holder = ally_by_id("laobai");
         if (!holder || holder->dead || holder->downed) {
             holder = nullptr;
             for (auto &x : W.units) if (x.id == "shitou" && !x.dead && !x.downed) { holder = &x; break; }
+        }
+        /* 上面两个都倒下时，再退到"任何还带着炸药的人"，最后才是任何活人。
+           原先只有老白 / 石头两个候选，实测第六关老白阵亡后整条命令就废了 ——
+           而那一关的主目标恰恰是炸坝，等于"一个人死掉 → 这一关必输"。
+           爆破是**班组能力**不是某一个人的专利，候选池不该只有两个名字。 */
+        if (!holder) {
+            for (auto &x : W.units)
+                if (x.team == Team::Ally && !x.dead && !x.downed && x.hasCharge) { holder = &x; break; }
+        }
+        if (!holder) {
+            for (auto &x : W.units)
+                if (x.team == Team::Ally && !x.dead && !x.downed) { holder = &x; break; }
         }
         if (!holder) { say("全体", "没人能操作炸药了", "no"); return; }
         const float ob = calc_obey(*holder, id);

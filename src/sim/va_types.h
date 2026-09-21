@@ -56,6 +56,10 @@ struct Prop {
     bool  destroyed = false;
     float hp = 0;
     float w = 0, h = 0;   // trench 用
+    /* 水坝（内外加山「水淹七军」）：可被打爆，炸开后南侧平原变洪水区。
+       单独一个标记而不是靠 PropType 区分：它是 Wall 的一种，
+       但爆炸后果比普通墙大得多（洪水 + 我方退路被断），混在类型里判断会漏。 */
+    bool  dam = false;
 };
 
 // ------------------------------------------------------------------ 战斗体
@@ -220,6 +224,7 @@ struct Unit {
     Unit *resupplyTarget = nullptr;
     bool  grenadeOrder = false, smokeOrder = false;
     bool  bridgeTask = false; float plantT = 0;
+    bool  damTask = false;      // 去炸水库大坝（内外加山「水淹七军」）
     Unit *dragging = nullptr;
     Unit *draggedBy = nullptr;
     bool  carryBox = false;

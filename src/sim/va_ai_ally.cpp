@@ -1,6 +1,7 @@
 // VolunteerArmyPC —— 队友 AI（感知 → 决策 → 行动 → 通讯）
 // 对应网页版 logic_ref.js 1734~1989 行（第五章：队友状态机）
 #include "sim/va_world.h"
+#include "sim/va_campaign.h"
 
 #include <algorithm>
 #include <cmath>
@@ -149,6 +150,35 @@ void update_ally(Unit *u, float dt) {
                     update_evac_marker();
                     say(u->name, "桥炸了！改从南侧树林撤离", "sys");
                     toast("桥梁已摧毁 · 撤离点改为 E 南侧树林");
+                } else if (std::floor(u->plantT) != std::floor(u->plantT - dt)) {
+                    say(u->name, "安放炸药 " + std::to_string((int)std::floor(u->plantT)) + "/8", "ok");
+                }
+            }
+            return;
+        }
+    }
+    /* 炸水库（内外加山）。流程照抄炸桥：走到坝上 → 安放炸药 8 秒 → 起爆。
+       为什么**必须由人跑过去安放**而不是"远程一按就炸"：史实里这一炸是 5 连
+       自己跑到坝上、自断退路换来的；做成一键按钮，那个两难就消失了。 */
+    if (u->damTask) {
+        if (LV.damBlown) { u->damTask = false; }
+        else if (!LV.damX && !LV.damY) { u->damTask = false; }
+        else {
+            u->moveGoal = { LV.damX, LV.damY }; u->hasMoveGoal = true;
+            move_step(u, dt, 1.1f);
+            /* 到达判定必须**把坝体自己的半径算进去**：坝是一堵 150 宽的墙，
+               人会被它挡在外面，离中心最近也有 ~75 单位 ——
+               照抄炸桥那个 70 的话，条件是永远不可能成立的（实测派工 3 人、
+               安放进度恒为 0，就是这个原因）。 */
+            if (distf(u->x, u->y, LV.damX, LV.damY) < LV.damR + 80.0f) {
+                u->plantT += dt;
+                u->aiming = true;
+                if (u->plantT > 8) {
+                    u->damTask = false;
+                    LV.damByCharge = true;    // 记清"是人工安放的"（见 damByCharge 注释）
+                    for (auto &p : W.props) {
+                        if (p.dam && !p.destroyed) { p.destroyed = true; chain_barrel(p); break; }
+                    }
                 } else if (std::floor(u->plantT) != std::floor(u->plantT - dt)) {
                     say(u->name, "安放炸药 " + std::to_string((int)std::floor(u->plantT)) + "/8", "ok");
                 }

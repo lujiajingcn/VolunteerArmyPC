@@ -20,6 +20,7 @@
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include "sim/va_world.h"
+#include "sim/va_campaign.h"   // 战役：简报要报当前是第几关、哪一天、当面之敌
 #include "node/scene_builder.h"   // ally_art_key：名册胸像与三维模型共用同一套键
 
 using namespace godot;
@@ -1934,7 +1935,15 @@ void Hud::draw_end_panel() {
         tx_r(String::utf8(c2), x + w - 50.0f * s_, y + 358.0f * s_, 14,
              Color(0.80f, 0.84f, 0.88f, 0.80f * e));
 
-        tx_c(String::utf8("按 R 重新部署 · Esc 回主菜单"), x + w * 0.5f, y + h - 26.0f * s_, 15,
+        /* 底部这行提示**必须说清 R 会做什么**：战役里"过关"与"没打过"是两件事 ——
+           前者转进下一阵地（带着撤出来的队伍），后者重打本关。
+           文案直接读 end_game 给的 overKind，不自己从 stats 反推：
+           战绩全达标但没过关（撤离人数不够）也会走 end_game，
+           那种不算转进，按钮就不能写成"转进下一阵地"。 */
+        const char *hint = "按 R 重新部署 · Esc 回主菜单";
+        if (va::W.overKind == "转进")      hint = "按 R 转进下一阵地 · Esc 回主菜单";
+        else if (va::W.overKind == "胜利") hint = "按 R 重新入伍 · Esc 回主菜单";
+        tx_c(String::utf8(hint), x + w * 0.5f, y + h - 26.0f * s_, 15,
              Color(accent.r, accent.g, accent.b, 0.70f + 0.30f * std::sin(clock_ * 4.0f)));
     }
 }
@@ -2253,10 +2262,18 @@ void Hud::draw_brief() {
         draw_line(Vector2(rr, bb), Vector2(rr - L, bb), cc, w, true);
         draw_line(Vector2(rr, bb), Vector2(rr, bb - L), cc, w, true);
     }
-    tx(String::utf8("区域态势 · 断头谷公路"), x0, ir.position.y + ih + 26.0f * s_, 14,
-       c_shell_dim());
-    tx(String::utf8("车队自东沿公路进入伏击圈；河谷上的桥是敌退路，可炸。"),
-       x0, ir.position.y + ih + 48.0f * s_, 13, c_shell_faint());
+    /* 态势图的标题与副题**跟着当前关卡走**。
+       战役里六关的地形、来敌方向、可炸目标都不一样，写死"断头谷公路"
+       会让第二关的玩家拿着一份第一关的态势说明去打仗。
+       非战役（旧的单关卡入口）保持原文案 —— 那条路径的行为不许被挪动。 */
+    const std::string mapTitle = va::CAM.active
+        ? (va::cur_level().name + std::string(" · 区域态势"))
+        : std::string("区域态势 · 断头谷公路");
+    const std::string mapSub = va::CAM.active
+        ? (std::string("我方：") + va::cur_level().ourUnit + "　｜　当面之敌：" + va::cur_level().enemyUnit)
+        : std::string("车队自东沿公路进入伏击圈；河谷上的桥是敌退路，可炸。");
+    tx(String::utf8(mapTitle.c_str()), x0, ir.position.y + ih + 26.0f * s_, 14, c_shell_dim());
+    tx(String::utf8(mapSub.c_str()), x0, ir.position.y + ih + 48.0f * s_, 13, c_shell_faint());
 
     // ---- 右栏：任务元信息 ----
     const float rx = x0 + iw + 66.0f * s_;
@@ -2287,9 +2304,13 @@ void Hud::draw_brief() {
     float y = top + 78.0f * s_;
 
     struct KV { const char *k; std::string v; };
+    /* 战役模式下地点/时间**取自关卡表**（"涟川山口 · 第一道防线核心" / "1951.6.1"）——
+       这两条是史实的锚点，不该由渲染层再编一遍；关卡表改了简报自动跟着改。 */
     const KV meta[4] = {
-        { "地点",   "朝鲜东线 · 断头谷公路" },
-        { "时间",   "1951 年 · 拂晓前" },
+        { "地点",   va::CAM.active ? std::string(va::cur_level().place)
+                                  : std::string("朝鲜东线 · 断头谷公路") },
+        { "时间",   va::CAM.active ? std::string(va::cur_level().date)
+                                  : std::string("1951 年 · 拂晓前") },
         { "天气",   weather_cn(va::W.weather) },
         { "撤离点", va::W.evac.name },
     };
