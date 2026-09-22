@@ -107,6 +107,13 @@ void WorldSim::aim_at_road() {
      VA_UNIT_SHOW=veh:<类型>[:<度>]  单车近景，类型 = jeep | apc | tank | truck
      VA_UNIT_SHOW=veh:row           四辆车的陈列排（按 jeep/apc/tank/truck 固定顺序）
 
+   地物还有两条（前缀 prop:，2026-09-22 加）：
+     VA_UNIT_SHOW=prop:<键>[:<度>]  近景单体，键 = prop_rock_a | prop_rock_b |
+                                    prop_pine | prop_bush（按场上典型尺寸摆）
+     VA_UNIT_SHOW=prop:row          四件地物的陈列排（固定顺序，看彼此差异）
+   地物这条的取景按**物体自身的实际高度**推（灌木 0.6 m 与松树 8 m 没法共用一套距离），
+   且相机高取 0.5×H —— 低矮地物的判据是"底下那条地面余量"，相机太高就俯视、余量被压没。
+   
    【载具为什么要单独一条通道】战场截图答不了载具的三个问题：车头朝哪个方向、
    跟人比有多大、轮子是踩在地上还是悬在半空。车队在公路上、离玩家几十到上百米，
    画面上就是一小块，还常被地形切掉一半 —— 与角色那轮的处境一模一样。
@@ -304,9 +311,121 @@ void WorldSim::build_unit_showcase() {
         return;
     }
 
+    if (mode.rfind("prop:", 0) == 0) {
+        /* ---- 地物近景 / 陈列排：prop:<键>[:<临时偏航角>] 或 prop:row ----
+         【为什么地物也要一条通道】岩石/树/灌木换真模型之后，同样有三件事
+         战场截图答不了：**比例对不对**（跟 1.68 m 的兵比多大）、
+         **底是踩在地上还是悬空**、**压扁有没有把模型压成一块饼**。
+         而地物恰恰是"数量最多、每块都很小"的那一类 —— 场上三十块石头里
+         随便挑一块，画面上就是几像素，什么都读不出来。
+
+         【取景按"物体自身的实际高度"推，不能照抄角色那套】
+         两个原因：
+           ① 地物的高宽比跨度极大：灌木 0.6 m、松树 8 m，同一套距离必然
+              要么把树拍出框、要么把灌木拍成一个点；
+           ② 相机高度取 0.5×H（而不是固定的 1.05 m）—— 低矮地物的判据是
+              "**底下那条地面余量**"，相机太高就俯视，地面余量被压没了。
+         数字：FOV 32 ⇒ 竖半角 16°、tan = 0.2867，横半视场 = 0.2867×(2560/1369)
+         ≈ 0.536（同一个换算见 veh 分支）。要求"物体高 H 在框内且脚下留 0.25H"：
+           半视场 ≥ 0.65H  ⇒ D ≥ 2.27H
+         再由参照兵定下限（参照兵横向偏 1.6 m，还要留 0.4 m 边距）：
+           0.536D ≥ W/2 + 1.6 + 0.4
+         取两者的大者。岩石落到横向下限（D≈6）、松树落到纵向上限（D≈18.5），
+         正是上面那个"跨度极大"的直接后果。 */
+        std::string rest = mode.substr(5);
+        std::string key = rest, yaw_s;
+        const size_t c = rest.find(':');
+        if (c != std::string::npos) { key = rest.substr(0, c); yaw_s = rest.substr(c + 1); }
+        float dyaw = 0.0f;
+        if (!yaw_s.empty()) dyaw = (float)std::strtod(yaw_s.c_str(), nullptr) * PI / 180.0f;
+
+        const bool row = (key == "row");
+        const char *pk[4] = { "prop_rock_a", "prop_rock_b", "prop_pine", "prop_bush" };
+        // 代表尺寸：岩石/灌木给的是**水平尺度**、树给的是**高**（与 kPropArt 的
+        // by_height 同口径）。取的是场上最常见的档：岩石 p.r≈22、灌木 p.r≈15、树 8 m。
+        const float pt[4] = { 2.20f, 2.20f, 8.00f, 1.65f };
+        // 高宽比只为算取景用，必须与 kPropArt 保持一致（岩石 0.50 / 灌木 0.36）
+        const float phw[4] = { 0.50f, 0.50f, 0.0f, 0.36f };
+        const int n = row ? 4 : 1;
+
+        float max_h = 0.0f, sum_w = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            const float h = (phw[i] > 0.0f) ? pt[i] * phw[i] : pt[i];
+            const float w = (phw[i] > 0.0f) ? pt[i] : pt[i] * 0.5f;   // 树冠估算 0.5H
+            max_h = std::max(max_h, h);
+            sum_w += w;
+        }
+        const float GAP_P = row ? 1.60f : 0.0f;
+        const float row_w = sum_w + GAP_P * (float)(n - 1);
+        const float CAM_H  = std::max(0.90f, 0.50f * max_h);
+        const float D_vert = 2.27f * max_h;
+        const float D_horz = (row ? (row_w * 0.5f * 1.15f) : (row_w * 0.5f + 2.0f)) / 0.536f;
+        const float DIST_M = std::max(6.0f, std::max(D_vert, D_horz));
+        const float PITCH  = -0.06f;
+        const float REF_OFF_M = 1.60f;
+
+        int built = 0;
+        float off_acc = -row_w * 0.5f;
+        for (int i = 0; i < n; ++i) {
+            const std::string k = row ? std::string(pk[i]) : key;
+            const float t = row ? pt[i] : pt[0];
+            Node3D *nd = make_prop_node(k, t, refs_.units);
+            if (nd == nullptr) {
+                // 与角色/载具同口径：缺模型**留空位**而不是把后面的往前挪 ——
+                // 挪了就再也看不出"少哪一个"，而"少哪个"恰恰是要一眼看出来的事。
+                UtilityFunctions::print(String::utf8("[show] 缺地物模型，第 "), i,
+                                        String::utf8(" 格（"), String::utf8(k.c_str()),
+                                        String::utf8("）空置"));
+                continue;
+            }
+            const float w_i = (phw[i] > 0.0f) ? (row ? pt[i] : pt[0]) : 4.0f;
+            const float off_m = row ? (off_acc + w_i * 0.5f) : 0.0f;
+            off_acc += w_i + GAP_P;
+            const float lx = p->x + fx * DIST_M * U + rx * off_m * U;
+            const float ly = p->y + fy * DIST_M * U + ry * off_m * U;
+            // 地物没有"正面"，偏航只用来核对"压扁/对轴有没有把它转歪"。
+            nd->set_transform(Transform3D(Basis(Vector3(0, 1, 0), a + PI + dyaw),
+                                          to3(lx, ly, ground_h(lx, ly))));
+            stage->add_child(nd);
+            ++built;
+        }
+
+        // 比例尺参照兵：与载具那条同一个理由 —— "跟人比多大"只能靠同框回答。
+        if (!row) {
+            if (Node3D *ref = make_unit_node_by_key("char_rifleman", refs_.units)) {
+                const float lx = p->x + fx * DIST_M * U + rx * REF_OFF_M * U;
+                const float ly = p->y + fy * DIST_M * U + ry * REF_OFF_M * U;
+                ref->set_transform(unit_transform(lx, ly, a + PI, false));
+                stage->add_child(ref);
+                UtilityFunctions::print(String::utf8("[show] 比例尺参照兵 char_rifleman 距物心 "),
+                                        REF_OFF_M, "m");
+            } else {
+                UtilityFunctions::print(String::utf8("[show] 比例尺参照兵缺失（char_rifleman）"));
+            }
+        }
+
+        cam_->set_position(to3(p->x, p->y, CAM_H));
+        cam_->set_rotation(Vector3(PITCH, yaw_, 0));
+        if (std::getenv("VA_FOV") == nullptr) cam_->set_fov(32.0f);
+        UtilityFunctions::print(String::utf8("[show] 地物 "), String::utf8(key.c_str()),
+                                String::utf8(" 距离 "), DIST_M, String::utf8("m 机高 "), CAM_H,
+                                String::utf8(" 横向跨 "), row_w,
+                                String::utf8(" 临时偏航 "), dyaw * 180.0f / PI,
+                                String::utf8(" 度 建出 "), built, "/", n);
+        /* 藏掉真单位、真车队、以及**道具层**。
+           这里道具层是**必藏**的（与载具那条同理、与角色那条相反）：
+           场上本来就散着三十块程序化/真模型石头与二十棵树，而检阅台这套
+           用的又是同一批模型、还冻在出生点附近 —— 同框会把"这一排到底几个"
+           彻底搅乱（载具那轮实测一块岩石正好压在吉普车身上、
+           角色那轮实测一根树干正好立在视线中轴上）。 */
+        if (refs_.units != nullptr) refs_.units->set_visible(false);
+        if (refs_.vehicles != nullptr) refs_.vehicles->set_visible(false);
+        if (refs_.props != nullptr) refs_.props->set_visible(false);
+        return;
+    }
+
     // ---- 陈列排 ----
-    const std::vector<std::string> &keys = all_art_keys();
-    // 末位那一个是**倒在地上的步枪手** —— 倒地姿态只有摆出来才能确认，
+    const std::vector<std::string> &keys = all_art_keys();    // 末位那一个是**倒在地上的步枪手** —— 倒地姿态只有摆出来才能确认，
     // 而战场上要等到有人被打倒才看得到，取证时等不起（也未必等得到）。
     const int n = (int)keys.size() + 1;
 

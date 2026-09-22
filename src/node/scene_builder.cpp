@@ -239,7 +239,11 @@ static Ref<ArrayMesh> make_terrain_mesh() {
 
 // 只重建掩体层（见头文件说明）
 // add_prop 定义在文件后半段，这里先声明（掩体建模函数很长，不搬家了）
-static void add_prop(Node3D *parent, const va::Prop &p);
+// 第二个参数是**地物三维模型原型的挂载点**（传 refs.units，场景里已有的容器）：
+// 原型必须挂进场景树，否则它持有的 mesh / 材质 / 贴图在进程退出时会被 Godot
+// 报成 "RID allocations ... leaked at exit"，而"日志里有没有 ERROR"正是本工程的
+// 回归判据，被这种假错误污染之后真问题就看不见了（角色/武器/载具三条都踩过）。
+static void add_prop(Node3D *parent, Node *p_proto_parent, const va::Prop &p);
 
 void rebuild_props(Node3D *root, SceneRefs &refs) {
     if (refs.props != nullptr) {
@@ -248,7 +252,7 @@ void rebuild_props(Node3D *root, SceneRefs &refs) {
     }
     Node3D *props = memnew(Node3D);
     props->set_name("Props2");
-    for (const auto &p : va::W.props) add_prop(props, p);
+    for (const auto &p : va::W.props) add_prop(props, refs.units, p);
     root->add_child(props);
     refs.props = props;
 }
@@ -1606,15 +1610,241 @@ Node3D *make_box_node() {
     return n;
 }
 
+// ------------------------------------------------------- 战场地物模型（图生3D，2026-09-22）
+/* 【这一档换的是什么】场上**数量最多**的三类掩体：岩石（每关三十来块）、
+   树（二十来棵）、灌木（十几丛）。它们原先全是程序化图元 ——
+   岩石是"极坐标球 + 逐顶点半径扰动"的多面体，树是"圆柱 + 斜插分枝 + 球簇树冠"，
+   灌木是"3~5 个小球"。三样在近景里都读得出是几何拼的，最出戏的是树冠：
+   一根杆顶三个绿球。
+
+   【归一化口径：把"占多大地方"原样搬过来】这是本档唯一不能错的一件事。
+   逻辑层的 p.r 决定这块东西遮住多大一片，而程序化那套的尺寸**就是**从 p.r 推的
+   （岩石网格的顶点半径 = r = p.r × S，再压扁 flat=0.50）。所以换模型时不能按
+   模型自己的尺寸摆，而要把它的包围盒拉到"原来那套图元的包围盒"：
+
+     岩石   宽 = 2·r         高 = 1.00·r       底沉 0.24·r（= 原来"中心抬 0.26·r"）
+     灌木   宽 = 2.2·r       高 = 0.80·r       底沉 0.10·r
+     松树   只定高 = 7.0 + rng·3.0（沿用原公式），冠幅跟着模型走
+
+   两款"按宽"、一款"按高"不是随手定的：
+     · 岩石/灌木低矮，它们的"遮挡"就是那个水平圆 —— 按水平尺度归一化、再把高度
+       压到固定比例。高了矮了都会立刻改变"能不能藏住"的读感，而那是玩法；
+     · 树只按高度归一化。逻辑层对树的 p.r **只**约束"俯视遮挡半径"、高度本来就不受
+       它约束（见下面 Tree 分支那句注释），若按冠幅归一化，8 米的树会缩成 3 米的灌木。
+       代价是树冠比原来宽（原来约 2.1 m、现在约 4 m）—— **那正是要改的东西**：
+       原来是一根杆顶三个球。另注意"视觉比逻辑宽"这件事**改动前后同向**，
+       改动前 2.1 m 也已经 > 2·p.r（1.6 m），不是这一次新引入的偏差。
+
+   【变体：一份模型 + hash 轮换】两块石头是**两份不同剪影**（棱角裸岩 / 苔覆圆石），
+   由 add_prop 按 hash 交替取，偏航也按 hash 撒开 —— 三十多块石头不该是同一块
+   复制出来的。生成额度有限（内置通道 5 次/天），"多做几个变体"太贵，
+   而"一份模型 + hash 轮换"是同样效果里最便宜的。
+
+   【回退链】任何一步失败（文件缺失 / 解析失败 / 尺寸退化）一律返回 nullptr，
+   由 add_prop 回退到原来的程序化图元 —— 少一个模型文件不该让战场上少一块掩体。
+   那套程序化图元同时是"真模型接坏了吗"的对照基准，**不要删**。 */
+
+struct PropArtDef {
+    const char *key;
+    // true ：原型归一化到"高 = 1"，实例按目标**高**等比缩放（树）
+    // false：原型归一化到"水平尺度 = 1"且高/宽压到 hw，实例按目标**宽**等比缩放
+    bool  by_height;
+    float hw;          // by_height = false 时的高宽比（压扁量）
+};
+
+static const PropArtDef kPropArt[] = {
+    { "prop_rock_a", false, 0.50f },   // 棱角裸岩
+    { "prop_rock_b", false, 0.50f },   // 苔覆圆石（矮而宽）
+    { "prop_pine",   true,  0.00f },   // 针叶树
+    { "prop_bush",   false, 0.36f },   // 低矮灌丛
+};
+static const int kPropArtN = (int)(sizeof(kPropArt) / sizeof(kPropArt[0]));
+
+static const PropArtDef *prop_art_def(const std::string &p_key) {
+    for (int i = 0; i < kPropArtN; ++i) {
+        if (p_key == kPropArt[i].key) return &kPropArt[i];
+    }
+    return nullptr;
+}
+
+static std::map<std::string, Node3D *> s_prop_proto;   // 键 -> 单位原型（已归一化，隐藏）
+static std::map<std::string, bool> s_prop_failed;      // 失败过就别每块石头再试一次
+
+static Node3D *load_prop_proto(const std::string &p_key, Node *p_parent) {
+    auto it = s_prop_proto.find(p_key);
+    if (it != s_prop_proto.end()) {
+        return it->second;
+    }
+    if (s_prop_failed.count(p_key) != 0) {
+        return nullptr;
+    }
+
+    const String path = String("res://assets/art/prop/model/") +
+                        String::utf8(p_key.c_str()) + String(".glb");
+    Node3D *raw = load_glb_root(path, "prop");
+    if (raw == nullptr) {
+        s_prop_failed[p_key] = true;
+        return nullptr;
+    }
+
+    AABB box;
+    bool has = false;
+    collect_aabb(raw, Transform3D(), box, has);
+
+    const PropArtDef *def = prop_art_def(p_key);
+    if (def == nullptr) {
+        UtilityFunctions::print(String::utf8("[prop] 表里没有这个键 "), String::utf8(p_key.c_str()));
+        raw->queue_free();
+        s_prop_failed[p_key] = true;
+        return nullptr;
+    }
+
+    // 判据要求**三个方向都非零**：地物是坐在地上的东西，万一生成成一张竖片
+    // （贴图平面）或一条线，体积照样非零，摆到地上就是一块纸板 / 一根杆。
+    if (!has || box.size.x <= 1e-4f || box.size.y <= 1e-4f || box.size.z <= 1e-4f) {
+        UtilityFunctions::print(String::utf8("[prop] 模型没有网格或尺寸退化 "), path,
+                                String::utf8(" 包围盒 "), box.size);
+        raw->queue_free();
+        s_prop_failed[p_key] = true;
+        return nullptr;
+    }
+
+    /* ---- 尺寸退化的第二道闸：**相对**判据 ----
+       上面那条用的是绝对阈值 1e-4，**实测拦不住"饼 / 杆"**：图生3D 对**半透明叶簇**
+       （针叶、灌木）会把体积塌掉，本项目 2026-09-22 实测两个（都在同一批、同一组参数下）：
+         prop_bush  世界包围盒 (1.0017, 0.0016, 0.9878)  高 = 最大维的 0.16%  → 一张绿饼
+         prop_pine  世界包围盒 (0.0703, 1.1956, 0.0752)  宽 = 高的 6.3%        → 一根绿杆
+       bush 那个数离 1e-4 还差 16 倍，**照样过闸**，摆到场上就是一块饼。
+       所以这里补两条**比例**判据 —— 判据必须是比例，因为生成器的输出不带单位：
+       同一个模型整体缩放 1000 倍，绝对阈值会给出相反的答案，而"它是不是饼"不变。
+       ① 任何一维 < 最大维的 2%  → 塌了（纸片 / 杆 / 饼）；
+       ② 按高归一化的地物（树）还要"横向展得开"：真实针叶树的冠幅 / 树高通常 0.3~0.6，
+          取 0.15 作下限 —— 只有"只剩一根树干"那类才会低于它。
+       ⚠️ 判据②只对 by_height 的地物成立。日后若有**又高又细**的正当道具
+       （旗杆 / 电线杆 / 独腿支架）想走这条通道，得给它单独一档，别放宽这条。 */
+    const float mx = std::max(std::max(box.size.x, box.size.y), box.size.z);
+    const float mn = std::min(std::min(box.size.x, box.size.y), box.size.z);
+    const char *degen_why = nullptr;
+    if (mx <= 0.0f || mn < 0.02f * mx) {
+        degen_why = "某一维 < 最大维的 2%（饼 / 纸片 / 杆）";
+    } else if (def->by_height) {
+        const float spread = std::max(box.size.x, box.size.z) / std::max(box.size.y, 1e-5f);
+        if (spread < 0.15f) {
+            degen_why = "按高归一化但横向过窄（冠幅 / 树高 < 0.15）";
+        }
+    }
+    if (degen_why != nullptr) {
+        UtilityFunctions::print(String::utf8("[prop] 模型尺寸退化，回退程序化图元 "), path,
+                                String::utf8(" 包围盒 "), box.size,
+                                String::utf8(" —— "), String::utf8(degen_why));
+        raw->queue_free();
+        s_prop_failed[p_key] = true;
+        return nullptr;
+    }
+
+    /* ---- ① 偏航对轴：把**较长的那个水平轴**转到 X ----
+       地物没有"正面"，这一步只为一个目的：让归一化读到的水平尺度
+       （max(size.x, size.z)）落在模型的真实长轴上，免得拿短边当宽度缩。
+       （载具那批的对轴是同一件事，但那边还多一个"哪一端是车头"的残余角 ——
+       地物不需要，偏航转过去也没人看得出差别。） */
+    const float align_deg = (box.size.z > box.size.x) ? 90.0f : 0.0f;
+    constexpr float PI = 3.14159265358979323846f;
+    Basis b(Vector3(0.0f, 1.0f, 0.0f), align_deg * PI / 180.0f);
+    const AABB rbox = Transform3D(b).xform(box);
+
+    const float hw_meas = std::max(std::max(rbox.size.x, rbox.size.z), 1e-5f);
+    const float hy_meas = std::max(rbox.size.y, 1e-5f);
+
+    /* ---- ② 归一化到"单位原型" ----
+       按宽：先等比缩到水平尺度 = 1，再把 Y 单独压/拉到 hw（高宽比）。
+       按高：等比缩到高 = 1，宽交给模型自己。
+       压扁是**在同一个 Basis 上追加一次 scale**，一次给全 —— 与角色那条一样，
+       不拆成 set_scale + set_rotation 两步（Node3D 会拿内部缓存的 euler/scale
+       重新合成基，顺序与语义都要额外确认，而这里要表达的是一个明确的仿射变换）。 */
+    float k = 0.0f, ys = 1.0f;
+    if (def->by_height) {
+        k = 1.0f / hy_meas;
+    } else {
+        k = 1.0f / hw_meas;
+        ys = (def->hw * hw_meas) / hy_meas;   // 使 (高 × k × ys) / (宽 × k) == hw
+    }
+    b.scale(Vector3(k, k * ys, k));
+    const AABB kbox = Transform3D(b).xform(box);
+    const Vector3 c = kbox.get_center();
+
+    Node3D *outer = memnew(Node3D);
+    Node3D *norm = memnew(Node3D);
+    // 一次给全：绕 Y 对轴 → 单位归一化（含压扁）→ **底面中心挪到原点**。
+    // 原点取底面而不是包围盒中心：地物要按"底贴地面"摆，取中心的话每换一个模型
+    // 都要重算一次下沉量，而那个数只能靠试。
+    norm->set_transform(Transform3D(b, Vector3(-c.x, -kbox.position.y, -c.z)));
+    norm->add_child(raw);
+    outer->add_child(norm);
+
+    if (p_parent != nullptr) {
+        p_parent->add_child(outer);
+        outer->set_visible(false);
+    } else {
+        UtilityFunctions::print(String::utf8("[prop] 警告：没有原型挂载点，模型资源会在退出时报泄漏"));
+    }
+
+    UtilityFunctions::print(String::utf8("[prop] 模型 "), String::utf8(p_key.c_str()),
+                            String::utf8(" 原始包围盒 "), box.size,
+                            String::utf8(" 水平尺度 "), hw_meas,
+                            String::utf8(" 高 "), hy_meas,
+                            String::utf8(" 归一化 "),
+                            def->by_height ? String::utf8("按高 1.0")
+                                           : String::utf8("按宽 1.0"),
+                            String::utf8(" 高宽比 "), def->by_height ? 0.0f : def->hw,
+                            String::utf8(" 对轴 "), align_deg);
+    s_prop_proto[p_key] = outer;
+    return outer;
+}
+
+Node3D *make_prop_node(const std::string &p_key, float p_target, Node *p_proto_parent) {
+    Node3D *proto = load_prop_proto(p_key, p_proto_parent);
+    if (proto == nullptr) {
+        return nullptr;
+    }
+    Node *dup = proto->duplicate();
+    Node3D *n = Object::cast_to<Node3D>(dup);
+    if (n == nullptr) {
+        if (dup != nullptr) dup->queue_free();
+        return nullptr;
+    }
+    // 与角色/载具同一条坑：duplicate() 会把原型上的 visible=false 一起复制过来，
+    // 不显式打开的话整片林子与石头在画面上集体消失。
+    n->set_visible(true);
+    // 等比缩放。目标语义（宽还是高）由 kPropArt 决定，调用方只把数传进来 ——
+    // 让"哪一维是目标"这件事只在一处定义。
+    n->set_scale(Vector3(p_target, p_target, p_target));
+    return n;
+}
+
 // ------------------------------------------------------- 掩体物件
-static void add_prop(Node3D *parent, const va::Prop &p) {
+static void add_prop(Node3D *parent, Node *p_proto_parent, const va::Prop &p) {
     // 种在坡面上：掩体的 (x,y) 与 r 都由逻辑层给、一个没动，这里只把它按地形抬起来。
     const Vector3 pos = to3(p.x, p.y, ground_h(p.x, p.y));
     const float r = p.r * S;
+    // 弧度换算：地物的偏航是"按 hash 撒开"，不是逻辑层给的 —— 地物没有正面，
+    // 转多少只影响"这块石头看起来跟旁边那块不一样"。
+    constexpr float DEG2RAD = 3.14159265358979323846f / 180.0f;
     switch (p.type) {
         case va::PropType::Rock: {
-            // 低模不规则多面体 + 扁平化，贴地而不是"立起来的蛋"
             const uint32_t sd = (uint32_t)(p.x * 31 + p.y * 17);
+            /* 真模型：两份剪影（棱角裸岩 / 苔覆圆石）按 hash 交替，偏航也按 hash 撒开。
+               尺寸照"占多大地方"给：宽 2·r（与 make_rock_mesh 的顶点半径口径一致），
+               高由 kPropArt 的 hw=0.50 定成 1.0·r，底面下沉 0.24·r ——
+               三条合起来正是原来"网格中心抬 0.26·r、网格自身高 1.0·r"的复现。 */
+            if (Node3D *m = make_prop_node((sd & 1u) ? "prop_rock_b" : "prop_rock_a",
+                                           2.0f * r, p_proto_parent)) {
+                m->set_position(pos + Vector3(0, -0.24f * r, 0));
+                m->set_rotation(Vector3(0, (float)(sd % 360u) * DEG2RAD, 0));
+                parent->add_child(m);
+                break;
+            }
+            // 回退：低模不规则多面体 + 扁平化，贴地而不是"立起来的蛋"。
+            // 这套图元同时是"真模型接坏了吗"的对照基准，**不要删**。
             Ref<ArrayMesh> m = make_rock_mesh(sd, r, 0.50f);
             const Color c = hash_color(sd, 0.212f, 0.204f, 0.188f, 0.055f);
             add_mesh(parent, m, pos + Vector3(0, r * 0.26f, 0), mat_solid(c, 0.96f),
@@ -1626,6 +1856,17 @@ static void add_prop(Node3D *parent, const va::Prop &p) {
             // 逻辑层的 p.r 只约束"俯视遮挡半径"（= 树冠的水平尺度），高度不受约束。
             va::Rng rng((uint32_t)(p.x * 73856093u) ^ (uint32_t)(p.y * 19349663u) ^ 0x9E3779B9u);
             const float h = 7.0f + rng.next() * 3.0f;
+            /* 真模型：只按**高度**归一化 —— 而 h 用的还是上面那条原公式，
+               所以地平线上的树高分布一个字没改，变的只是"树长什么样"。
+               冠幅交给模型自己（约 4 m）：逻辑层的 p.r 对树只管"俯视遮挡半径"、
+               高度不受它约束，若改按冠幅归一化，8 米的树会缩成 3 米的灌木。
+               偏航按 hash 撒开 —— 针叶树是旋转体，但要的是"这片林子不是同一棵"。 */
+            if (Node3D *m = make_prop_node("prop_pine", h, p_proto_parent)) {
+                m->set_position(pos);
+                m->set_rotation(Vector3(0, (float)((uint32_t)(p.x * 7 + p.y * 13) % 360u) * DEG2RAD, 0));
+                parent->add_child(m);
+                break;
+            }
             const float trunk_r = r * 0.15f + 0.030f;
             const Color bark_c(0.238f, 0.186f, 0.130f);
             Ref<StandardMaterial3D> bark = mat_solid(bark_c, 0.98f);
@@ -1683,7 +1924,16 @@ static void add_prop(Node3D *parent, const va::Prop &p) {
             break;
         }
         case va::PropType::Bush: {
-            // 一丛 3~5 个小球，不是一个孤零零的大球
+            /* 真模型：按**水平尺度**归一化 —— 2.2·r 是原来那丛小球的水平轮廓量级，
+               高压到 0.80·r、底沉 0.10·r。低矮地物"能不能藏住"读的是水平轮廓，
+               高度一改那件事就跟着变，所以按宽给、由 kPropArt 的 hw 压扁。 */
+            if (Node3D *m = make_prop_node("prop_bush", 2.2f * r, p_proto_parent)) {
+                m->set_position(pos + Vector3(0, -0.10f * r, 0));
+                m->set_rotation(Vector3(0, (float)((uint32_t)(p.x * 11 + p.y * 23) % 360u) * DEG2RAD, 0));
+                parent->add_child(m);
+                break;
+            }
+            // 回退：一丛 3~5 个小球，不是一个孤零零的大球
             va::Rng rng((uint32_t)(p.x * 40503u) ^ (uint32_t)(p.y * 12289u));
             const int n = 3 + (int)(rng.next() * 2.99f);
             for (int i = 0; i < n; ++i) {
@@ -2442,7 +2692,10 @@ void build_scene(Node3D *root, SceneRefs &out) {
     // ---- 掩体物件 ----
     Node3D *props = memnew(Node3D);
     props->set_name("Props");
-    for (const auto &p : va::W.props) add_prop(props, p);
+    // 原型挂载点传 root：这一段跑在 out.units 建出来之前，而原型只需要"在场景树里
+    // 且隐藏"。静态缓存按键存，所以谁先跑谁挂 —— build_scene 恒先于 rebuild_props，
+    // 于是原型这辈子都挂在 root 下，不随换关重建的 Props 层一起消失。
+    for (const auto &p : va::W.props) add_prop(props, root, p);
     root->add_child(props);
     out.props = props;
     out.root = root;

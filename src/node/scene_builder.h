@@ -83,6 +83,24 @@ godot::Node3D *make_soldier_node(bool enemy, bool downed);
 godot::Node3D *make_vehicle_node(const std::string &type, godot::Node *p_proto_parent);
 godot::Node3D *make_box_node();
 
+// ---- 战场地物三维模型（图生3D 产物，tools/gen3d_batch.py --kind prop）----
+//
+// 约定：assets/art/prop/model/<键>.glb，四个键 —— prop_rock_a（棱角裸岩）/
+// prop_rock_b（苔覆圆石）/ prop_pine（针叶树）/ prop_bush（低矮灌丛）。
+// 前两个是同一件事的**两份剪影**，由 add_prop 按 hash 交替取，免得三十多块石头
+// 是同一块复制出来的。载入失败一律返回 nullptr，由 add_prop 回退到程序化图元 ——
+// 少一个模型文件不该让战场上少一块掩体。
+//
+// 【p_target 的语义由键决定，不看调用方】表里 by_height 的键（树）传的是**高度**，
+// 其余传的是**水平尺度**。理由见 .cpp 里 kPropArt 的长注释：低矮地物的"遮挡"
+// 就是那个水平圆，树则只受高度约束（逻辑层的 p.r 对树只管俯视遮挡半径）。
+//
+// 返回节点的原点在**底面中心**、单位是米、水平已居中：调用方只管 set_position /
+// set_rotation。底面而不是包围盒中心，是因为地物要按"底贴地面"摆 ——
+// 取中心的话每换一个模型都要重算一次下沉量，而那个数只能靠试。
+godot::Node3D *make_prop_node(const std::string &p_key, float p_target,
+                              godot::Node *p_proto_parent);
+
 // ---- 载具三维模型（图生3D 产物，tools/prep_veh_refs.sh + tools/gen3d_batch.py --kind veh）----
 //
 // 约定：assets/art/veh/model/veh_<type>.glb，type 就是 va_config.cpp 里

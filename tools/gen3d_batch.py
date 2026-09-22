@@ -26,6 +26,15 @@
     被整个场景共用，而是挂在相机上、离眼睛 0.3~0.45 m 的一小块 ——
     面数/贴图的取舍与它们完全不同（近距离看，贴图吃满屏）。
 
+【五档：战场地物（prop），2026-09-22 加】
+    地物：输入 assets/art/prop/<键>.png     → 成品 assets/art/prop/model/<键>.glb
+             中间产物 sweep/gen3d_prop/<键>.json
+    `--kind prop`。岩石 ×2 / 松树 / 灌木丛 —— 换掉的是场上**数量最多**的那三类
+    程序化图元（每关约 30 块石头、20 棵树、15 丛灌木）。
+    与武器/载具一样由 scene_builder 的 load_glb_root() 在运行期解析，
+    所以 model/ 旁边不会冒出 Godot 抽出来的 "_texture_pbr_*.jpg"。
+    参考图来源见 ref/prop/SOURCES.md（Bing 图片搜索的**白底商品照**，非维基）。
+
 【为什么要有这一层，而不是在 shell 里 for 循环】
 一次图生3D 是「提交 → 轮询 1~5 分钟 → 拿到 URL → 下载 42MB → 瘦身到 1.5MB」，
 四个环节各有各的失败方式（提交被限流、轮询超时、COS 链接断流、GLB 里 BIN 块没取到）。
@@ -119,6 +128,19 @@ PROFILES = {
         # 先只做 r（扳机手）：握拳的手在引擎里旋转后左右手可以共用，
         # 所以 r 是"先 1 张确认朝向"那一步，l 视效果再决定要不要单独生成。
         "keys": ["vm_hand_r"],
+    },
+    "prop": {
+        "label": "战场地物",
+        "src_dir": os.path.join(ROOT, "assets", "art", "prop"),
+        "model_dir": os.path.join(ROOT, "assets", "art", "prop", "model"),
+        "work": os.path.join(ROOT, "sweep", "gen3d_prop"),
+        # 顺序 = scene_builder.cpp 的 add_prop 里认的四个键。
+        # 这一档换的是**掩体本身**（Rock / Tree / Bush 三种 PropType 的渲染），
+        # 逻辑层一个字段没动：落位、半径、判定顺序全是原来那套。
+        # 两个岩石是**两份不同剪影**（棱角裸岩 / 苔覆圆石），按 hash 交替用，
+        # 免得三十多块石头是同一块复制出来的 —— 变体是"少钱多变化"的便宜做法，
+        # 真正贵的是再多生成几张。
+        "keys": ["prop_rock_a", "prop_rock_b", "prop_pine", "prop_bush"],
     },
 }
 
