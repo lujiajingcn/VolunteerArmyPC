@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""调用内置多模态 3D 生成能力（图生3D），把 base64 从文件读入。
+"""调用内置多模态 3D 生成能力（图生3D / 文生3D），把 base64 从文件读入。
 
 【为什么不直接命令行调 buddy-cloud.py】
 它的 `--image-base64` 是一个普通字符串参数，而这两张立绘单张就有 2.7MB，
@@ -9,11 +9,22 @@ base64 之后约 3.6MB —— Windows 命令行上限 32767 字符，作为 argv
 
 用法：
     echo -n "<token>" | python tools/gen3d.py <图片路径> <结果json输出路径> [额外参数...]
+    echo -n "<token>" | python tools/gen3d.py --text <中文描述> <结果json输出路径> [额外参数...]
 
 额外参数原样透传给 buddy-cloud.py，例如：
     --no-poll          只提交不等待
     --enable-pbr       生成 PBR 材质
     --face-count 50000 面数上限
+
+【为什么要加 `--text`（2026-09-23）】
+图生3D 是**单视图重建**：给一张照片，反推它占的三维体积。对"靠半透明叶簇
+表达体积"的东西（树 / 灌丛）这条路走不通 —— 参考图里枝干之间透出背景，
+重建拿不到"叶子围成的体积"，于是要么只留一根主干、要么把地面剪影当成物体
+（实测：树塌成水平只有高度 6.3% 的一根杆、灌丛塌成高只有最大维 0.16% 的圆盘）。
+文生3D 走的是另一条路：**从头合成一个体量**，不受"只能看到一面"的约束，
+所以对针叶树这种"体量简单的轴对称物体"是更合适的通道。
+buddy-cloud.py 的 `3d` 子命令本来就接受 `prompt` 位置参数
+（`if prompt: body["Prompt"] = prompt`），只是本文具此前只走图片那条。
 """
 
 import base64
@@ -37,18 +48,20 @@ def load_bc():
 
 
 def main():
-    if len(sys.argv) < 3:
+    argv = sys.argv[1:]
+    text_mode = False
+    if argv and argv[0] == "--text":
+        text_mode = True
+        argv = argv[1:]
+    if len(argv) < 2:
         print(__doc__)
         return 2
-    img_path = sys.argv[1]
-    out_json = sys.argv[2]
-    extra = sys.argv[3:]
+    subject = argv[0]          # 图片路径（图生3D）或中文描述（文生3D）
+    out_json = argv[1]
+    extra = argv[2:]
 
     if not os.path.isfile(SCRIPT):
         print("找不到 buddy-cloud.py：%s" % SCRIPT)
-        return 2
-    if not os.path.isfile(img_path):
-        print("找不到输入图片：%s" % img_path)
         return 2
 
     token = sys.stdin.readline().strip()
@@ -56,12 +69,21 @@ def main():
         print("stdin 没有拿到 token")
         return 2
 
-    with open(img_path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode()
+    if text_mode:
+        if not subject.strip():
+            print("--text 的描述是空的")
+            return 2
+        head = [subject]
+    else:
+        if not os.path.isfile(subject):
+            print("找不到输入图片：%s" % subject)
+            return 2
+        with open(subject, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        head = ["--image-base64", b64]
 
     bc = load_bc()
-    sys.argv = ["buddy-cloud.py", "3d", "--image-base64", b64,
-                "--token-stdin"] + extra
+    sys.argv = ["buddy-cloud.py", "3d"] + head + ["--token-stdin"] + extra
     sys.stdin = io.StringIO(token + "\n")
 
     # 把 stdout 也截下来存盘：3D 任务要跑 1~5 分钟，

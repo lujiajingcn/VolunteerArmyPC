@@ -346,12 +346,35 @@ void WorldSim::build_unit_showcase() {
         const float pt[4] = { 2.20f, 2.20f, 8.00f, 1.65f };
         // 高宽比只为算取景用，必须与 kPropArt 保持一致（岩石 0.50 / 灌木 0.36）
         const float phw[4] = { 0.50f, 0.50f, 0.0f, 0.36f };
+
+        /* 【单体模式必须按**点中的那个键**取尺寸，不能一律用 pt[0]】（2026-09-23 修）
+           原来取景与建节点两处都写成 `row ? pt[i] : pt[0]`，于是 `prop:prop_pine`
+           把 8 m 的树按 2.2 m 建出来、又按 2.2 m 取景 —— 截图上就是"树怎么跟人差不多高"，
+           而战场上它是按 `7.0 + rng·3.0` 摆的，两边对不上。
+           这条通道存在的唯一理由就是回答"**比例对不对**"，所以这个 bug 恰好
+           把它的判据毁掉：拍出来偏小，看着像"树接错了"，其实是取景表取错了行 ——
+           最坏的一种错，因为它会让人去改一个本来正确的模型。
+           键写错时静默退回 pt[0]（= 改动前的行为），所以顺手把解析出的下标喊进日志。 */
+        int pick[4] = { 0, 1, 2, 3 };
+        if (!row) {
+            int idx = 0;
+            for (int i = 0; i < 4; ++i) {
+                if (key == pk[i]) { idx = i; break; }
+            }
+            pick[0] = idx;
+            if (key != pk[idx]) {
+                UtilityFunctions::print(String::utf8("[show] 未知地物键 "),
+                                        String::utf8(key.c_str()),
+                                        String::utf8("（临时按 prop_rock_a 的尺寸取景）"));
+            }
+        }
         const int n = row ? 4 : 1;
 
         float max_h = 0.0f, sum_w = 0.0f;
         for (int i = 0; i < n; ++i) {
-            const float h = (phw[i] > 0.0f) ? pt[i] * phw[i] : pt[i];
-            const float w = (phw[i] > 0.0f) ? pt[i] : pt[i] * 0.5f;   // 树冠估算 0.5H
+            const int j = pick[i];
+            const float h = (phw[j] > 0.0f) ? pt[j] * phw[j] : pt[j];
+            const float w = (phw[j] > 0.0f) ? pt[j] : pt[j] * 0.5f;   // 树冠估算 0.5H
             max_h = std::max(max_h, h);
             sum_w += w;
         }
@@ -367,8 +390,9 @@ void WorldSim::build_unit_showcase() {
         int built = 0;
         float off_acc = -row_w * 0.5f;
         for (int i = 0; i < n; ++i) {
+            const int j = pick[i];
             const std::string k = row ? std::string(pk[i]) : key;
-            const float t = row ? pt[i] : pt[0];
+            const float t = pt[j];
             Node3D *nd = make_prop_node(k, t, refs_.units);
             if (nd == nullptr) {
                 // 与角色/载具同口径：缺模型**留空位**而不是把后面的往前挪 ——
@@ -378,14 +402,24 @@ void WorldSim::build_unit_showcase() {
                                         String::utf8("）空置"));
                 continue;
             }
-            const float w_i = (phw[i] > 0.0f) ? (row ? pt[i] : pt[0]) : 4.0f;
+            const float w_i = (phw[j] > 0.0f) ? pt[j] : 4.0f;
             const float off_m = row ? (off_acc + w_i * 0.5f) : 0.0f;
             off_acc += w_i + GAP_P;
             const float lx = p->x + fx * DIST_M * U + rx * off_m * U;
             const float ly = p->y + fy * DIST_M * U + ry * off_m * U;
             // 地物没有"正面"，偏航只用来核对"压扁/对轴有没有把它转歪"。
-            nd->set_transform(Transform3D(Basis(Vector3(0, 1, 0), a + PI + dyaw),
-                                          to3(lx, ly, ground_h(lx, ly))));
+            /* 【缩放必须合进 Basis，不能 set_transform 之后再想】set_transform 是
+               **整体替换**：它会把 make_prop_node 里设好的 Vector3(t,t,t) 一并抹成 1。
+               于是检阅台里每一件地物都按"归一化后的单位原型"渲染 —— 岩石 1.0 m 宽
+               （而不是 2.2 m）、针叶树 1.0 m 高（而不是 8 m）。
+               而**战场侧是对的**：add_prop 用的是 set_position / set_rotation，
+               这两个不动缩放。所以这是一个**只影响取证**的 bug —— 偏偏检阅台存在的
+               唯一理由就是回答"比例对不对"，它一错，判据就变成反的：
+               拍出来树只有人一半高，看着像"模型接错了"，其实该改的是取景（这里）。
+               2026-09-23 实测：树 135 px / 参照兵 236 px，反推 0.96 m，恰好是单位原型。 */
+            Basis pb(Vector3(0, 1, 0), a + PI + dyaw);
+            pb.scale(Vector3(t, t, t));
+            nd->set_transform(Transform3D(pb, to3(lx, ly, ground_h(lx, ly))));
             stage->add_child(nd);
             ++built;
         }

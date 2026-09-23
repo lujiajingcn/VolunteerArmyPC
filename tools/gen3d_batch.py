@@ -141,6 +141,31 @@ PROFILES = {
         # 免得三十多块石头是同一块复制出来的 —— 变体是"少钱多变化"的便宜做法，
         # 真正贵的是再多生成几张。
         "keys": ["prop_rock_a", "prop_rock_b", "prop_pine", "prop_bush"],
+        # 【文生3D（2026-09-23）】这两个键**不用立绘**，走 `prompt` 位置参数。
+        # 为什么单独开一条通道：图生3D 是**单视图重建**，而树与灌丛是"靠半透明
+        # 叶簇表达体积"的东西 —— 参考图里枝干之间透出背景，重建拿不到叶子围成的
+        # 体积。实测（09-22 那轮，单图 + 半透明叶簇）：
+        #   针叶树 → 水平只有高的 6.3%（一根杆）
+        #   灌丛   → 高只有最大维的 0.16%（一张水平圆盘）
+        # 两个不透明实体（两块岩石）同一批同样参数全部正常，所以根因是**输入形态**，
+        # 不是管线。文生3D 从头合成体量，不受"只能看到一面"的约束。
+        #
+        # prompt 的写法要点（直接针对根因）：
+        #   ① 点明**不透光 / 看不到枝干之间的空隙** —— 这是上轮失败的那件事；
+        #   ② 点明形体是**完整的圆锥**（给重建一个明确的体量先验）；
+        #   ③ 写"摄影 / 写实"，避免生成卡通或带场景的图（我们只要单体）；
+        #   ④ 灌丛额外点明"高度约为宽度的一半"，与 kPropArt 里 hw=0.36 的口径一致。
+        "prompts": {
+            "prop_pine":
+                "一棵高大的针叶松树单体，笔直粗壮的红褐色树干，枝叶极其茂密浓绿，"
+                "层层叠叠的针叶枝条从下到上收拢成一个完整饱满的圆锥形树冠，"
+                "完全看不到枝干之间的空隙、不透光，朝鲜战场山地常见的东北红松，"
+                "写实摄影，纯白背景，只拍这一棵树",
+            "prop_bush":
+                "一丛低矮密实的灌木单体，由许多紧密挤在一起的深绿色叶团组成，"
+                "整体呈半圆的团簇状，高度约为宽度的一半，完全看不到内部的枝干空隙、"
+                "不透光，没有明显的主干，写实摄影，纯白背景，只拍这一丛",
+        },
     },
 }
 
@@ -148,6 +173,9 @@ SRC_DIR = PROFILES["char"]["src_dir"]
 MODEL_DIR = PROFILES["char"]["model_dir"]
 WORK = PROFILES["char"]["work"]
 KEYS = list(PROFILES["char"]["keys"])
+# 走**文生3D**的键 → 中文描述。空表 = 全档位都走图生3D（既有四个档位就是这样，
+# 行为一个字节没变）。见 PROFILES["prop"]["prompts"] 的注释。
+PROMPTS = {}
 
 PY = sys.executable
 # 瘦身要 Pillow，而 Pillow 只装在隔离 venv 里（本项目唯一一个非纯 Python 的工具）。
@@ -266,7 +294,7 @@ def _select_kind(p_kind):
     传参等于给每一处都增加一个可以说错话的机会。这里覆写一次、之后再没人改，
     语义上就是"这一批的路径"。覆写点唯一，所以不会出现两份路径不一致。
     """
-    global SRC_DIR, MODEL_DIR, WORK, KEYS
+    global SRC_DIR, MODEL_DIR, WORK, KEYS, PROMPTS
     if p_kind not in PROFILES:
         raise SystemExit("--kind 只能是 %s，当前为 %r"
                          % (" / ".join(sorted(PROFILES)), p_kind))
@@ -275,6 +303,9 @@ def _select_kind(p_kind):
     MODEL_DIR = p["model_dir"]
     WORK = p["work"]
     KEYS = list(p["keys"])
+    # .get()：既有的四个档位没有 prompts 这一项，取空表 → 全部走图生3D，
+    # 与引入这条通道之前的行为完全一致（不需要给它们补字段）。
+    PROMPTS = dict(p.get("prompts", {}))
     return p
 
 
@@ -318,10 +349,20 @@ def run_one(key, token, force):
             return True
         say("已有成品但规格不对（%d 面 > %d），重做" % (tris, MAX_TRIS_OK))
 
-    src = os.path.join(SRC_DIR, key + ".png")
-    if not os.path.isfile(src):
-        say("缺立绘 %s" % src)
-        return False
+    # 输入校验：走文生3D 的键不需要立绘（描述在 PROFILES 的表里），走图生3D 的必须有。
+    # 缺图是"这个键没准备好"，不是"模型生成失败" —— 早报早好，别等到提交才报。
+    prompt = PROMPTS.get(key)
+    if prompt:
+        if BACKEND != "builtin":
+            say("文生3D 只在内置通道（builtin）上实现：tc / hy 两个后端脚本只吃立绘，"
+                " 请用 VA_GEN3D_BACKEND=builtin 重跑")
+            return False
+        src = None
+    else:
+        src = os.path.join(SRC_DIR, key + ".png")
+        if not os.path.isfile(src):
+            say("缺立绘 %s" % src)
+            return False
 
     # ---- 0. 上次的 json 是"成功的"还是"失败留下的"？----
     # 【为什么必须看内容而不是只看文件在不在】第一次跑（并发 6）11 个全被 429 拒了，
@@ -346,7 +387,13 @@ def run_one(key, token, force):
     # ---- 1. 提交并轮询（交给各自的后端脚本；两者都改用进程内 argv 绕开命令行长度上限）----
     if not done_json:
         t0 = time.time()
-        say("提交中（输入 %.2f MB，后端 %s）…" % (os.path.getsize(src) / 2 ** 20, BACKEND))
+        # 【判据：走文本时没有 src，日志不能去 stat 它】上一步的 src 只在图生3D 分支
+        # 才有值，这里必须按 prompt 分流 —— 否则 os.path.getsize(None) 直接抛 TypeError，
+        # 而且是在提交之前抛，看起来像"生成失败"其实是"日志打不出来"。
+        if prompt:
+            say("提交中（文生3D，描述 %d 字，后端 %s）…" % (len(prompt), BACKEND))
+        else:
+            say("提交中（输入 %.2f MB，后端 %s）…" % (os.path.getsize(src) / 2 ** 20, BACKEND))
         # PYTHONIOENCODING：子进程的 stdout 是管道，Python 会按系统区域（GBK）编码它，
         # 而父进程按 UTF-8 解 —— 不解这一下，日志里所有中文都是乱码，
         # 而"哪一步说了什么"正是这个脚本存在的意义。
@@ -365,7 +412,14 @@ def run_one(key, token, force):
                    "--model", G3D_MODEL]
             stdin_text = None
         else:
-            cmd = [PY, os.path.join(ROOT, "tools", "gen3d.py"), src, out_json] + GEN_ARGS
+            # builtin：`--text` 必须排在两个位置参数之前（gen3d.py 按 argv[0] 认这个开关）。
+            # 其余参数（GEN_ARGS）原样透传，两条路的面数 / PBR / 生成方式完全一致 ——
+            # 这样"文字版与图片版出来得不一样"就只剩输入这一项变量。
+            if prompt:
+                cmd = [PY, os.path.join(ROOT, "tools", "gen3d.py"), "--text",
+                       prompt, out_json] + GEN_ARGS
+            else:
+                cmd = [PY, os.path.join(ROOT, "tools", "gen3d.py"), src, out_json] + GEN_ARGS
             stdin_text = token + "\n"
         for attempt in range(1, SUBMIT_TRIES + 1):
             p = subprocess.run(
@@ -435,13 +489,33 @@ def run_one(key, token, force):
     say("积分 %s" % d.get("raw_result", {}).get("ResultCreditConsumed"))
 
     # ---- 3. 下载 ----
+    # 【这一处曾经"拿旧模型顶替刚生成的新模型"，而且一路报成功（2026-09-23 实测）】
+    # 判据原本是"raw 不在才下"，可 raw 是**按 key 命名**的：上一轮遗留的
+    # `prop_pine.raw.glb` 会让这一轮的下载被整个跳过 → 刚花掉的 40 积分换来的新模型
+    # 被丢掉，改用旧 raw 重新瘦身，成品与上一轮**逐字节相同**（md5 一致）。而日志写的是
+    # "生成完成 / 积分 40 / 齐备 2/2 / EXIT=0"，从外面完全看不出异常 ——
+    # 唯一能看出的是 raw 的 mtime 还停在上一轮。
+    # 所以判据改成"**这一轮有没有真提交过**"：只要提交过（done_json 为假），
+    # 同名 raw 必然属于上一轮，先删掉再下。dl.fetch 内部也有"目标在就返回"的短路，
+    # 不先删就还是被它吃掉。
+    # 【为什么这是一个"上次只补了一半"的坑】dst_glb 那侧的同类问题在续跑判据里
+    # 已经处理过（见 _probe_tris 的注释：光"任务成功"不算完成，成品规格也是完成度）。
+    # 那次补的是**成品**，漏了**原料** —— 两条判据长得很像，但检查的是两个文件。
+    if not done_json and os.path.exists(raw_glb):
+        say("清掉上一轮遗留的同名 raw（%.2f MB）—— 这一轮重新下载"
+            % (os.path.getsize(raw_glb) / 2 ** 20))
+        os.remove(raw_glb)
     if not os.path.exists(raw_glb) or os.path.getsize(raw_glb) < 1024:
         sys.path.insert(0, os.path.join(ROOT, "tools"))
         import dl  # 复用它那套 Range 续传 + 退避重试
         try:
             dl.fetch(url, raw_glb)
         except Exception as e:
+            # 额度已经花了（任务在服务端是 DONE 的），结果 URL 就在 out_json 里 ——
+            # 把这条救回来的路写进日志，而不是只报一个"下载失败"。
             say("下载失败：%r" % e)
+            say("⚠ 额度已花掉，结果仍在服务端：URL 在 %s，可手工重下后 %s"
+                % (out_json, raw_glb))
             return False
 
     # ---- 4. 瘦身 ----
