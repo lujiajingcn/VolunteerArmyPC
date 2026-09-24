@@ -359,7 +359,7 @@ bool hand_art_enabled() {
 //
 // ⚠️ **与上面那三个武器旋钮的单位不一样，别混**：
 //   VA_VM_ART_ALB   是**线性空间的标量乘数**（默认 0.42）—— 它是标定出来的补偿量；
-//   VA_VM_HAND_TINT 是**sRGB 的色相**（默认 0.50,0.42,0.36）—— 它是一项美术选择。
+//   VA_VM_HAND_TINT 是**sRGB 的色相**（默认 0.71,0.61,0.43）—— 它是一项美术选择。
 // 不统一的理由：枪那边只需要"整体压暗"，一个标量就够；手这边要的是
 // "把皮肤改成皮革色"，必须按通道给、而且应当按人眼习惯的 sRGB 给。
 // 混用的后果是标定值不可移植（同一串数字在两个旋钮上差 2 倍多）。
@@ -376,10 +376,30 @@ bool hand_art_enabled() {
 //   而皮肤在蓝通道上高出一大截。这里先取往红绿再收一点的起点，
 //   实际定档用 tools/vm_hand_probe.py 扫（口径见该工具的文件头）。
 //   目标读数：手套那一行的中位亮度落在现有程序化手套附近（L96 RGB(119,90,83)）。
+//
+// 【2026-09-24 重标：手模换成"土黄棉手套"之后，这个乘数变小了】
+// 上面那套推理的前提是"**贴图是皮肤色**，要把它乘成皮革棕"。新模型（文生3D
+// 生成的棉手套）**贴图本身就是深赭黄的粗棉布** —— 再乘 0.50,0.42,0.36 是
+// **二次着色**，量出来中位亮度只有 L90 RGB(115,85,72)，画面里读成"深棕皮手套"
+// 而不是棉手套。所以改成**接近不变、只轻微提亮偏黄**。
+//
+// ⚠️ **"越亮越像棉布"是错的**：亮到某个点上，布纹会被冲掉，反而读成"光滑乙烯基"。
+// 判据因此不是"够不够亮"，而是**亮面仍留得住布纹**。1.55 倍缩放下看腕口那圈
+// 罗纹编织：0.80 档已经糊平，0.71 档还看得见。
+//
+// 四档扫描（同一机位、同一 ROI x1500-1700,y1000-1160 手套受光面，逐通道中位）：
+//   0.56,0.49,0.38  →  RGB(129, 97, 83)  L103   灰褐，偏脏
+//   0.63,0.56,0.42  →  RGB(157,115, 88)  L122   浅卡其，饱和度不够、发白
+//   0.71,0.61,0.43  →  RGB(193,133, 94)  L142   ← 采用：最贴"土黄"，腕口布纹仍在
+//   0.80,0.68,0.45  →  RGB(233,162,102)  L173   金黄偏琥珀，亮面纹理被冲掉
+// （另试过 0.95,0.82,0.55 → 过亮发白偏淡黄。参考：场上的草地约 RGB(172,170,129)
+//   L167 —— 采用档的手**比背景草略暗但色调分离明确**，不会糊进环境。）
+// 教训记一笔：**"色调乘数"只在"贴图是另一种材质"时成立**；贴图已经是对的颜色时，
+// 同一个数就从"补偿"变成了"污染"。换件之后要重新量，不能沿用。
 Vector3 hand_tint() {
     static const Vector3 s = [] {
         const char *e = std::getenv("VA_VM_HAND_TINT");
-        float a = 0.50f, b = 0.42f, c = 0.36f;
+        float a = 0.71f, b = 0.61f, c = 0.43f;
         if (e != nullptr && *e != '\0') std::sscanf(e, "%f,%f,%f", &a, &b, &c);
         return Vector3(va::clampf(a, 0.02f, 2.0f), va::clampf(b, 0.02f, 2.0f),
                        va::clampf(c, 0.02f, 2.0f));
@@ -732,6 +752,15 @@ void set_cuff(MeshInstance3D *p_mi, const Vector3 &a, const Vector3 &b, float r)
 // （莫辛 z=-0.45、波波沙 -0.48、DP-27 -0.62），腕端要跟着走，肘不动。
 void ViewModel::place_arms() {
     if (hands == nullptr) return;
+    // 开镜缩到看不清了就把整组藏掉（见 viewmodel.h 里 hand_ads_shrink 的注释）：
+    // 门限取 0.03 而不是 0 —— **缩放 0 是退化变换**（基的行列式为 0），
+    // Godot 会给出 NaN 法线并把网格渲染成一片乱刺；而在 3% 尺寸上做一次显隐，
+    // 玩家看到的只是"手已经没了"，不是"手突然消失了"。
+    if (hand_pose_scale < 0.03f) {
+        if (hands->is_visible()) hands->set_visible(false);
+        return;
+    }
+    if (!hands->is_visible()) hands->set_visible(hands_enabled());
     const float rw = env_f_clamped("VA_VM_ARM_W", ARM_R_WRIST, 0.008f, 0.080f);
     const float re = env_f_clamped("VA_VM_ARM_E", ARM_R_ELBOW, 0.008f, 0.090f);
     // 双手的"姿态让位"（开镜时按 ads 让开照门，见 update() 里那一段）：
@@ -779,7 +808,9 @@ void ViewModel::build(Camera3D *p_cam, Node *p_proto_parent) {
     // 注意改它**不影响开镜对准** —— 落点是由照门反推的，拉开距离只是等比缩小。
     aim_dist = env_f_clamped("VA_VM_AIMDIST", 0.270f, 0.060f, 0.600f);
     // 开镜时双手的让位量（见 update() 里那一段）：缩小比例 + 位移。
-    hand_ads_shrink = env_f_clamped("VA_VM_ADS_HSHRINK", hand_ads_shrink, 0.0f, 0.85f);
+    // 上界放到 1.0（= 缩到无）—— 见 viewmodel.h 里 hand_ads_shrink 的注释：
+    // 0.85 这一档在真手模上留下的正是一块"悬空残片"，那是本轮要消掉的东西。
+    hand_ads_shrink = env_f_clamped("VA_VM_ADS_HSHRINK", hand_ads_shrink, 0.0f, 1.0f);
     env_vec3("VA_VM_ADS_HOFF", hand_ads_off);
 
     // 开镜视场由基础视场推导 —— 改世界 FOV 时枪的放大倍率自动跟随。
@@ -1346,7 +1377,9 @@ bool ViewModel::load_skin(int p_index) {
     // 现在的取舍：手默认显示；每把枪的握持点标定在 kWpnArt 的 hand_r / hand_l 里，
     // 换枪时整组跟着走。实在想对照"有手/没手"，用 VA_VM_HANDS=0。
     if (proc_body != nullptr) proc_body->set_visible(false);
-    if (hands != nullptr) hands->set_visible(hands_enabled());
+    // 双手的显隐**只在 place_arms() 里决定**（它同时管"开镜缩到看不见就整组藏掉"）。
+    // 这里**不要**再补一句 hands->set_visible(hands_enabled())：place_arms() 就在上面
+    // 几行，补这一句等于把它的判断推翻 —— 开镜中换枪会让缩到 0.1% 的手闪一帧。
 
     // 顺手报一下手落在枪的哪个位置 —— 判"手有没有陷进枪身"时，
     // 拿这三个数与 glb_preview --probe 量出来的剖面直接比就行，不必靠看图。
