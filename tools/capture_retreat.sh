@@ -47,10 +47,15 @@ case "$MODE" in
   *) echo "未知模式：$MODE（应为 shot | key）"; exit 1 ;;
 esac
 
-# 目录名吃进模式 / 弹出时刻 / 快进倍率 / 时刻列表的指纹。
+# 目录名吃进模式 / 键 / 弹出时刻 / 快进倍率 / 时刻列表 / **机位**的指纹。
+# ⚠️ 机位（VA_CAM_H / VA_CAM_PITCH / VA_CAM_YAW）必须进指纹：只按时刻打指纹时，
+#    同一时刻不同机位的两批会写进同一目录、后者覆盖前者，而失败只表现为
+#    "图上少了一版"，不报任何错（fx 取证那层 2026-09-25 实际踩到过；
+#    retreat 这层 2026-09-26 又踩了一次 —— 所以这条是从两次事故里长出来的）。
 # 为什么不用 `rm -f` 清空：这台机器上 bash 的 rm 被安全策略拦掉（FAIL_CLOSED，静默不执行），
-# "清空"会悄无声息失效、两批截图混在一处，而失败只表现为"图上少了一张"，不报任何错。
-TAG="$(printf '%s|%s|%s|%s|%s' "$MODE" "$KEY" "$RETREAT_AT" "${VA_FF:-6}" "$TIMES" | cksum | awk '{print $1}')"
+# "清空"会悄无声息失效、两批截图混在一处，同样不报错。
+TAG="$(printf '%s|%s|%s|%s|%s|%s|%s|%s' "$MODE" "$KEY" "$RETREAT_AT" "${VA_FF:-6}" "$TIMES" \
+       "${VA_CAM_H:-}" "${VA_CAM_PITCH:-}" "${VA_CAM_YAW:-}" | cksum | awk '{print $1}')"
 OUT="sweep/v_retreat_${MODE}${KEY}_${TAG}"
 mkdir -p "$OUT"
 
