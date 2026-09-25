@@ -60,6 +60,7 @@
 #include <godot_cpp/classes/mesh_instance3d.hpp>
 #include <godot_cpp/classes/sphere_mesh.hpp>
 #include <godot_cpp/classes/standard_material3d.hpp>
+#include <godot_cpp/classes/viewport.hpp>
 #include <godot_cpp/core/memory.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
@@ -793,7 +794,14 @@ void ViewModel::build(Camera3D *p_cam, Node *p_proto_parent) {
     // 开发期旋钮：不动代码就能扫姿态。VA_VM_HIP / VA_VM_AIM / VA_VM_ROT。
     env_vec3("VA_VM_HIP", hip_pos);
     aim_env_over = env_vec3("VA_VM_AIM", aim_pos);
-    env_vec3("VA_VM_ROT", hip_rot);
+    hip_env_over = env_vec3("VA_VM_ROT", hip_rot);
+
+    // 腰射"枪口指向"的收敛（见 viewmodel.h 里 conv_d 那一节）。
+    // 不设 = 25 m；显式给 0 = 关掉收敛、回到 hip_rot 那组手调角度（对照取证用）。
+    // 收敛在**每次换枪后**必须重解一次：枪口 z 随枪变，同一个 conv_d 对应的
+    // 内收角也就跟着变。
+    conv_d = env_f_clamped("VA_VM_CONV", conv_d, 0.0f, 500.0f);
+    hip_roll = env_f("VA_VM_ROLL", hip_roll);
 
     // 视图模型统一缩放。**它和 hip_pos 必须一起调**：
     // 整体乘 s 再把 hip_pos 也乘 s 是一个相似变换，屏幕上分毫不变 ——
@@ -1199,6 +1207,11 @@ void ViewModel::build(Camera3D *p_cam, Node *p_proto_parent) {
     muzzle->set_position(Vector3(0, 0.000f, -0.575f));
     gun->add_child(muzzle);
 
+    // 枪口节点建出来之后就解一次腰射姿态 —— 解它要读枪口 z。
+    // （挂真模型时下面 load_skin 会带着新的枪口 z 再解一次，这次是给
+    //  VA_VM_NO_ART / 模型缺失时兜底的那条路用的。）
+    solve_hip_pose();
+
     flash_group = memnew(Node3D);
     muzzle->add_child(flash_group);
 
@@ -1369,6 +1382,14 @@ bool ViewModel::load_skin(int p_index) {
     // 位置与朝向都由 scene_builder 归一化进 gun 局部系了，这里不再动 art_holder。
     if (muzzle != nullptr) muzzle->set_position(Vector3(0.0f, 0.0f, art_muzzle_z));
 
+    // **枪口 z 变了 → 腰射姿态重解一次。**
+    // 老实说在默认 conv_d=25 下三把枪解出来是同一个角（实测 0.202733/0.241899，
+    // 三把一位不差）—— 因为枪口的**横向** offset 就是 hip_pos.x/y，与枪口 z 无关，
+    // 而 z 只影响"到目标的距离"，25 m 上差 0.3 m 折合 0.7%。
+    // 真正会分化的是 conv_d 很小的时候（3 m 处三把枪差 0.27°，1 m 处差 7°）。
+    // 保留这次重解是因为它一行、且让"任意 conv_d 都成立"这件事不依赖巧合。
+    solve_hip_pose();
+
     // 真模型接管枪身，程序化枪身整块让位。
     //
     // 双手**要留着**：参考图是光枪，生成的模型里本来就没有手，
@@ -1393,6 +1414,104 @@ bool ViewModel::load_skin(int p_index) {
                             String::utf8(" 全长 "), art_len[p_index],
                             String::utf8(" 枪口 z "), art_muzzle_z);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// 腰射姿态：解"枪管穿过准星"
+// ---------------------------------------------------------------------------
+//
+// 约束一句话：**从枪口沿枪管轴射出的那条直线，必须在 conv_d 米处穿过准星。**
+// 准星在屏幕中心，而屏幕中心对应的就是相机空间的 -Z 轴（视轴），
+// 所以目标点就是 T = (0, 0, -conv_d)（相机局部系，-Z 朝前）。
+//
+// 枪管 = 枪局部 -Z。枪只承担姿态角（位移在 root 上），所以未知量只有三个欧拉角里的
+// 两个（偏航 + 俯仰）—— 第三个是绕枪管轴的侧倾，它**不影响指向**，直接取
+// hip_roll 定观感。
+//
+// 【为什么要迭代而不是一步解出来】枪口在局部 (0,0,mz)，姿态一动它的**位置**也动，
+// 于是"枪口 → 目标"的方向跟着变。好在枪口就落在旋转轴上（局部 x=y=0），
+// 迭代 6 次已经收敛到 1e-4 量级；不迭代也能用，但既然便宜就让它精确。
+//
+// 【为什么用 Basis 拼而不是直接写 yaw/pitch 的公式】"让局部 -Z 对准 f"这件事
+// 用基向量拼是三行（zc = -f，xc = up×zc，yc = zc×xc），而写公式要同时照顾
+// 欧拉顺序与符号 —— 顺序搞错在画面上表现为"枪转了 90°"而不是"差一点"，更难查。
+void ViewModel::solve_hip_pose() {
+    hip_solved = false;
+    if (hip_env_over) return;    // VA_VM_ROT 给过：手调优先（取证 / 找位用）
+    if (conv_d <= 0.0f) return;  // VA_VM_CONV=0：关掉收敛，保留 hip_rot 那组手调角
+
+    // 枪口在枪局部系里的 z。**读 muzzle 节点而不是 art_muzzle_z**：
+    // 程序化枪模那条路 art_muzzle_z 恒为 0（它没有"归一化"这一步），
+    // 而 muzzle 节点在两种外观下都是权威值（build 建它时 -0.575，load_skin 改它）。
+    const float mz = (muzzle != nullptr) ? muzzle->get_position().z : -0.575f;
+    const Vector3 target(0.0f, 0.0f, -conv_d);
+
+    Vector3 e = Vector3(0.0f, 0.0f, hip_roll);
+    for (int it = 0; it < 6; ++it) {
+        const Basis b = Basis::from_euler(Vector3(Math::deg_to_rad(e.x),
+                                                  Math::deg_to_rad(e.y),
+                                                  Math::deg_to_rad(e.z)));
+        const Vector3 m = hip_pos + b.xform(Vector3(0.0f, 0.0f, mz)) * vm_scale;
+        const Vector3 f = (target - m).normalized();   // 枪管应有的朝向（相机空间）
+        // 由 f 造基：局部 -Z → f。侧倾 = 先把"上"绕 f 转再参与构造。
+        // 【符号：这里是 -hip_roll】"把 up 绕 f 转 φ"等于"把基绕局部 Z 转 -φ" ——
+        // 而 f = 局部 -Z。第一版漏了这个负号，解出来的姿态角是 (…, +6.0)，
+        // 而手调那组是 -6.0：指向完全一样（滚转不改变枪管方向），
+        // 但枪的倾斜方向**反了**，观感上是另一把枪的握姿。实测抓到的。
+        const Vector3 up = Vector3(0.0f, 1.0f, 0.0f).rotated(f, Math::deg_to_rad(-hip_roll));
+        const Vector3 zc = -f;
+        Vector3 xc = up.cross(zc);
+        if (xc.length_squared() < 1e-12f) xc = Vector3(1.0f, 0.0f, 0.0f).cross(zc);
+        xc = xc.normalized();
+        const Vector3 yc = zc.cross(xc);
+        Basis nb;
+        nb.set_column(0, xc);
+        nb.set_column(1, yc);
+        nb.set_column(2, zc);
+        // 节点是用**欧拉角**驱动的（Node3D 默认 YXZ，Basis::get_euler 的默认也是 YXZ），
+        // 所以换回欧拉角写出去。往返是否一致由 dbg_aim_line 的实测数字兜底 ——
+        // 顺序一旦不一致，屏幕上会立刻读出一个几十度的角误差。
+        const Vector3 ne = nb.get_euler();
+        e = Vector3(Math::rad_to_deg(ne.x), Math::rad_to_deg(ne.y), Math::rad_to_deg(ne.z));
+    }
+    hip_rot = e;
+    hip_solved = true;
+    if (dbg_vm()) {
+        UtilityFunctions::print(String::utf8("[vm] 腰射姿态解算（枪管穿过准星 "),
+                                String::num((double)conv_d, 1), String::utf8(" m 处）→ 姿态角 "),
+                                hip_rot);
+    }
+}
+
+// 一行日志：枪口与"枪管指向"落在屏幕哪儿，和准星并排。
+//
+// 【为什么必须量、不能靠看截图判读】枪管是细长体，看图容易把**枪身**的方向读成
+// 枪管的方向 —— 两者在莫辛上差 100 px 以上（复核时踩过：按枪身读是"指向准星左边
+// 一点点"，按枪管读是"偏 186 px"）。这里直接用引擎自己的投影 unproject_position，
+// 不给"我觉得"留余地。
+void ViewModel::dbg_aim_line() {
+    if (cam == nullptr || gun == nullptr || muzzle == nullptr) return;
+    Viewport *vp = cam->get_viewport();
+    if (vp == nullptr) return;
+    const Vector2 size = vp->get_visible_rect().size;
+    if (size.x < 2.0f || size.y < 2.0f) return;
+    const Vector2 c = size * 0.5f;                                  // 准星（HUD 画在视口中心）
+    const Vector2 pm = cam->unproject_position(muzzle->get_global_position());
+    // 枪管轴上的远点：从枪口再沿局部 -Z 走 200 m。远超任何交战距离，
+    // 所以它落在屏幕哪儿，就是"枪管指向哪儿"的读数。
+    const Vector2 pf = cam->unproject_position(
+        gun->to_global(Vector3(0.0f, 0.0f, muzzle->get_position().z - 200.0f)));
+    // 角误差：把横向像素差换算成视场角。读 px 会被分辨率带跑，读角度才能跨机器比。
+    const float half_h = std::tan(Math::deg_to_rad(cam->get_fov()) * 0.5f)
+                       * (size.x / (size.y > 1.0f ? size.y : 1.0f));
+    const float err = Math::rad_to_deg(std::atan((pf.x - c.x) / (size.x * 0.5f) * half_h));
+    UtilityFunctions::print(
+        String::utf8("[vm] 指向 枪口 px "), pm,
+        String::utf8("  枪管指向 px "), pf,
+        String::utf8("  准星 px "), c,
+        String::utf8("  角误差 "), String::num((double)err, 2), String::utf8("°"),
+        String::utf8("  姿态 "), hip_rot,
+        String::utf8(hip_solved ? "（解算）" : "（手调）"));
 }
 
 bool ViewModel::next_skin(int p_step) {
@@ -1608,6 +1727,16 @@ void ViewModel::update(double p_dt, float move01, bool running, float pitch, flo
                                     String::utf8("s，要 dt 小于它才画得出来）"));
             dbg_dt_acc = 0.0f;
             dbg_dt_frames = 0;
+        }
+    }
+
+    // VA_DBG_VMAIM=1：每秒报一次"枪管指向落在屏幕哪儿"，与准星并排（见 dbg_aim_line）。
+    // 独立于 VA_DBG_VM：那一行是帧率心跳，这两件事的判读场合不重叠。
+    if (std::getenv("VA_DBG_VMAIM") != nullptr) {
+        aim_dbg_acc += dt;
+        if (aim_dbg_acc >= 1.0f) {
+            aim_dbg_acc = 0.0f;
+            dbg_aim_line();
         }
     }
 
