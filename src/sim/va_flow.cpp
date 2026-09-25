@@ -27,8 +27,12 @@ void update_mines(float dt) {
             if (distf(v.x, v.y, m.x, m.y) < 34) {
                 m.used = true; W.stats.minesUsed++;
                 explosion(m.x, m.y, 74, 60, Team::Ally, "mine");
-                Unit *laobai = ally_by_id("laobai");
-                damage_vehicle(&v, 260, "mine", laobai ? laobai : W.player);
+                /* 战果算在**爆破手**头上（按职务找，不按名字 —— 五个阵地各有一批名字，
+                   写死"老白"只有第一关命中，之后恒为 nullptr、战果全算到玩家头上）。 */
+                Unit *demo = nullptr;
+                for (auto &x : W.units)
+                    if (x.team == Team::Ally && !x.dead && !x.downed && x.role == "爆破手") { demo = &x; break; }
+                damage_vehicle(&v, 260, "mine", demo ? demo : W.player);
                 if (W.box.active && !W.box.taken && v.hasBox) drop_box(v.x, v.y);
                 break;
             }
@@ -100,24 +104,42 @@ void check_objectives() {
     EV->on_objectives_dirty();
 }
 
-/* 收拢阶段：仗已经打完（除撤离外的主目标全部达成），并且已经开始往外带人
-   （下过撤退令，或者撤离人数已经够）。
-   **为什么不用 W.evacArmed**：它在"拿到密码箱"时也会置位。单关卡里那等于
-   "该走了"，但战役里"守住阵地 150 秒"才是主目标、物件只是副目标 ——
-   拿箱不等于要走。用 evacArmed 会让收拢窗口在箱子刚到手时就开门、
-   四十秒后关掉，那时队伍还在阵地上，于是被判定成"一个人都没带出来"
-   （实测第三关：9 人活着、0 人撤离）。
-   **为什么不用"撤离人数已够"当唯一条件**：那样差一个人的时候反而不给时间，
-   恰恰是最需要这二十秒的时候没有（实测第二关差 1 人，5/6）。
-   在这个阶段里关卡**不因时限收关**：时限是用来逼"还在打"的关卡的，
-   不是用来砍掉"已经赢了、正在把最后几个人带出去"的最后几十秒。
-   什么时候结束由 check_end 结算（窗口走完 / 能走的都走到了）。 */
-static bool gather_open() {
-    if (!CAM.active || W.over) return false;
+/* 主目标是否达成。**抽成函数是因为两个调用点都要用它**：
+   check_end（过关）与 update_flow（超时判死）——
+   两处各写一遍循环，迟早出现"撑到了时限却算没达标"这种自相矛盾的画面。 */
+static bool campaign_main_done() {
+    if (!CAM.active) return false;
     for (const auto &g : cur_level().goals) {
-        if (g.main && g.kind != GoalKind::Evac && !goal_done(g)) return false;
+        if (g.main && !goal_done(g)) return false;
     }
-    return W.evacOrdered || W.stats.evacCount >= effective_evac_need();
+    return true;
+}
+
+/* 本作（五个伏击阵地）**没有撤离门槛** —— 过关的两条出口只有：
+     ① 拖够时间（LevelDef 的 Delay 目标达成）；
+     ② 伤亡过半之后玩家主动选择撤退。
+   旧的「N 人真走到撤离点」是「夺密码箱 + 撤离」那套目标时代的产物：
+   留着它会出现"拖延目标 √ 却因为没人走到撤离点而判失败"，
+   而那种失败在 HUD 上完全没有对应的一行，玩家只会以为游戏坏了。
+   所以整个撤掉 —— 拖够了就转进，不会在原地多等人。 */
+
+/* 伤亡过半 → 给玩家一次「撤 / 守」的选择。
+   三个前置条件缺一不可：
+     · 战役模式（单关模式没有"下一个阵地"可去）；
+     · 已经交火（部署阶段还没接敌就弹"要不要撤"，是没有意义的骚扰）；
+     · 还没选过（选完就不再打扰）。
+   "过半"取 **伤亡数 × 2 >= 开局人数**：10 人的队伍倒下 5 个即触发。 */
+static void update_retreat_offer() {
+    if (!CAM.active || W.over || W.retreatChoice != 0) return;
+    if (!W.triggered || W.retreatOffered) return;
+    if (LV.startCount <= 0) return;
+    int cas = 0;
+    for (auto &u : W.units) if (u.team == Team::Ally && (u.dead || u.downed)) ++cas;
+    if (cas * 2 < LV.startCount) return;
+    W.retreatOffered = true;
+    W.retreatOfferT = W.t;
+    set_alert("伤亡过半 — 1 撤向下一阵地 / 2 继续死守", 8.0f);
+    say("全体", "队长，伤亡过半了！撤还是守？你拿主意！", "no");
 }
 
 void check_end() {
@@ -125,69 +147,65 @@ void check_end() {
     const MissionStats &s = W.stats;
     const int need = effective_evac_need();
 
-    /* 还在场上、且还站得起来的人：up = 人数，allIn = 是否已经全部撤到撤离点。
-       提前算出来是因为下面的"集结窗口"要用它当第二个出口。 */
+    bool mainDone = true;
+    if (CAM.active) {
+        mainDone = campaign_main_done();
+    } else {
+        mainDone = (s.tankKilled && s.boxTaken && s.evacCount >= need);
+    }
+
+    if (CAM.active) {
+        const bool retreating = (W.retreatChoice == 1);
+        if ((mainDone || retreating) && !W.convoyEscaped) {
+            /* 两条出口通向同一个动作：转进下一个阵地。
+               区别只在战报 —— 提前撤的那一栏写着"只拖住 N 秒"，
+               而且不计入 cleared（评级按它算）。 */
+            capture_carry();
+            commit_level_result(mainDone);
+            const LevelDef &L = cur_level();
+            const std::string held = std::to_string((int)W.t) + " 秒";
+            if (has_next_level()) {
+                const LevelDef &N = level_at(next_level_index());
+                end_game("转进", mainDone
+                    ? std::string(L.place) + " 拖住敌人 " + held + "。转进 " + N.place
+                      + " —— " + N.ourUnit + "。"
+                    : std::string("伤亡过半，主动撤出 ") + L.place + "（只拖住 " + held
+                      + "）。转进 " + N.place + "。");
+            } else {
+                end_game(mainDone ? "胜利" : "失败", mainDone
+                    ? "阻击任务完成：最后一个阵地也拖住了 " + held
+                      + "。铁原以北，新的防线已经起来了。"
+                    : "最后一个阵地提前放弃（只拖住 " + held + "），阻击任务失败。");
+            }
+            return;
+        }
+        /* 全灭 → 阵地失守。on_ally_lost() 是同一条判据的另一个入口
+           （那边是"最后一个人断气的那一刻"，这里是兜底）。 */
+        int up = 0;
+        for (auto &u : W.units) if (u.team == Team::Ally && !u.dead && !u.downed) ++up;
+        if (W.triggered && up == 0) {
+            commit_level_result(false);
+            end_game("失败", std::string(cur_level().place)
+                     + " 失守，阵地上没有人还能站起来。");
+        }
+        return;
+    }
+
+    // ---- 单关模式（离线扫描）：判据与旧版逐字相同，不能动 ----
+    if (s.tankKilled && s.boxTaken && s.evacCount >= need && !W.convoyEscaped) {
+        end_game("成功", "伏击成功：坦克被摧毁，密码箱到手，" + std::to_string(s.evacCount)
+                         + " 人从 " + W.evac.name + " 撤离。");
+        return;
+    }
     int up = 0, allIn = 1;
     for (auto &u : W.units) {
         if (u.team != Team::Ally || u.dead || u.downed) continue;
         up++;
         if (!u.evacuated) allIn = 0;
     }
-
-    /* ---- 战役：主目标全达成 + 撤离够人 → 过关。
-       过关不等于结束 —— 还有下一关就 end_game("转进")，由引擎层接住继续。
-       end_game 的 kind 是给外部看的：HUD 按它决定显示"任务完成"还是"继续转进"。 ---- */
-    bool mainDone = true;
-    if (CAM.active) {
-        for (const auto &g : cur_level().goals) {
-            if (g.main && !goal_done(g)) { mainDone = false; break; }
-        }
-    } else {
-        mainDone = (s.tankKilled && s.boxTaken && s.evacCount >= need);
-    }
-    if (CAM.active && gather_open() && !W.convoyEscaped) {
-        /* 集结/收拢窗口：进入这个阶段不等于立刻收关（见 CampaignState::evacOpenT）。
-           两个出口 —— 窗口走完，或者能走的人都走到了。 */
-        if (CAM.evacOpenT < 0.0f) CAM.evacOpenT = W.t;
-        if (W.t - CAM.evacOpenT >= cur_level().evacWindow || allIn) {
-            if (!mainDone) {
-                /* 窗口关掉、人还是没带够 —— 这才是真的没带出来。 */
-                commit_level_result(false);
-                end_game("失败", "撤离人数不足 " + std::to_string(need) + " 人（实际 "
-                         + std::to_string(s.evacCount) + " 人），" + std::string(cur_level().place)
-                         + " 未能守住。");
-                return;
-            }
-            capture_carry();          // 先数清楚谁跟着走（结算面板要用）
-            commit_level_result(true);
-            const LevelDef &L = cur_level();
-            if (has_next_level()) {
-                const LevelDef &N = level_at(next_level_index());
-                end_game("转进", std::string(L.place) + " 的任务完成：" + std::to_string(s.evacCount)
-                         + " 人撤出。转进" + N.place + " —— " + N.ourUnit + "。");
-            } else {
-                /* 史实落点：6 月 12 日 19:30，63 军奉兵团命令转向伊川地区休整。 */
-                end_game("胜利", "阻击任务完成。第 63 军转向伊川地区休整 —— 铁原以北，"
-                         "新的防线已经起来了。");
-            }
-            return;
-        }
-    } else if (!CAM.active && s.tankKilled && s.boxTaken && s.evacCount >= need && !W.convoyEscaped) {
-        end_game("成功", "伏击成功：坦克被摧毁，密码箱到手，" + std::to_string(s.evacCount)
-                         + " 人从 " + W.evac.name + " 撤离。");
-        return;
-    }
     if (up > 0 && allIn && W.triggered && W.evacArmed && s.evacCount < need) {
         end_game("失败", "撤离人数不足 " + std::to_string(need) + " 人（实际 "
                          + std::to_string(s.evacCount) + " 人），任务失败。");
-        return;
-    }
-    /* 人都撤出来了、但主目标没完成 → 也得给个结束。
-       不写这条的话玩家会卡在"全员已撤离、界面却什么都不发生"的状态里 ——
-       既不能继续打（人都走了），也不结算。 */
-    if (CAM.active && up > 0 && allIn && W.triggered && !mainDone) {
-        commit_level_result(false);
-        end_game("失败", "撤出来了，但 " + std::string(cur_level().place) + " 的任务没完成。");
     }
 }
 
@@ -220,7 +238,7 @@ void update_flow(float dt) {
         if (CAM.active) {
             /* 已经在收拢阶段 → 不在这里判死，交给 check_end 按窗口结算：
                时限是逼"还在打"的关卡的，不是砍"已经赢了、正在把人带出去"的。 */
-            if (!gather_open()) {
+            if (!campaign_main_done()) {
                 commit_level_result(false);
                 end_game("失败", std::string(cur_level().place) + " 未能按时完成，敌人已经绕过去了。");
             }
@@ -229,6 +247,7 @@ void update_flow(float dt) {
         }
     }
     update_level_goals(dt);          // 夜袭夺回 / 阵地坚守的累计计时
+    update_retreat_offer();          // 伤亡过半 → 弹「撤 / 守」选择
     check_objectives();
     if (W.t > 20) check_end();
     update_barrage(dt);

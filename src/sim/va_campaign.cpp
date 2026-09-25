@@ -30,155 +30,120 @@ void reset_level_runtime() {
 }
 
 // ------------------------------------------------------------------ 关卡表
-/* missionEnd 既是本关时限，也是 Delay 类目标的判据 —— 两个必须是同一个数，
-   否则会出现"撑到了时限但目标还没打勾"这种自相矛盾的画面（简报写 5 分钟，
-   目标写 300 秒，玩家按哪个算？）。Delay 关的 missionEnd 比 need 多留 30 秒撤离。 */
+/* 五个伏击阵地 = 五个关卡。
+   【目标只剩一条：拖延】不需要夺取敌人的密码箱，也不需要"撤出 N 人" ——
+   每一关的判据都是同一句话：**把敌人钉在这里 240 秒**。
+   为什么连撤离门槛一起去掉：本作要的是"逐次抵抗"的节奏感 ——
+   打满 240 秒就转进下一个阵地；伤亡过半时你也可以**提前撤**（见 retreat），
+   但那时候只拖了多少秒就记多少秒，战报里写得明明白白。
+   "拖够时间"和"提前撤"是两条出口，都通向下一个阵地，区别只在战报。
+
+   【missionEnd 必须 > Delay 的 need】update_flow 里"超时判死"那一段排在
+   check_end **之前**，两者取同一个数的话，撑到 240 秒那一刻会先被判成超时失败。
+   留 35 秒的余量，语义是"拖够 240 秒就走，不会在原地多待"。 */
+static const float kDelayNeed = 240.0f;
+
 static const LevelDef L1{
-    "l1_yunv", "第一关 · 玉女峰前哨", "1951.5.30", "涟川以南 · 第一道防线前哨",
+    "l1_yunvfeng", "第一关 · 玉女峰", "1951.5.30", "玉女峰 · 前出警戒阵地",
     "63军187师561团3营（前出警戒分队）", "美骑兵第1师搜索分队",
-    "5 月 30 日夜，各师进入阵地。你们是 3 营派出的前出警戒分队，在玉女峰、沙宗洞"
-    "一带前出二十公里。任务不是死守 —— 是**让敌人提前展开**，打掉他的搜索队就走。",
-    "史实：187 师进入阵地当夜即派警戒分队前出 20 公里骚扰，迫使美军于 6 月 1 日"
-    "提前展开进攻，为军主力抢修工事抢出了一天。",
-    TerrainTheme::Gorge, 2200, 1300, 650, 70, 4.5f, 18.0f, 0.5f,
-    { "玉女峰主峰", "沙宗洞北坡", "下浦渡口", "前哨弹药堆", "沙宗洞密林", "东路（敌来向）", "西路（撤回）" },
-    30, 120, 120, 300, 9999,
-    false, false, false, true,
-    8, 12,
+    "5 月 30 日夜，各师进入阵地。你们是 3 营派出的前出警戒分队，卡在玉女峰南面的"
+    "公路拐弯上。任务不是死守，也不是夺什么物件 —— 是**把敌人钉在这里 240 秒**，"
+    "打乱他的展开节奏，然后带着人转进下一个阵地。",
+    "史实：187 师进入阵地当夜即派警戒分队前出二十公里，迫使美军于 6 月 1 日提前展开"
+    "进攻，为军主力抢修工事抢出了一天。",
+    TerrainTheme::Pass, 1900, 1250, 620, 58, 9.0f, 34.0f, 0.35f,
+    { "玉女峰主峰", "北坡侧射位", "西侧隘口", "路边油桶", "南麓密林", "东路（敌来向）", "西路（撤回）" },
+    30, 120, 165, 275, 480,
+    false, false, false, false,
+    10, 14,
     { { "jeep", "jeep", "apc", "truck" }, { "jeep", "apc", "truck", "jeep" } },
     {
-        { GoalKind::DestroyKind, "打掉敌搜索队的装甲车", true, 1, "apc" },
-        { GoalKind::Evac, "撤回下浦渡口", true, 7 },
+        { GoalKind::Delay, "拖住敌人 240 秒", true, kDelayNeed },
     },
-    7, "警戒哨记录本",
-    /* 第一关的集结窗口给得最宽：对面只是搜索分队，火力压不住人，
-       从容收拢的代价小。**这一关带走多少人，直接决定第二关的底子** ——
-       实测窗口 0（旧行为）时只带走 8 人，第二关对着美骑 1 师崩掉；给 30 秒后带走 11 人。 */
-    42.0f,
+    0, "", 0.0f,
 };
 
 static const LevelDef L2{
-    "l2_lianchuan", "第二关 · 涟川山口", "1951.6.1", "涟川山口 · 第一道防线核心",
+    "l2_233", "第二关 · 233.2 高地", "1951.6.1", "233.2 高地 · 涟川以南第二道阻击线",
     "63军187师561团3营", "美骑兵第1师 5 个营 + 4 个炮兵营 + 11 辆坦克",
     "敌人的主攻方向选在了西线 —— 就是你们这里。正面不到三公里，对面是两个师。"
-    "卡住山口：162 高地和 167.1 高地一丢，涟铁公路就通了，铁原背后再无险可守。",
-    "史实：561 团 3 营在涟川山口坚守四天三夜，抗击数倍于己的敌人十余次进攻，"
+    "233.2 高地一丢，涟铁公路就通了。再拖 240 秒，能拖一秒是一秒。",
+    "史实：561 团 3 营在涟川山口一线坚守四天三夜，抗击数倍于己的敌人十余次进攻，"
     "毙伤美军 1300 余人，战后被授予「守如泰山」锦旗。",
-    TerrainTheme::Pass, 1900, 1250, 620, 58, 9.0f, 34.0f, 0.35f,
-    { "162高地", "167.1高地", "榛田里北山", "新村北山", "山口南林", "东路（骑1师）", "西路（通铁原）" },
-    30, 120, 165, 400, 480,
-    false, false, false, true,
+    TerrainTheme::Ridges, 2100, 1300, 640, 66, 6.0f, 24.0f, 0.55f,
+    { "233.2主峰", "东南鞍部", "西侧谷口", "弹药堆", "北台树林", "东路（骑1师）", "西路（通铁原）" },
+    30, 120, 160, 275, 480,
+    false, false, false, false,
     12, 18,
     { { "jeep", "apc", "tank", "apc", "jeep" }, { "jeep", "tank", "apc", "apc", "jeep" },
       { "jeep", "apc", "apc", "tank", "jeep" } },
     {
-        { GoalKind::Hold, "守住山口", true, 150 },
-        /* 为什么是"打瘫两辆车"而不是"必须敲掉坦克"：950 HP、装甲 0.04 的坦克
-           只有火箭筒啃得动，而反坦克组一共 6 发、还要穿过车顶机枪的火网 ——
-           实测（离线扫描、默认平衡）真人剧本打掉它的概率约 8/10，
-           也就是说**每五局就有一局因为运气而整关判死**，这不是难度，是赌博。
-           改成"打瘫两辆车（坦克最好）"：打掉坦克仍然是最优解，
-           但打不掉时还能靠打瘫装甲车/卡车完成任务。 */
-        { GoalKind::DestroyAny, "打瘫两辆车（坦克最好）", true, 2 },
-        { GoalKind::Evac, "撤出战斗", true, 6 },
+        { GoalKind::Delay, "拖住敌人 240 秒", true, kDelayNeed },
     },
-    6, "山口布防图",
-    40.0f,     // 正对着美军主攻方向，窗口太长就是白挨炮 —— 靠"能走的都到了"提前关
+    0, "", 0.0f,
 };
 
 static const LevelDef L3{
-    "l3_zhongzishan", "第三关 · 种子山", "1951.6.2 — 6.3 凌晨", "种子山 · 233.2 高地",
+    "l3_zhongzishan", "第三关 · 种子山", "1951.6.2 — 6.3", "种子山 · 五峰寺以北",
     "63军189师566团", "伪陆战第1团 / 伪9师 / 加拿大25旅 → 美第25师",
-    "白天丢了就夜里夺回来。566 团的敢死队会在凌晨发起反击 —— 在那之前，"
-    "你们得把阵地**拖住**，别让敌人站稳。入夜后跟着反击队冲上主峰。",
+    "白天丢了就夜里夺回来。眼下你们的任务更简单也更难：站在这里，**别让敌人**"
+    "**在 240 秒内走过去**。弹药不够就省着打，人在阵地在。",
     "史实：6 月 2 日激战竟日，种子山、五峰寺及以南阵地相继失守；当夜 566 团以"
     "一连、三连各一个排组成敢死队，于 3 日凌晨夜袭种子山，全歼守敌夺回阵地。",
     TerrainTheme::Ridges, 2300, 1350, 700, 66, 6.0f, 24.0f, 0.55f,
-    { "种子山主峰", "233.2高地", "五峰寺", "弹药堆", "南麓密林", "东路（美25师）", "西路" },
-    30, 120, 160, 480, 420,
-    true, false, false, true,
-    10, 14,
-    { { "jeep", "apc", "tank", "truck", "apc", "jeep" }, { "jeep", "tank", "apc", "truck", "apc", "jeep" } },
-    {
-        { GoalKind::Hold, "白天拖住敌人", true, 90 },
-        { GoalKind::Retake, "夜袭夺回种子山主峰", true, 0 },
-        { GoalKind::Evac, "撤出战斗", true, 5 },
-    },
-    5, "团部密码本",
-    40.0f,     // 夜战：看得见的敌人少，收拢队伍的时间可以给长一点
-};
-
-static const LevelDef L4{
-    "l4_jiachixiang", "第四关 · 加齿项", "1951.6.3", "加齿项 · 477.2 高地（第二道防线）",
-    "63军189师（打光前最后一天）", "美第25师 3 个团 + 坦克集群",
-    "美 25 师加入了。189 师的所有营连都已经不成建制，师团机关的勤务人员都上了阵地。"
-    "你们的任务不再是歼灭 —— 是**拖到天黑**，把阵地交给接防的 188 师。",
-    "史实：6 月 3 日拂晓美 25 师 3 个团加入战斗，以坦克为先导突入纵深；189 师"
-    "战斗减员严重，坚守到天黑才奉命将阵地移交给军预备队 188 师。",
-    TerrainTheme::Ridges, 2100, 1300, 640, 72, 5.5f, 22.0f, 0.5f,
-    { "加齿项主阵地", "477.2高地", "细柳洞", "油桶堆", "北台树林", "东路", "西路" },
-    30, 120, 150, 380, 240,
-    false, false, false, true,
-    14, 20,
-    { { "jeep", "tank", "apc", "tank", "truck", "jeep" }, { "tank", "jeep", "tank", "apc", "truck", "jeep" } },
-    {
-        { GoalKind::Delay, "拖到天黑（交给 188 师）", true, 260 },
-        { GoalKind::ExtractItem, "带出师部电台", true, 0 },
-        { GoalKind::Evac, "撤向二线阵地", true, 5 },
-    },
-    4, "师部电台",
-    40.0f,     // 迟滞关：本来就是"且战且退"，收拢正好借着交替掩护做
-};
-
-static const LevelDef L5{
-    "l5_207", "第五关 · 207 高地", "1951.6.5 — 6.6", "207 高地 · 255.1 高地",
-    "63军188师563团", "美骑兵第1师加强团",
-    "志司已经下令改坚守防御为机动防御。207 高地三面受敌，背后是悬崖绝壁 —— "
-    "敌人会分两路从侧翼迂回。撑住，能带几个走就带几个走。",
-    "史实：6 月 6 日敌以一个营分两路迂回 207 高地，563 团 1 连 2 排三面受敌、"
-    "背后是悬崖，战至午夜只剩 8 人，弹药耗尽后高呼「胜利属于我们」跳下悬崖，"
-    "5 人牺牲、3 人被树枝托住生还，后被授予「宁死不屈的八勇士」。",
-    TerrainTheme::LoneHill, 2000, 1400, 720, 80, 2.5f, 10.0f, 0.7f,
-    { "207高地", "255.1高地", "北台", "弹药堆", "崖下密林", "东路", "西路（悬崖）" },
-    30, 120, 155, 420, 300,
-    false, false, true, true,
+    { "种子山主峰", "北坡侧射位", "五峰寺", "油桶堆", "南麓密林", "东路（美25师）", "西路" },
+    30, 120, 160, 275, 480,
+    false, false, false, false,
     12, 18,
     { { "jeep", "apc", "tank", "truck", "apc", "jeep" }, { "jeep", "tank", "apc", "truck", "apc", "jeep" } },
     {
-        { GoalKind::Hold, "守住 207 高地", true, 180 },
-        { GoalKind::ExtractItem, "带出连队花名册", true, 0 },
-        { GoalKind::Evac, "撤向二线阵地", true, 4 },
+        { GoalKind::Delay, "拖住敌人 240 秒", true, kDelayNeed },
     },
-    4, "连队花名册",
-    36.0f,     // 三面受敌，侧翼的火力不会给你慢慢等人的时间
+    0, "", 0.0f,
 };
 
-static const LevelDef L6{
-    "l6_neiwaijia", "第六关 · 内外加山", "1951.6.9 — 6.10", "内外加山 279.5 高地 · 铁原东南最后屏障",
-    "63军188师564团5连（两个排 70 余人）", "美第3师15团 + 骑1师5团 · 上百辆坦克装甲车",
-    "再往北就是平原，无险可守。山北一百米有一座水库 —— 炸开它，洪水能淹没南面的"
-    "平原，把美军装甲集群陷在泥里一整天。代价是：山上的人**再也退不回来**。"
-    "炸不炸，你们自己决定。",
-    "史实：6 月 10 日晨 5 连自断退路炸开水库，「水淹七军」令敌坦克陷入洪流；"
-    "美军出动飞机 707 架次倾泻凝固汽油弹，山体被打得像融化的冰淇淋（当地人称"
-    "「冰激凌山」）。5 连以全部牺牲的代价，把一个 200 多米高的小山包守了一整天。",
-    TerrainTheme::Reservoir, 2100, 1350, 680, 76, 3.0f, 12.0f, 0.45f,
-    { "内外加山279.5", "水库大坝", "铁原北道", "油桶堆", "峡谷口树林", "东路（装甲集群）", "西路" },
-    30, 120, 150, 420, 9999,
-    false, true, false, true,
-    12, 16,
-    { { "jeep", "tank", "apc", "tank", "truck", "jeep" },
-      { "tank", "jeep", "tank", "apc", "truck", "jeep" } },
+static const LevelDef L4{
+    "l4_jiufeng", "第四关 · 鹫峰", "1951.6.3", "鹫峰 · 第二道防线左翼",
+    "63军189师（减员严重的几个连）", "美第25师 3 个团 + 坦克集群",
+    "美 25 师加入了。189 师的所有营连都已经不成建制，师团机关的勤务人员都上了阵地。"
+    "再撑 240 秒，把阵地交给接防的部队 —— 你们的价值是**时间**，不是战果。",
+    "史实：6 月 3 日拂晓美 25 师 3 个团加入战斗，以坦克为先导突入纵深；189 师"
+    "战斗减员严重，坚守到天黑才奉命将阵地移交给军预备队 188 师。",
+    TerrainTheme::LoneHill, 2000, 1400, 720, 80, 2.5f, 10.0f, 0.7f,
+    { "鹫峰主阵地", "东岩", "细柳洞", "油桶堆", "北台树林", "东路", "西路" },
+    30, 120, 150, 275, 480,
+    false, false, false, false,
+    14, 20,
+    { { "jeep", "tank", "apc", "tank", "truck", "jeep" }, { "tank", "jeep", "tank", "apc", "truck", "jeep" } },
     {
-        { GoalKind::BlowDam, "炸开水库大坝", true, 0 },
-        { GoalKind::Delay, "把装甲集群钉在原地", true, 200 },
-        { GoalKind::Evac, "撤往铁原以北", true, 3 },
+        { GoalKind::Delay, "拖住敌人 240 秒", true, kDelayNeed },
     },
-    3, "观察哨日志",
-    38.0f,     // 洪水已经把装甲集群钉住了，最后这段路是六关里最好走的
+    0, "", 0.0f,
 };
 
-const std::vector<LevelDef> LEVELS = { L1, L2, L3, L4, L5, L6 };
+static const LevelDef L5{
+    "l5_shazongdong", "第五关 · 沙宗洞", "1951.6.5 — 6.6", "沙宗洞 · 最后一道阻击线",
+    "63军188师563团", "美骑兵第1师加强团",
+    "志司已经下令改坚守防御为机动防御。沙宗洞三面受敌，背后是悬崖绝壁 —— "
+    "敌人会分两路从侧翼迂回。这是最后一个阵地：再拖 240 秒，铁原以北的新防线就起来了。",
+    "史实：6 月 6 日敌以一个营分两路迂回 207 高地，563 团 1 连 2 排三面受敌、"
+    "背后是悬崖，战至午夜只剩 8 人，弹药耗尽后跳下悬崖，5 人牺牲、3 人生还，"
+    "后被授予「宁死不屈的八勇士」。",
+    TerrainTheme::Gorge, 2200, 1300, 650, 70, 4.5f, 18.0f, 0.5f,
+    { "沙宗洞主峰", "北坡", "下浦渡口", "弹药堆", "洞北密林", "东路", "西路（悬崖）" },
+    30, 120, 150, 275, 480,
+    false, false, true, false,
+    16, 22,
+    { { "jeep", "tank", "apc", "tank", "truck", "apc", "jeep" },
+      { "tank", "jeep", "tank", "apc", "tank", "truck", "jeep" } },
+    {
+        { GoalKind::Delay, "拖住敌人 240 秒", true, kDelayNeed },
+    },
+    0, "", 0.0f,
+};
+
+const std::vector<LevelDef> LEVELS = { L1, L2, L3, L4, L5 };
+
 
 int level_count() { return (int)LEVELS.size(); }
 /* 撤离门槛 = min(关卡设定的上限, 开局人数 - 3)，下限 2。
@@ -404,22 +369,31 @@ void apply_level(int idx, uint32_t seed) {
     DEPLOY_ZONES.push_back({ "后方 / 撤离点",        L.mapW * 0.08f, L.roadCY + 110.0f,
                              L.mapW * 0.24f, L.roadCY + 440.0f, "医疗兵与撤退点" });
 
-    // ---- 开局站位：按角色分到四个区（与原来那份手填表同构） ----
+    // ---- 开局站位：按**职务**分到四个区 ----
+    /* 不能再按 id 手填：五个阵地各有自己的 10 个人（共 50 个名字），
+       写死一份 id 表只会让第二关之后的人全部落在默认点（recommend_of 找不到就
+       原样返回调用方给的兜底值）—— 表现是"整个班挤在一个点上"，
+       而日志里一行报错都没有。按职务分配则天然对任何一份花名册成立。 */
     RECOMMEND.clear();
     const float ax = L.mapW * 0.40f, bx = L.mapW * 0.49f;
     const float ay = L.roadCY + 250.0f, by = L.roadCY - 250.0f;
-    const float ex = L.mapW * 0.33f, ey = L.roadCY + 420.0f;
-    RECOMMEND.push_back({ "player",  ax,         ay });
-    RECOMMEND.push_back({ "laozhou", ax + 74.0f,  ay + 58.0f });
-    RECOMMEND.push_back({ "xiaoxia", ax - 76.0f,  ay - 16.0f });
-    RECOMMEND.push_back({ "ajie",    ax + 30.0f,  ay + 112.0f });
-    RECOMMEND.push_back({ "daliu",   ax - 44.0f,  ay + 78.0f });
-    RECOMMEND.push_back({ "shitou",  bx - 22.0f,  by - 36.0f });
-    RECOMMEND.push_back({ "houzi",   bx + 36.0f,  by + 18.0f });
-    RECOMMEND.push_back({ "alan",    ex,          ey });
-    RECOMMEND.push_back({ "laobai",  L.mapW * 0.56f, L.roadCY + 152.0f });
-    RECOMMEND.push_back({ "xiaoman", L.mapW * 0.15f, L.roadCY + 250.0f });
-    RECOMMEND.push_back({ "tietou",  L.mapW * 0.19f, L.roadCY + 206.0f });
+    RECOMMEND.push_back({ "player", ax, ay });   // 队长（玩家位）
+    int nRifle = 0, nAt = 0;
+    for (const auto &m : position_men(L.id)) {
+        float rx = ax, ry = ay;
+        if (m.role == "机枪手")          { rx = ax + 74.0f;              ry = ay + 58.0f; }
+        else if (m.role == "狙击手")     { rx = ax - 76.0f;              ry = ay - 16.0f; }
+        else if (m.role == "步枪手")     { rx = (nRifle++ == 0) ? ax + 30.0f : ax - 44.0f;
+                                           ry = (nRifle == 1) ? ay + 112.0f : ay + 78.0f; }
+        else if (m.role == "反坦克手")   { rx = (nAt++ == 0) ? bx - 22.0f : bx + 36.0f;
+                                           ry = (nAt == 1) ? by - 36.0f : by + 18.0f; }
+        else if (m.role == "爆破手")     { rx = L.mapW * 0.56f;          ry = L.roadCY + 152.0f; }
+        else if (m.role == "医疗兵")     { rx = L.mapW * 0.15f;          ry = L.roadCY + 250.0f; }
+        else                             { rx = L.mapW * 0.19f;          ry = L.roadCY + 206.0f; }
+        /* id 取自 POSITION_ROSTERS（静态常量表），c_str() 的寿命够用 ——
+           RecommendPos::id 就是 const char*。 */
+        RECOMMEND.push_back({ m.id.c_str(), rx, ry });
+    }
 }
 
 // ------------------------------------------------------------------ 目标
@@ -558,24 +532,20 @@ float flood_speed_mul(float x, float y) {
 void capture_carry() {
     CARRY.valid = true;
     CARRY.units.clear();
+    CARRY.aliveAtCapture = 0;
+    CARRY.downAtCapture = 0;
     for (auto &u : W.units) {
         if (u.team != Team::Ally || u.dead) continue;
-        /* 带走的条件：站着的必须真走到撤离点；倒地的只要被抬到撤离点附近就算救回来了
-           （下一关开局仍是失能，需要医疗兵救）。
-           为什么倒地的不直接算"没了"：那就把"救回所有伤员"这条加分项变成了
-           一句空话 —— 救与不救结果一样，玩家没有理由冒着火力去拖人。
-
-           **已经走出去的人（u.evacuated）优先按标志算，不重新量距离。**
-           标志是"走到撤离点那一刻"打上的、用的就是下面这个 95/160 规则，
-           再量一次只会引入漂移：撤离点本身会在炸桥后**改成南侧树林**
-           （update_evac_marker），于是"先在旧撤离点出去的 2 个人"会被判成没带出来 ——
-           结算面板写"7 人撤出"、下一关却只带来 5 人。
-           实机第一关转进时见到的就是这个 7 vs 5。 */
-        const bool reached = u.evacuated
-                          || distf(u.x, u.y, W.evac.x, W.evac.y) < (u.downed ? 160.0f : 95.0f);
-        if (!reached && !u.isPlayer) continue;
+        /* **带走的条件改成了"还活着就行"**，不再要求"走到撤离点"：
+           五个阵地的任务只有拖延一条，过关的两条出口是「拖够 240 秒」和
+           「伤亡过半后主动撤退」，两条都不经过撤离点。沿用旧的 95/160 距离判据
+           会让第二关一开局只剩玩家一个人 —— 因为没人走到过撤离点，
+           而那种失败在结算面板上只表现为"带队 1 人"。
+           **阵亡的不复活**（u.dead 上面就跳过了）—— 这是"严格继承"的落点；
+           倒地的照带，下一关开局仍是失能，医疗兵救起来才算恢复。 */
         CarryUnit c;
         c.id = u.id;
+        c.name = u.name;
         c.hp = u.downed ? std::max(1.0f, u.maxHp * 0.30f) : clampf(u.hp, 1.0f, u.maxHp);
         c.maxHp = u.maxHp;
         c.morale = clampf(u.morale, 10.0f, 100.0f);
@@ -585,19 +555,15 @@ void capture_carry() {
         c.grenades = u.grenades;
         c.smokes = u.smokes;
         c.downed = u.downed;
+        if (u.downed) ++CARRY.downAtCapture; else ++CARRY.aliveAtCapture;
         c.kills = u.kills; c.shots = u.shots; c.hits = u.hits;
         CARRY.units.push_back(c);
     }
-    /* 玩家必须跟着走 —— 否则"率领队友撤往下一个阵地"没有主语。
-       玩家挨打只会失能不会阵亡（down_player），所以这里不需要兜底复活。 */
-    bool hasPlayer = false;
-    for (const auto &c : CARRY.units) if (c.id == "player") hasPlayer = true;
-    if (!hasPlayer && W.player != nullptr) {
-        CarryUnit c;
-        c.id = "player"; c.hp = std::max(1.0f, W.player->maxHp * 0.35f); c.maxHp = W.player->maxHp;
-        c.morale = 70; c.ammo = 30; c.magAmmo = 10; c.downed = true;
-        CARRY.units.push_back(c);
-    }
+    /* **玩家阵亡了就不往 CARRY 里补人**。
+       原来的兜底是"玩家没走到撤离点也强行补一个失能的 player" —— 那是撤离门槛
+       时代的产物（少了它玩家就凭空消失）。现在没有撤离门槛，这条兜底只会把
+       一个已经阵亡的玩家复活成失能；正确的落点是**下一阵地由该阵地的队长接任**
+       （见 init_world），CARRY 里没有 player 正是"该换人了"的信号。 */
 }
 
 void commit_level_result(bool win) {
@@ -606,11 +572,17 @@ void commit_level_result(bool win) {
     CAM.totalEvac += W.stats.evacCount;
     CAM.totalTime += W.t;
     if (win) CAM.cleared++;
-    char buf[128];
-    std::snprintf(buf, sizeof(buf), "%s %s：%s · 撤离 %d 人 · 阵亡 %d 人 · 用时 %d:%02d",
+    /* 战报改成报**拖延了多少秒**（本作的唯一指标）+ 阵亡 + 带出几人。
+       不再报"撤离 N 人" —— 没有撤离门槛，那一栏恒为 0，
+       看战报的人只会以为自己一个人都没带出来。 */
+    int alive = 0;
+    for (const auto &c : CARRY.units) if (!c.downed) ++alive;
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "%s %s：%s · 拖延 %d/%d 秒%s · 阵亡 %d 人 · 带出 %d 人",
                   L.date, L.place, win ? "达成" : "未完成",
-                  W.stats.evacCount, W.stats.allyDead,
-                  (int)(W.t / 60.0f), (int)W.t % 60);
+                  (int)W.t, (int)kDelayNeed,
+                  W.retreatChoice == 1 ? "（提前撤离）" : "",
+                  W.stats.allyDead, alive);
     CAM.log.push_back(buf);
 }
 

@@ -53,41 +53,123 @@ void build_convoy_way() {
 }
 
 // ------------------------------------------------------------------ 花名册
-const std::vector<RosterDef> ROSTER = {
-    { "ajie",    "阿杰",  "步枪手",   "1组",   "rifle",  true,  false, { "阿杰", "阿杰尔", "阿杰哥", "杰哥", "阿洁", "阿杰儿" } },
-    { "laozhou", "老周",  "机枪手",   "1组",   "mg",     false, false, { "老周", "周哥", "周叔" } },
-    { "xiaoxia", "小夏",  "狙击手",   "1组",   "sniper", false, false, { "小夏", "夏姐", "小侠" } },
-    { "daliu",   "大刘",  "步枪手",   "1组",   "rifle",  false, false, { "大刘", "大流", "刘哥" } },
-    { "alan",    "阿兰",  "步枪手",   "2组",   "rifle",  false, true,  { "阿兰", "阿蓝", "兰姐" } },
-    { "shitou",  "石头",  "反坦克手", "2组",   "at",     false, false, { "石头", "石头哥", "石哥" } },
-    { "houzi",   "猴子",  "反坦克手", "2组",   "at",     false, false, { "猴子", "猴哥", "猴儿" } },
-    { "laobai",  "老白",  "爆破手",   "2组",   "demo",   false, false, { "老白", "白哥", "白叔" } },
-    { "xiaoman", "小满",  "医疗兵",   "支援组", "medic",  false, false, { "小满", "满姐", "小曼", "医疗兵", "医生", "军医" } },
-    { "tietou",  "铁头",  "弹药/支援", "支援组", "rifle", false, false, { "铁头", "铁头哥", "铁哥" } },
+/* 语音别名按姓名现场生成：全名 + 去掉姓的名（"李长顺" → "长顺"）。
+   为什么不手写：五个阵地 50 个人，手写 100 条别名既容易漏、
+   也保证不了"名"这一条一定存在；而解析端（va_parser）对别名做的是
+   **最长命中优先 + 0.72 阈值模糊匹配**，两条足够，多了反而互相打架。 */
+std::vector<std::string> make_aliases(const std::string &name) {
+    std::vector<std::string> out;
+    out.push_back(name);
+    const std::string given = utf8_slice_str(name, 1, 8);   // 去掉姓
+    if (!given.empty() && given != name) out.push_back(given);
+    return out;
+}
+
+namespace {
+RosterDef man(const char *id, const char *name, const char *role, const char *group,
+              const char *weapon, const char *art, bool leader, bool deputy) {
+    RosterDef r;
+    r.id = id; r.name = name; r.role = role; r.group = group;
+    r.weapon = weapon; r.art = art;
+    r.leader = leader; r.deputy = deputy;
+    r.aliases = make_aliases(name);
+    return r;
+}
+/* 编制固定为 10 人：队长 1（men[0]，玩家位）+ 机枪 1 + 狙击 1 + 步枪 2 +
+   反坦克 2 + 爆破 1（兼副队长）+ 医疗 1 + 弹药 1。
+   **模型键复用**：11 个 char_* 模型里没有"第 6 个步枪手"这种资源，
+   所以新名字一律复用既有模型（char_rifleman 等）—— 这就是"人物模型可以复用"。 */
+std::vector<RosterDef> pos_men(const char *pfx, const char *cap, const char *mg,
+                               const char *sn, const char *r1, const char *r2,
+                               const char *at1, const char *at2, const char *demo,
+                               const char *med, const char *ammo) {
+    auto I = [pfx](const char *suffix) { return std::string(pfx) + "_" + suffix; };
+    std::vector<RosterDef> v;
+    v.push_back(man(I("cap").c_str(),   cap,  "队长",     "1组",   "rifle",  "char_leader",   true,  false));
+    v.push_back(man(I("mg").c_str(),    mg,   "机枪手",   "1组",   "mg",     "char_mg",       false, false));
+    v.push_back(man(I("sniper").c_str(), sn,  "狙击手",   "1组",   "sniper", "char_sniper",   false, false));
+    v.push_back(man(I("r1").c_str(),    r1,   "步枪手",   "1组",   "rifle",  "char_rifleman", false, false));
+    v.push_back(man(I("r2").c_str(),    r2,   "步枪手",   "2组",   "rifle",  "char_rifleman", false, false));
+    v.push_back(man(I("at1").c_str(),   at1,  "反坦克手", "2组",   "at",     "char_at",       false, false));
+    v.push_back(man(I("at2").c_str(),   at2,  "反坦克手", "2组",   "at",     "char_at",       false, false));
+    v.push_back(man(I("demo").c_str(),  demo, "爆破手",   "2组",   "demo",   "char_demo",     false, true));
+    v.push_back(man(I("medic").c_str(), med,  "医疗兵",   "支援组", "medic",  "char_medic",    false, false));
+    v.push_back(man(I("ammo").c_str(),  ammo, "弹药/支援", "支援组", "rifle",  "char_ammo",     false, false));
+    return v;
+}
+} // namespace
+
+/* 五个伏击阵地各自的 10 人编制。**名字是"事先创造"的** —— 每一关谁在场，
+   在开局那一刻就定死了（继承的幸存者 + 本阵地补员），不是随机抽的。 */
+const std::vector<PositionRoster> POSITION_ROSTERS = {
+    { "l1_yunvfeng", pos_men("p1", "李长顺", "王铁柱", "赵永年", "陈二狗", "孙有田",
+                             "周大勇", "吴小山", "郑满仓", "韩秀英", "马德胜") },
+    { "l2_233",      pos_men("p2", "高德明", "刘黑子", "徐文远", "曹金水", "田福来",
+                             "潘长贵", "于得海", "范石头", "宋桂芳", "姜立春") },
+    { "l3_zhongzishan", pos_men("p3", "郭守成", "罗长发", "谢大眼", "唐小山", "冯德山",
+                             "郝铁牛", "钱有财", "孔繁林", "白淑兰", "崔永福") },
+    { "l4_jiufeng",  pos_men("p4", "杨建国", "吕大个", "施眼镜", "张德海", "苏有贵",
+                             "葛长顺", "韦老栓", "廉福生", "杜鹃", "方金锁") },
+    { "l5_shazongdong", pos_men("p5", "阎成福", "尹黑牛", "冷长贵", "江大水", "尚德全",
+                             "翟铁蛋", "苗长林", "舒老蔫", "甘秀云", "霍满囤") },
 };
 
-const RosterDef *roster_of(const std::string &id) {
-    for (const auto &r : ROSTER) if (id == r.id) return &r;
+const std::vector<RosterDef> &position_men(const char *levelId) {
+    for (const auto &p : POSITION_ROSTERS) {
+        if (levelId != nullptr && p.levelId == levelId) return p.men;
+    }
+    return POSITION_ROSTERS[0].men;
+}
+
+const RosterDef *roster_def_anywhere(const std::string &id) {
+    for (const auto &p : POSITION_ROSTERS)
+        for (const auto &m : p.men)
+            if (m.id == id) return &m;
     return nullptr;
 }
 
-const std::vector<GroupDef> GROUPS = {
-    { "1组",     { "ajie", "laozhou", "xiaoxia", "daliu" } },
-    { "2组",     { "alan", "shitou", "houzi", "laobai" } },
-    { "火力组",   { "ajie", "laozhou", "daliu" } },
-    { "反坦克组", { "shitou", "houzi" } },
-    { "支援组",   { "xiaoman", "tietou" } },
-};
+/* 当前这一关实际出场的人（10 个，含队长）。由 init_world 写入。 */
+std::vector<RosterDef> ROSTER;
 
-const std::vector<RoleCall> ROLE_CALL = {
-    { "机枪手",   { "laozhou" } },
-    { "狙击手",   { "xiaoxia" } },
-    { "反坦克手", { "shitou", "houzi" } },
-    { "爆破手",   { "laobai" } },
-    { "医疗兵",   { "xiaoman" } },
-    { "弹药兵",   { "tietou" } },
-    { "步枪手",   { "ajie", "daliu", "alan" } },
-};
+const RosterDef *roster_of(const std::string &id) {
+    for (const auto &r : ROSTER) if (r.id == id) return &r;
+    return nullptr;
+}
+
+std::vector<GroupDef> GROUPS;
+std::vector<RoleCall> ROLE_CALL;
+
+/* 按 ROSTER 重算分组与职务呼号。顺序按 ROSTER 的顺序走 ——
+   也就是"名册里的先后顺序"，跟 HUD 右侧小队板一致，
+   玩家念"2组"时看到的和听到的才是同一批人。 */
+void rebuild_roster_index() {
+    GROUPS.clear();
+    ROLE_CALL.clear();
+    std::vector<std::string> order;
+    for (const auto &r : ROSTER) {
+        if (r.group.empty()) continue;
+        bool seen = false;
+        for (const auto &g : order) if (g == r.group) { seen = true; break; }
+        if (!seen) order.push_back(r.group);
+    }
+    for (const auto &gname : order) {
+        GroupDef g; g.name = gname;
+        for (const auto &r : ROSTER) if (r.group == gname) g.members.push_back(r.id);
+        GROUPS.push_back(g);
+    }
+    std::vector<std::string> roles;
+    for (const auto &r : ROSTER) {
+        if (r.role.empty()) continue;
+        bool seen = false;
+        for (const auto &x : roles) if (x == r.role) { seen = true; break; }
+        if (!seen) roles.push_back(r.role);
+    }
+    for (const auto &rn : roles) {
+        RoleCall rc; rc.role = rn;
+        for (const auto &r : ROSTER) if (r.role == rn) rc.ids.push_back(r.id);
+        ROLE_CALL.push_back(rc);
+    }
+}
 
 // ------------------------------------------------------------------ 武器表
 namespace {
@@ -234,13 +316,28 @@ std::vector<DeployZone> DEPLOY_ZONES = {
     { "后方 C 点",           180,  760, 520,  1090, "医疗兵与撤退点" },
 };
 
+/* 默认站位（不走战役的入口用，如 tools/va_sweep 的十种子扫描）。
+   进关时由 apply_level 按当前阵地的花名册整个重写，所以这里的 id 必须与
+   **第一份编制**（POSITION_ROSTERS[0]）对得上 —— 对不上的后果是那一类人
+   全部落在调用方给的兜底坐标上（recommend_of 查不到就原样返回），
+   表现为"开局一整排人挤在一个点"，而日志里一行报错都没有。
+   【坐标与顺序是逐项照抄旧花名册的】旧表是 阿杰/老周/小夏/大刘/阿兰/石头/
+   猴子/老白/小满/铁头，新表是 队长/机枪/狙击/步枪/步枪/反坦克/反坦克/爆破/
+   医疗/弹药 —— **同槽同职务**，所以每个坐标原样留在同一个槽位上。
+   为什么要这么小心：这份表决定建队顺序与每人的落点，两者都进 RNG 抽取序列，
+   动一格就会把离线扫描的胜率与伤亡整体平移，新数据再也比不了旧基线。 */
 std::vector<RecommendPos> RECOMMEND = {
-    { "player",  872,  872  },
-    { "laozhou", 946,  930  }, { "xiaoxia", 796, 856 },
-    { "ajie",    902,  984  }, { "daliu",   828, 950 },
-    { "shitou",  1058, 356  }, { "houzi",   1116, 404 },
-    { "alan",    706,  1118 }, { "laobai",  1234, 802 },
-    { "xiaoman", 322,  900  }, { "tietou",  420, 856 },
+    { "player",    872,  872  },
+    { "p1_cap",    902,  984  },   // 旧：阿杰（步枪）
+    { "p1_mg",     946,  930  },   // 旧：老周（机枪）
+    { "p1_sniper", 796,  856  },   // 旧：小夏（狙击）
+    { "p1_r1",     828,  950  },   // 旧：大刘（步枪）
+    { "p1_r2",     706,  1118 },   // 旧：阿兰（步枪）
+    { "p1_at1",    1058, 356  },   // 旧：石头（反坦克）
+    { "p1_at2",    1116, 404  },   // 旧：猴子（反坦克）
+    { "p1_demo",   1234, 802  },   // 旧：老白（爆破）
+    { "p1_medic",  322,  900  },   // 旧：小满（医疗）
+    { "p1_ammo",   420,  856  },   // 旧：铁头（弹药）
 };
 
 bool recommend_of(const std::string &id, float &ox, float &oy) {

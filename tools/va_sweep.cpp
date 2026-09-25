@@ -179,10 +179,11 @@ Row run_one(const Scenario &sc, int seed) {
 }
 
 // --------------------------------------------------------------- 战役模式
-/* 逐关打一遍：每关结束把撤出来的人交给下一关（capture_carry → CARRY → init_world）。
-   它回答的是"关卡能不能连起来"，**不是**"这六关难度合不合适" ——
+/* 逐关打一遍，每关结束把还活着的人交给下一关（capture_carry → CARRY → init_world）。
+   它回答的是"关卡能不能连起来"，**不是**"这几关难度合不合适" ——
    剧本是同一套机械口令，不带玩家的临场判断，所以胜率没有参考价值；
-   有价值的是：六关都能铺出来、目标都能判、人确实在一关关减少、不崩、不卡死。 */
+   有价值的是：每一关都能铺出来、目标都能判、名册换得对、补员补得齐、
+   人确实在一关关减少、不崩、不卡死。 */
 bool goals_but_evac_done() {
     for (const auto &g : cur_level().goals) {
         if (g.main && g.kind != GoalKind::Evac && !goal_done(g)) return false;
@@ -195,6 +196,7 @@ struct LvRow {
     std::string name, kind;
     int   alive = 0, dead = 0, downed = 0, evac = 0;
     int   carry = 0;          // 带进下一关的人数
+    int   carryAlive = 0, carryDown = 0;   // 收拢那一刻的站 / 倒（同一帧内的更早时刻）
     float t = 0;
     std::string goals;        // 目标完成情况
     std::string extra;        // 关卡机制的诊断
@@ -206,6 +208,33 @@ LvRow run_level(int lv, uint32_t seed, bool verbose) {
     W.smokes.clear();
     W.started = true;
     W.deployDone = true;
+
+    /* 打印本关**实际出场的人**。需求是"每个阵地 10 个人、名字事先定好"，
+       所以这一行就是判据：**继承的在前、本阵地补员的在后，合计 10 人**；
+       第二关起如果这里还全是第一关的名字，就是补员没生效。 */
+    std::printf("     名册(%d)：", (int)ROSTER.size());
+    for (const auto &m : ROSTER) {
+        std::printf("%s[%s] ", m.id == "player" ? (m.name + "*").c_str() : m.name.c_str(),
+                    m.role.c_str());
+    }
+    std::printf("（* = 玩家）\n");
+
+    /* 两个**验证开关**（不是玩法，只给离线链路取证用）：
+         VA_SW_RETREAT=1     —— 伤亡过半的提示一弹出就立刻选"撤退"，
+                                用来离线验"提前撤离"这条出口能不能通向下一阵地；
+         VA_SW_KILLPLR=<秒>  —— 到点把玩家打死，用来验"玩家阵亡 → 下一阵地换人"；
+         VA_SW_CAS=<人数>    —— 交火后立刻打死这么多名队员，用来把队伍打到"伤亡过半"，
+                                好让"撤退 / 死守"这个选择**确定性地**出现。
+       之所以要这些开关：这几条路径在实机里全靠运气才能撞上 ——
+       提示只弹一次、玩家不一定会死、机械剧本又太能扛（实测第五阵地最硬的
+       一局也只伤亡 3/10，永远到不了"过半"），线上偶发的路径必须有办法离线复现。 */
+    const char *swRetreat  = std::getenv("VA_SW_RETREAT");
+    const char *swKillPlrS = std::getenv("VA_SW_KILLPLR");
+    const char *swCasS     = std::getenv("VA_SW_CAS");
+    const float killPlrAt  = swKillPlrS ? (float)std::atof(swKillPlrS) : -1.0f;
+    const int   casWant    = swCasS ? std::atoi(swCasS) : 0;
+    bool killPlrDone = false;
+    int  casDone = 0;
 
     int cmdIdx = 0;
     float lastEvacCmd = -100.0f, lastDamCmd = -100.0f, lastRetakeCmd = -100.0f;
@@ -220,14 +249,16 @@ LvRow run_level(int lv, uint32_t seed, bool verbose) {
         const Vehicle *lead = W.vehicles.empty() ? nullptr : &W.vehicles[0];
         if (cmdIdx == 0 && W.t > 5) { c = "全体，隐蔽"; fire = true; }
         else if (cmdIdx == 1 && lead != nullptr && lead->x < CFG.convoyStopX + 320) {
-            trigger_ambush("mine"); c = "老白，起爆"; fire = true;
+            trigger_ambush("mine"); c = "爆破手，起爆"; fire = true;
         }
         if (!fire && W.triggered) {
+            /* 呼号一律用**职务**不用名字：五个阵地各有自己的 10 个人
+               （共 50 个名字），写死"老白 / 铁头 / 小满"只有第一关能命中，
+               之后每一条口令都解析不到人 —— 而失败表现只是"这条命令没生效"。
+               「搬密码箱」那两条直接删：本作没有密码箱目标。 */
             if (cmdIdx == 2 && W.t > T + 12) { c = "全体，开火"; fire = true; }
-            else if (cmdIdx == 3 && W.t > T + 30) { c = "反坦克组，打坦克"; fire = true; }
-            else if (cmdIdx == 4 && W.t > T + 70) { c = box_order(); fire = true; }
-            else if (cmdIdx == 5 && W.t > T + 100) { c = "铁头，搬密码箱"; fire = true; }
-            else if (cmdIdx == 6 && W.t > T + 130) { c = "小满，救伤员"; fire = true; }
+            else if (cmdIdx == 3 && W.t > T + 30) { c = "反坦克手，打坦克"; fire = true; }
+            else if (cmdIdx == 4 && W.t > T + 100) { c = "医疗兵，救伤员"; fire = true; }
         }
         // 关卡特有：炸坝（内外加山）与夜袭夺回（种子山）
         if (!fire && cur_level().hasDam && W.triggered && W.t > T + 25 && W.t - lastDamCmd > 25.0f) {
@@ -250,6 +281,24 @@ LvRow run_level(int lv, uint32_t seed, bool verbose) {
            站上主峰需要持续压上去。史实里敢死队也是一波波冲的。 */
         if (!fire && !retreating && LV.retakeArmed && W.t - lastRetakeCmd > 20.0f) {
             c = "全体，前往A点"; lastRetakeCmd = W.t; retakeOrdered = true; fire = true;
+        }
+        if (casWant > 0 && W.triggered && casDone < casWant) {
+            for (auto &x : W.units) {
+                if (casDone >= casWant) break;
+                if (x.team != Team::Ally || x.dead || x.downed || x.isPlayer) continue;
+                kill_unit(&x, nullptr);
+                ++casDone;
+            }
+            if (casDone >= casWant) std::printf("      [验证] 强制减员 %d 人（%.0fs）\n", casDone, W.t);
+        }
+        if (swRetreat && W.retreatOffered && W.retreatChoice == 0) {
+            std::printf("      [验证] %.0fs 伤亡过半提示已弹出 → 选「撤退」\n", W.t);
+            W.retreatChoice = 1;
+        }
+        if (killPlrAt >= 0.0f && !killPlrDone && W.t >= killPlrAt && W.player && !W.player->dead) {
+            killPlrDone = true;
+            std::printf("      [验证] %.0fs 击杀玩家 %s\n", W.t, W.player->name.c_str());
+            kill_unit(W.player, nullptr);
         }
         if (fire && !c.empty()) {
             if (cmdIdx < 7 && c != "老白，炸水库" && c != "全体，前往A点" && c != "全体，撤离") ++cmdIdx;
@@ -277,7 +326,9 @@ LvRow run_level(int lv, uint32_t seed, bool verbose) {
     r.t = W.t;
     r.text = W.overText;
     if (cur_level().hasDam) {
-        Unit *lb = ally_by_id("laobai");
+        Unit *lb = nullptr;
+        for (auto &x : W.units)
+            if (x.team == Team::Ally && x.role == "爆破手") { lb = &x; break; }
         /* "已炸(安放)" = 人跑上去安放了 8 秒炸药；"已炸(非安放)" = 被别的爆炸波及 ——
            后者意味着"水淹七军"在玩家没做那个两难选择的情况下就被打勾了。 */
         r.extra = std::string("坝:") + (LV.damBlown ? (LV.damByCharge ? "已炸(安放)" : "已炸(非安放!)")
@@ -304,18 +355,23 @@ LvRow run_level(int lv, uint32_t seed, bool verbose) {
        **只在真的"转进"时才有意义** —— 没过关（失败）时 CARRY 还是上一关留下的，
        直接打出来会被读成"这一关带出了这么多人"，所以标成 -1、表格里打 "-"。 */
     r.carry = (W.overKind == "转进") ? (int)CARRY.units.size() : -1;
+    r.carryAlive = CARRY.aliveAtCapture;
+    r.carryDown  = CARRY.downAtCapture;
     return r;
 }
 
 int run_campaign(int seed, bool verbose) {
     CARRY = CarryOver{};
     CAM = CampaignState{};
-    std::printf("铁原战役 · 六关连续跑（种子 %d，无敌方干预的机械剧本）\n\n", seed);
-    /* 「撤」= 本关结算时走出去的人数（统计口径）；「带」= 实际被 carry 进下一关的人数
-       （继承口径）。两者应当只差玩家 1 人（玩家永远进下一关，但不一定"撤出"）。
-       分开打出来，是为了让 capture_carry() 的判据（u.evacuated || 距离）出问题时
-       当场能看见 —— 实测踩过「撤 7 / 带 5」：撤离点改到南侧树林后，
-       已经走出旧撤离点的人被判成没带出来。 */
+    /* 关数按 LEVELS 现算：写死"六关"在关卡表换成五个阵地之后就是一句假话，
+       而它是这张表最上面的一行 —— 人第一眼看到的就是它。 */
+    std::printf("伏击阵地 · %d 关连续跑（种子 %d，无敌方干预的机械剧本）\n\n",
+                level_count(), seed);
+    /* 「带」= 实际被 carry 进下一关的人数（继承口径）。
+       原先还打一栏「撤」（走到撤离点的人数）并与「带」互锁 ——
+       那是"撤离门槛"时代的产物：本作过关只看"拖延到点"，
+       带人走的条件是**还活着**，不再看有没有走到撤离点，
+       所以「撤」必然小于「带」，那个不变式已经不成立（实测 撤 7 / 带 10）。 */
     std::printf("%-4s %-22s %-6s %4s %4s %4s %4s %4s %6s  %s\n",
                 "关", "阵地", "结果", "活", "亡", "倒", "撤", "带", "用时", "目标");
     /* VA_CAMP_START：从第几关开始（0 基）。**单独验证后面几关用** ——
@@ -343,15 +399,21 @@ int run_campaign(int seed, bool verbose) {
         /* 结束原因：`W.overText` 是 end_game 写下的原话（"全队失能" / "时限已到" …）。
            关卡"失败"有好几种成因，先看这句再猜是哪一条。 */
         if (!r.text.empty()) std::printf("     × 结束原因：%s\n", r.text.c_str());
-        /* **不变式**：过了关的话，`带` 必须等于 `撤` 或 `撤+1`。
-           加 1 的那一种来自玩家 —— 玩家恒进下一关，但收拢时可能已经倒在场上、
-           没从撤离点走出去（所以 `撤` 里没有他）。除此之外任何差额都是 bug：
-           `撤 > 带` = capture_carry 把已经走出去的人漏了（撤离点中途改址踩过，
-           实测「撤 7 / 带 5」）；`带 > 撤+1` = 把人重复收了。 */
-        if (r.kind == "转进" && (r.carry < r.evac || r.carry > r.evac + 1)) {
-            std::printf("     !! 不变式破了：撤 %d / 带 %d（应满足 撤 <= 带 <= 撤+1）\n",
-                        r.evac, r.carry);
+        /* **不变式一**：`带` 必须等于收拢那一刻的 `站 + 倒`。
+           这个等式把"多收了人"和"漏收了人"都挡住。 */
+        if (r.kind == "转进" && r.carry != r.carryAlive + r.carryDown) {
+            std::printf("     !! 不变式破了：带 %d ≠ 收拢时站 %d + 倒 %d\n",
+                        r.carry, r.carryAlive, r.carryDown);
             ++carryBad;
+        }
+        /* **不变式二**：`带` 与停表时的 `活 + 倒` 也应当相等。
+           差值为正是**已知行为**：capture_carry 在 update_flow 里跑，
+           而 step_once 在这一帧里还会继续跑完 AI 与弹道 ——
+           同一帧晚死的人算进了 `亡`、却没进 CARRY。
+           这不是"多收了人"，所以只提示、不判失败（真要看的是上面那条）。 */
+        if (r.kind == "转进" && r.carry != r.alive + r.downed) {
+            std::printf("     · 收拢后同帧又阵亡 %d 人（收拢 %d / 停表 %d，既有的同帧结算行为）\n",
+                        r.carry - (r.alive + r.downed), r.carry, r.alive + r.downed);
         }
         if (r.kind != "转进") {
             /* VA_CAMP_FORCE：打输了也往下走一关。

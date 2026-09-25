@@ -26,6 +26,7 @@
 // 和 viewmodel 同一原则：HUD 不改逻辑层、不反向写状态。
 // 逻辑层删掉这些字段也不影响它自己跑测试（HUD 只是消费者）。
 #include <deque>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -204,9 +205,12 @@ private:
     godot::Ref<godot::Texture2D> art_chapter_;  // 区域态势（俯瞰公路）
     godot::Ref<godot::Texture2D> art_win_;      // 结算 · 成功
     godot::Ref<godot::Texture2D> art_lose_;     // 结算 · 失败
-    // 11 张队员胸像，下标与 hud.cpp 里的 kRosterIds 一一对应
-    // （长度取自 public 的 kRosterMax，见类首的说明）
-    godot::Ref<godot::Texture2D> art_port_[kRosterMax];
+    /* 队员胸像，按 **模型键** 缓存，不再按下标存。
+       为什么要换：花名册现在是**逐阵地**的（五个阵地 50 个名字），
+       按下标存意味着第二关名册第 3 格会用到第一关第 3 个人那张头像 ——
+       而 50 个人一共只复用 11 套模型/胸像，按"键"取才是正确的对应关系。 */
+    std::map<std::string, godot::Ref<godot::Texture2D>> art_port_;
+    const godot::Ref<godot::Texture2D> &portrait_of(const std::string &p_id);
 
     Screen screen_ = SCREEN_PLAY;
     int    menu_sel_ = 0;         // 当前菜单项
@@ -221,6 +225,7 @@ private:
     void draw_info_strip();       // 雷达下方：时间 / 天气 / 阶段 / 噪声
     void draw_objectives();       // 中央目标横幅
     void draw_alert();            // 警报（伏击开始 / 炮击来袭 / 增援到达）
+    void draw_retreat_prompt();   // 伤亡过半后的「1 撤 / 2 守」选择条
     void draw_killfeed();         // 右上击杀回执
     void draw_squad();            // 右侧小队状态板
     void draw_ammo();             // 右下弹药 + 装备 + 生命

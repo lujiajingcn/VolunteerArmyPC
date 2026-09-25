@@ -575,17 +575,16 @@ static void collect_aabb(Node *p_node, const Transform3D &p_xf, AABB &p_box, boo
 }
 
 std::string ally_art_key(const std::string &p_id) {
-    // 我方按花名册 id 查表（va_config.cpp 的 ROSTER）。
-    // 用 id 而不是 role 字符串：role 有"弹药/支援"这种带斜杠的写法，
-    // 而且铁头的 role 是"弹药/支援"但武器是步枪，按武器分档会把他错认成步枪手。
-    if (p_id == "player")  return "char_leader";
-    if (p_id == "laozhou") return "char_mg";
-    if (p_id == "xiaoxia") return "char_sniper";
-    if (p_id == "shitou" || p_id == "houzi") return "char_at";
-    if (p_id == "laobai")  return "char_demo";
-    if (p_id == "xiaoman") return "char_medic";
-    if (p_id == "tietou")  return "char_ammo";
-    return "char_rifleman";        // ajie / daliu / alan 与一切未登记的
+    /* 按**当前花名册**里的 art 字段查模型键，不再按 id 写死一张表。
+       为什么必须改：五个伏击阵地各有自己的 10 个人（共 50 个名字），
+       写死 id→模型意味着每加一个名字就要回来补一行，漏一个就表现为
+       "某人端着错的枪" —— 而这类偏差在截图上几乎看不出来。
+       art 是随人一起定义的（va_config.cpp 的 POSITION_ROSTERS），
+       于是新名字天然复用那 11 个既有模型 —— 这正是"人物模型可以复用"。 */
+    const va::RosterDef *r = va::roster_of(p_id);
+    if (r != nullptr && !r->art.empty()) return r->art;
+    if (p_id == "player") return "char_leader";   // 花名册还没建好时的兜底
+    return "char_rifleman";
 }
 
 std::string enemy_art_key(bool p_officer, bool p_mg) {

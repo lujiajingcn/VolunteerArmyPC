@@ -621,6 +621,15 @@ void WorldSim::_ready() {
     if (const char *dt = std::getenv("VA_DOWN_AT"); dt != nullptr && *dt != '\0') {
         down_at_ = std::atof(dt);
     }
+    /* VA_RETREAT_AT=<战局秒数>：到点强制弹出「伤亡过半 → 1 撤 / 2 守」选择条。
+       为什么需要它：真实玩到"伤亡过半"要靠运气（机械剧本最硬的一局也只伤亡 3/10），
+       而这条 HUD 是一个**等玩家决策的常驻状态**，只有真弹出一次才验得到它画得对、
+       按 1/2 有没有反应。它只置 `W.retreatOffered` 这一个标志 —— 判定、结算、
+       转进全都还是走 `src/sim/` 的真实代码，本层不伪造任何战果。
+       离线侧的对口开关是 VA_SW_CAS（减员）+ VA_SW_RETREAT（选撤退）。 */
+    if (const char *rt = std::getenv("VA_RETREAT_AT"); rt != nullptr && *rt != '\0') {
+        retreat_at_ = std::atof(rt);
+    }
     /* 快进（VA_FF）。加它的原因是实测：一次"打到交火"的取证跑图 = 300 秒真实时间，
        因为逻辑层按真实经过时间推进，而车队要等到 CFG.convoyIn = 175 秒才进地图
        —— 在那之前战场上一个人都没有（这一点是本轮踩到的：t=50 的取证跑图里
@@ -630,6 +639,10 @@ void WorldSim::_ready() {
         if (k < 1) k = 1;
         if (k > 32) k = 32;          // 上限只为防手滑，正常用 4~8
         ff_ = k;
+    }
+    if (retreat_at_ >= 0.0) {
+        UtilityFunctions::print(String::utf8("[combat-ev] 取证注入：强制弹出撤退选择条 t="),
+                                String::num(retreat_at_, 1), String::utf8(" 秒（VA_RETREAT_AT）"));
     }
     if (autoplay_ || down_at_ >= 0.0 || ff_ > 1) {
         UtilityFunctions::print(String::utf8("[combat-ev] 取证注入：自动战斗="), autoplay_ ? String::utf8("开") : String::utf8("关"),
@@ -1101,6 +1114,24 @@ void WorldSim::hud_down_inject() {
     va::damage_unit(p, 5000.0f, src, "bullet");
 }
 
+/* VA_RETREAT_AT：到点把「伤亡过半 → 1 撤 / 2 守」的选择条强制弹出来。
+   这是这条 HUD 唯一的确定性取证入口 —— 真打到伤亡过半要看运气，
+   而"选择条画得对不对 / 按 1 和按 2 有没有反应"这两件事只能真弹出一次才验得到。
+   ⚠️ 只置 `W.retreatOffered` 与 `W.retreatOfferT` 两个字段，**不替玩家做选择**：
+   撤还是守、什么时候结算、转进哪一关，全部仍由 `src/sim/` 的真实代码走完。
+   ⚠️ 单关模式（`levelIdx < 0`）下 `check_end()` 不读 `retreatChoice`，
+   这时按 1 不会有反应 —— 那是设计如此，不是开关坏了。 */
+void WorldSim::retreat_inject() {
+    if (retreat_at_ < 0.0 || retreat_done_) return;
+    if ((double)va::W.t < retreat_at_) return;
+    retreat_done_ = true;
+    if (va::W.over || va::W.retreatChoice != 0) return;
+    va::W.retreatOffered = true;
+    va::W.retreatOfferT  = va::W.t;
+    UtilityFunctions::print("[combat-ev] t=", String::num((double)va::W.t, 2),
+                            String::utf8(" 强制弹出撤退选择条（1 撤 / 2 守），等待真实按键"));
+}
+
 void WorldSim::setup_runtime_ui() {
     CanvasLayer *layer = memnew(CanvasLayer);
     layer->set_layer(10);
@@ -1310,6 +1341,7 @@ void WorldSim::_process(double p_delta) {
            下面的 hud_->update 才采样得到。 */
         autoplay_step();
         hud_down_inject();
+        retreat_inject();
         va::step_once((float)H);
         script_a_step();      // 次序与 va_sweep 一致：先 step，再判该不该下命令
         acc_ -= H;
@@ -1638,6 +1670,24 @@ void WorldSim::apply_key(Key p_code, bool p_down) {
             }
             break;
         case Key::KEY_Z:     if (p_down) va::IN.markerSet = true; break;
+        /* 1 / 2：伤亡过半后的「撤 / 守」选择。
+           为什么必须是数字键：F 是烟雾弹、G 是手雷、Q/R/V/Z 各有其主，
+           剩下的字母里没有一个能一眼对上"二选一"。
+           **只在提示条已经弹出时生效** —— 平时按 1/2 不该有任何反应，
+           否则玩家会在不知情的情况下把这一关提前结束掉（而提示只弹一次，
+           那个"莫名其妙就转进了"的瞬间根本无从解释）。 */
+        case Key::KEY_1:
+            if (p_down && va::W.retreatOffered && va::W.retreatChoice == 0) {
+                va::W.retreatChoice = 1;
+                if (hud_ != nullptr) hud_->ev_alert("已下令：撤向下一个伏击阵地", 2.6f);
+            }
+            break;
+        case Key::KEY_2:
+            if (p_down && va::W.retreatOffered && va::W.retreatChoice == 0) {
+                va::W.retreatChoice = 2;
+                if (hud_ != nullptr) hud_->ev_alert("已下令：继续死守阵地", 2.6f);
+            }
+            break;
         case Key::KEY_ESCAPE:
             if (p_down) {
                 /* 结算界面上 Esc = 回主菜单；战斗中 Esc = 释放鼠标。

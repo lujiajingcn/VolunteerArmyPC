@@ -80,19 +80,49 @@ void build_convoy_way();
 // ------------------------------------------------------------------ 花名册
 // 注意：这里刻意用 std::string 而不是 const char* —— 敌军下车时要用
 // "e" + 车号 + "_" + 序号 现场拼出 ID，const char* 存不住这种临时串。
+//
+// 【逐阵地花名册】五个伏击阵地各有一份**预先写好的 10 人名单**（含姓名 / 职务 /
+// 武器 / 模型键），见下面的 POSITION_ROSTERS。ROSTER 本身是**当前这一关实际出场
+// 的那 10 个人**，由 init_world 按「继承存活者 + 本阵地补员」算出来后写入 ——
+// 所以它必须是可变的，不是一张静态表：
+//   · 语音呼号（va_parser 的 ROSTER / ROLE_CALL / GROUPS）只对**在场的人**生效，
+//     叫一个上一阵地已经阵亡的名字还能命中，是最容易被当成 bug 的一类偏差；
+//   · 胸像与三维模型键（ally_art_key）按 id 查这张表，缺了就退回 char_rifleman，
+//     表现为"人明明是机枪手却端着步枪"。
 struct RosterDef {
     std::string id, name, role, group, weapon;
+    std::string art;               // 三维模型 / 胸像键（空 = 按武器推）
     bool deputy = false, leader = false;
-    std::vector<const char *> aliases;
+    /* 语音别名改成 std::vector<std::string>：别名现在**按姓名现场生成**
+       （见 make_aliases），生成的串没有静态寿命，const char* 存不住。 */
+    std::vector<std::string> aliases;
 };
-extern const std::vector<RosterDef> ROSTER;
+extern std::vector<RosterDef> ROSTER;
 const RosterDef *roster_of(const std::string &id);
 
-struct GroupDef { const char *name; std::vector<const char *> members; };
-extern const std::vector<GroupDef> GROUPS;
+/* 一个阵地的编制。men[0] **恒为队长** —— 玩家阵亡后由下一阵地的队长接任，
+   玩家存活时则由他本人占住这个位置（下一阵地 men[0] 那人不登场）。 */
+struct PositionRoster {
+    const char *levelId = "";
+    std::vector<RosterDef> men;
+};
+extern const std::vector<PositionRoster> POSITION_ROSTERS;
+// 按关卡 id 取该阵地的编制（找不到返回第一份）
+const std::vector<RosterDef> &position_men(const char *levelId);
+// 在**所有**阵地里按 id 找人（跨关继承时要把上一阵地幸存者的档案找回来）
+const RosterDef *roster_def_anywhere(const std::string &id);
+// 按姓名生成语音别名：全名 + 去掉姓的名（"李长顺" → "长顺"）
+std::vector<std::string> make_aliases(const std::string &name);
 
-struct RoleCall { const char *role; std::vector<const char *> ids; };
-extern const std::vector<RoleCall> ROLE_CALL;
+struct GroupDef { std::string name; std::vector<std::string> members; };
+extern std::vector<GroupDef> GROUPS;
+
+struct RoleCall { std::string role; std::vector<std::string> ids; };
+extern std::vector<RoleCall> ROLE_CALL;
+/* 花名册换了一批人之后，分组与职务呼号必须跟着重算 ——
+   这两张表是给语音指令解析用的（"2组 撤退" / "机枪手 压制"），
+   留着上一阵地的人名就等于可以对着一个不在场的人下命令。 */
+void rebuild_roster_index();
 
 // ------------------------------------------------------------------ 武器表
 const WeaponSpec *weapon_of(const std::string &key);

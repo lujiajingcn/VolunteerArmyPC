@@ -53,6 +53,9 @@ void damage_unit(Unit *u, float dmg, Unit *src, const std::string &kind,
     }
 }
 
+// 玩家阵亡的处理（定义在 kill_unit 之后，这里先声明）
+static void on_player_lost();
+
 void kill_unit(Unit *u, Unit *src) {
     if (!u || u->dead) return;
     u->dead = true; u->state = "阵亡";
@@ -84,7 +87,32 @@ void kill_unit(Unit *u, Unit *src) {
         W.stats.allyDead = (W.stats.allyDead || 0) + 1;
         for (auto *a : allies()) if (a != u) a->morale = clampf(a->morale - 6, 0, 100);
         say("全体", u->name + "阵亡！", "no");
+        if (u->isPlayer) on_player_lost();
         on_ally_lost();
+    }
+}
+
+/* 玩家阵亡 → **直接转进下一个伏击阵地**，由该阵地的队长接任。
+   为什么不是"就地判失败"：本作的视角是**一个人跟着部队换阵地**，不是"一条命
+   打完一整场战役"。阵亡的代价是**交出指挥权、换成一个陌生的名字**（下一关
+   队伍里那个你不认识的人就是你），而不是整场战役从头再来 —— 后者只会让人
+   不敢往前站，与"逐次抵抗"的立意相反。
+   为什么在这里结算而不是等 check_end：check_end 的前提是"这一关还在打"，
+   而玩家一死这一关就已经结束了，拖到那里会多跑几十秒的空战场。 */
+static void on_player_lost() {
+    if (W.playerLost) return;
+    W.playerLost = true;
+    if (!CAM.active) return;                 // 单关模式保持旧行为（交给 on_ally_lost）
+    if (has_next_level()) {
+        capture_carry();                     // 此刻还活着的人跟着转进
+        commit_level_result(false);
+        const LevelDef &N = level_at(next_level_index());
+        end_game("转进", std::string("你阵亡了 —— ") + cur_level().place
+                 + " 只拖住 " + std::to_string((int)W.t) + " 秒。剩下的交给 "
+                 + N.place + " 的 " + N.ourUnit + "。");
+    } else {
+        commit_level_result(false);
+        end_game("失败", "你在最后一个阵地上阵亡了，阻击任务失败。");
     }
 }
 

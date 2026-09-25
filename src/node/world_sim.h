@@ -95,6 +95,7 @@ private:
     //   不伪造 HUD 状态：命中判定、hits/kills 自增、伤害与死亡全走真实战斗代码。
     void autoplay_step();          // 每帧朝最近活敌对准 + 按住开火
     void hud_down_inject();        // 到点让玩家被真实伤害击倒
+    void retreat_inject();         // 到点强制弹出「伤亡过半」选择条（VA_RETREAT_AT）
     // 把当前视口存成 PNG。capture_step（按战局秒数）与战斗事件取证（按事件）共用。
     void save_shot(const godot::String &tag);
     // 角色模型检阅台（取证）：VA_UNIT_SHOW 时把 11 个角色的三维模型
@@ -166,6 +167,8 @@ private:
     bool   autoplay_   = false;    // VA_AUTO=1
     double down_at_    = -1.0;     // VA_DOWN_AT=<战局秒数>，<0 = 关闭
     bool   down_done_  = false;    // 幂等：只击倒一次
+    double retreat_at_ = -1.0;     // VA_RETREAT_AT=<战局秒数>，<0 = 关闭
+    bool   retreat_done_ = false;  // 幂等：只弹一次
     /* VA_FF=<倍率>：快进。逻辑层是按「真实经过时间」推进的，而车队要到
        CFG.convoyIn = 175 秒才进场 —— 不快进的话，一次"打到交火"的取证
        就是五分钟真实时间起步。只改推进多快，不改怎么推进：

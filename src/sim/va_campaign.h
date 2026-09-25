@@ -110,6 +110,10 @@ struct LevelDef {
    优先供给前沿狙击小组，反坦克手雷严格管控"），把它做成机制比做成文案更有说服力。 */
 struct CarryUnit {
     std::string id;
+    /* 姓名一起带过来。**玩家阵亡后由下一阵地的队长接任** —— 那时候 id 仍是 "player"、
+       但姓名必须换成新阵地那个人的，否则 HUD 名册、无线电字幕里会一直挂着
+       一个上一关已经死了的名字。存活延续时同理：姓名要跟着人走。 */
+    std::string name;
     float hp = 100, maxHp = 100, morale = 78;
     int   ammo = 0, magAmmo = 0, rockets = 0, grenades = 0, smokes = 0;
     bool  downed = false;   // 被抬下来的伤员：下一关开局仍处于失能状态
@@ -119,6 +123,12 @@ struct CarryUnit {
 struct CarryOver {
     bool valid = false;                 // false = 第一关，按花名册新建
     std::vector<CarryUnit> units;
+    /* 收拢**那一刻**的站/倒人数（capture_carry 里记下）。
+       为什么要单独记：`units` 是在 update_flow 里抓的，而 step_once 在这一帧里
+       还会继续跑完 AI 与弹道 —— 于是"停表时的活人"可能比"收拢时的活人"少一两个。
+       两个数字都对，只是取自同一帧的不同时刻；少了这一对，
+       "带 9 / 活 7"看起来就像凭空多收了两个人。 */
+    int aliveAtCapture = 0, downAtCapture = 0;
 };
 
 struct CampaignState {

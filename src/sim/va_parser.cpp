@@ -57,7 +57,7 @@ static bool find_callsign(const Cps &s, CsHit &out) {
     for (const auto &m : ROSTER) {
         bool found = false;
         int bp = -1, blen = 0;
-        for (const char *a : m.aliases) {
+        for (const std::string &a : m.aliases) {
             const int p = utf8_find(s, cp(a));
             const int L = (int)cp(a).size();
             if (p >= 0 && (!found || L > blen)) { found = true; bp = p; blen = L; }
@@ -67,7 +67,7 @@ static bool find_callsign(const Cps &s, CsHit &out) {
     if (hits.empty()) {
         /* 模糊匹配（阿杰尔 / 阿杰哥 → 阿杰）：逐窗口算字符相似度，阈值 0.72 */
         for (const auto &m : ROSTER) {
-            for (const char *a : m.aliases) {
+            for (const std::string &a : m.aliases) {
                 const Cps av = cp(a);
                 if (av.size() < 2) continue;
                 int bp = -1; float bs = 0;
@@ -193,7 +193,7 @@ static std::vector<std::string> find_mentioned_ids(const Cps &s, const std::stri
     std::vector<std::string> out;
     for (const auto &m : ROSTER) {
         if (!excludeId.empty() && m.id == excludeId) continue;
-        for (const char *a : m.aliases) {
+        for (const std::string &a : m.aliases) {
             if (utf8_find(s, cp(a)) >= 0) { out.push_back(m.id); break; }
         }
     }
@@ -346,7 +346,7 @@ std::vector<ParsedCmd> parse_candidates(const std::string &text, const ParsedCmd
         const RosterDef *bm = nullptr;
         float bs = 0;
         for (const auto &m : ROSTER) {
-            for (const char *a : m.aliases) {
+            for (const std::string &a : m.aliases) {
                 const float sco = char_sim(a, norm);
                 if (sco > bs) { bs = sco; bm = &m; }
             }

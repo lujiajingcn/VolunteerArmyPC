@@ -26,6 +26,8 @@ WM_KEYUP = 0x0101
 VK = {
     "R": 0x52, "ESC": 0x1B, "ENTER": 0x0D, "V": 0x56,
     "W": 0x57, "A": 0x41, "S": 0x53, "D": 0x44, "G": 0x47, "F": 0x46, "Z": 0x5A,
+    # 数字键：伤亡过半那条选择条是 1 撤 / 2 守（F=烟雾、G=手雷已占，只能用数字键）
+    "1": 0x31, "2": 0x32, "3": 0x33, "4": 0x34,
 }
 
 WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)

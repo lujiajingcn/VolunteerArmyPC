@@ -60,12 +60,12 @@ std::vector<Unit *> resolve_targets(const ParsedCmd &cmd) {
     } else if (kind == "group") {
         for (const auto &g : GROUPS) {
             if (id != g.name) continue;
-            for (const char *mid : g.members) add(mid);
+            for (const std::string &mid : g.members) add(mid);
         }
     } else if (kind == "role") {
         for (const auto &rc : ROLE_CALL) {
             if (id != rc.role) continue;
-            for (const char *mid : rc.ids) add(mid);
+            for (const std::string &mid : rc.ids) add(mid);
         }
     } else if (kind == "member" && id != "auto") {
         add(id);
@@ -470,10 +470,15 @@ void issue_command(const ParsedCmd &cmd, bool silent) {
 
     /* 全局指令：起爆 / 炸桥 / 炸水库 */
     if (id == "detonate" || id == "blowBridge" || id == "blowDam") {
-        Unit *holder = ally_by_id("laobai");
-        if (!holder || holder->dead || holder->downed) {
-            holder = nullptr;
-            for (auto &x : W.units) if (x.id == "shitou" && !x.dead && !x.downed) { holder = &x; break; }
+        /* 优先**爆破手**、其次**反坦克手** —— 按**职务**找，不按名字找。
+           写死"老白 / 石头"在五个阵地里只有第一关能命中，
+           于是每次都要靠下面那层 hasCharge 兜底（能跑，但"谁去炸"变成随机的第一个人）。 */
+        Unit *holder = nullptr;
+        for (auto &x : W.units)
+            if (x.team == Team::Ally && !x.dead && !x.downed && x.role == "爆破手") { holder = &x; break; }
+        if (!holder) {
+            for (auto &x : W.units)
+                if (x.team == Team::Ally && !x.dead && !x.downed && x.role == "反坦克手") { holder = &x; break; }
         }
         /* 上面两个都倒下时，再退到"任何还带着炸药的人"，最后才是任何活人。
            原先只有老白 / 石头两个候选，实测第六关老白阵亡后整条命令就废了 ——

@@ -307,7 +307,11 @@ Unit *make_unit(const RosterDef &def, float x, float y, Team team, bool isPlayer
 }
 
 // 玩家的合成花名册项（网页版直接内联字面量）
-static const RosterDef PLAYER_DEF{ "player", "你（队长）", "队长", "1组", "rifle", false, false, {} };
+/* 玩家的合成花名册项（网页版直接内联字面量）。
+   art = char_leader：**队长那一套模型/胸像与职务绑定、不随阵地变** ——
+   玩家阵亡后接任的是下一阵地的队长，用的也是这一套，
+   所以换人之后画面上不会出现"同一个人换了张脸"。 */
+static const RosterDef PLAYER_DEF{ "player", "你（队长）", "队长", "1组", "rifle", "char_leader", false, false, {} };
 
 void init_world(uint32_t seed, int p_level, const CarryOver *p_carry) {
     RNG.reseed(seed);
@@ -340,6 +344,11 @@ void init_world(uint32_t seed, int p_level, const CarryOver *p_carry) {
     W.reinforceDone = false; W.reinforceT = CFG.reinforceAt;
     W.convoyStarted = false; W.convoyEscaped = false;
     W.bridgeAlive = true; W.evac = EVAC_DEFAULT; W.evacArmed = false; W.evacOrdered = false;
+    /* 「撤 / 守」的选择是**每一关一次**的：换关必须清回去，
+       否则第二关一开局就带着上一关那个"已经选了死守"的状态，
+       提示条再也不弹 —— 而玩家只会以为这一关还没打到伤亡过半。 */
+    W.retreatOffered = false; W.retreatChoice = 0; W.retreatOfferT = -1.0f;
+    W.playerLost = false;
     W.hasMarker = false; W.deployDone = false; W.noise = 0; W.noiseT = 0;
     W.started = false; W.paused = false;
 
@@ -360,51 +369,138 @@ void init_world(uint32_t seed, int p_level, const CarryOver *p_carry) {
        密码箱、车队顺序整体平移一格，旧基线的数据全废。 */
     if (p_level >= 0 && level_at(p_level).forceNight) W.weather = "night";
 
-    // 玩家 + 10 名队友
-    float px = 872, py = 872;
-    recommend_of("player", px, py);
-    Unit *pl = make_unit(PLAYER_DEF, px, py, Team::Ally, true);
-    pl->facing = -3.141592653589793f / 2.0f;
-    W.player = pl;
+    /* ---- 先定"这一关出场的是哪 10 个人" ----
+       编制 = 队长位（玩家）+ 9 名队员，队员池 = 本阵地花名册的 men[1..9]。
+       继承优先：上一阵地活下来的先上场，缺额用本阵地**还没上过场**的名字补齐 ——
+       于是"每个阵地 10 个人、名字事先定好"和"打得好的人能带到下一关"同时成立。 */
+    const bool campaign = (p_level >= 0);
+    const std::vector<RosterDef> &men =
+        position_men(campaign ? level_at(p_level).id : POSITION_ROSTERS[0].levelId);
+    const int    memberCap = campaign ? 9 : 10;    // 战役里队长位由玩家占
+    const size_t poolStart = campaign ? 1u : 0u;   // 战役里 men[0] 就是那个队长位
 
-    /* 战役第二关起走 p_carry：只把上一关**撤出来的人**建出来，血量 / 弹药 / 士气
-       原样带过来，阵亡的直接不出现。这是"严格继承"的落点 —— 人越打越少，
-       后面每一关的撤离门槛也跟着逐关下调（LEVELS 里的 evacNeed）；
-       门槛要是不动，第二关就必输，玩家只会觉得游戏在耍赖。 */
+    std::vector<RosterDef> squad;                  // 队员（不含玩家）
     const bool carried = (p_carry != nullptr && p_carry->valid);
     if (carried) {
         for (const auto &c : p_carry->units) {
-            if (c.id == "player") {
-                /* 队长不带"失能"进新关：玩家倒地要交出指挥权、还要 UI 配合，
-                   开局就躺着等于把操作权收走。带伤可以（hp 按带出来的值走）。 */
-                pl->hp = clampf(c.hp, 1.0f, c.maxHp);
-                pl->maxHp = c.maxHp; pl->morale = c.morale;
-                pl->ammo = c.ammo; pl->magAmmo = c.magAmmo;
-                pl->grenades = c.grenades; pl->smokes = c.smokes;
-                continue;
-            }
-            const RosterDef *r = roster_of(c.id);
-            if (r == nullptr) continue;
-            float rx = 880, ry = 900;
-            recommend_of(r->id, rx, ry);
-            Unit *u = make_unit(*r, rx + rr(-8, 8), ry + rr(-8, 8), Team::Ally, false);
-            u->hasHome = true; u->homePos = { rx, ry };
+            if (c.id == "player") continue;
+            if ((int)squad.size() >= memberCap) break;
+            const RosterDef *r = roster_def_anywhere(c.id);
+            if (r == nullptr) continue;            // 查不到档案的人上不了场
+            squad.push_back(*r);
+            if (!c.name.empty()) squad.back().name = c.name;
+        }
+    }
+    /* 补员分两轮，**都不随机** —— "事先创造出来"的含义就是"同一份名单可复现"：
+       掺进随机之后"第二关是谁"会随上一关的战况漂移，复盘时对不上号。
+         第一轮：优先补**现在没人担任的职务**。职务是班组能力而不是装饰 ——
+           按花名册顺序硬补会让"这一队没有医疗兵"一直带到后面几关，
+           于是倒地的人永远没人救（实测机械剧本第 5 关补进来的 4 个全是
+           机枪/步枪，医疗兵与反坦克手双双缺席）。
+         第二轮：按花名册原序把人数填满。 */
+    auto already_has = [&](const std::string &role) {
+        for (const auto &s : squad) if (s.role == role) return true;
+        return false;
+    };
+    /* 第一轮只在**有继承队伍**时才跑。
+       为什么：满编开局（第一关 / 非战役）时花名册本身就是完整编制，
+       走"缺职务优先"会把顺序打乱（实测：满编时它会跳过第二个步枪手、
+       先塞反坦克手，队伍顺序与改动前不同 —— 而建队顺序决定 RNG 抽取顺序，
+       离线扫描的基线会被整体平移）。没有继承队伍时顺序就该等于名册顺序。 */
+    if (carried) {
+        for (size_t i = poolStart; i < men.size() && (int)squad.size() < memberCap; ++i) {
+            bool taken = false;
+            for (const auto &s : squad) if (s.id == men[i].id) { taken = true; break; }
+            if (taken || already_has(men[i].role)) continue;
+            squad.push_back(men[i]);
+        }
+    }
+    for (size_t i = poolStart; i < men.size() && (int)squad.size() < memberCap; ++i) {
+        bool taken = false;
+        for (const auto &s : squad) if (s.id == men[i].id) { taken = true; break; }
+        if (!taken) squad.push_back(men[i]);
+    }
+
+    /* ---- 队长位（玩家）----
+       · 上一关活下来了 → **继续控制原角色**（id 恒为 "player"，姓名跟着人走）；
+       · 上一关阵亡（CARRY 里没有 player）或第一关 → 由**本阵地的队长**接任。
+       这两支正是需求第 4 条的两半，缺哪一半都会出现"人死了还在操控他"
+       或者"人活着却莫名其妙换了个名字"。 */
+    const CarryUnit *pc = nullptr;
+    if (carried) {
+        for (const auto &c : p_carry->units) if (c.id == "player") { pc = &c; break; }
+    }
+    RosterDef pdef = PLAYER_DEF;
+    if (pc != nullptr) {
+        if (!pc->name.empty()) pdef.name = pc->name;
+    } else if (campaign) {
+        pdef.name = men[0].name;                                   // 本阵地队长接任
+        pdef.weapon = men[0].weapon;
+    }
+    pdef.art = "char_leader";
+    pdef.leader = true;
+
+    // 玩家 + 队员
+    float px = 872, py = 872;
+    recommend_of("player", px, py);
+    Unit *pl = make_unit(pdef, px, py, Team::Ally, true);
+    pl->facing = -3.141592653589793f / 2.0f;
+    W.player = pl;
+
+    /* 继承的队长带伤延续：血量 / 弹药 / 士气原样带过来。
+       **但不带"倒地"进新关** —— 玩家开局躺着等于把操作权收走
+       （要等医疗兵跑过来，期间只能看着），而且倒地计时一到就直接判阵亡 →
+       触发"换人转进"，玩家会看到自己在还没接敌的时候就被换掉了。
+       实测：第三关结束时有 3 个倒地（玩家在内），第四关开局 45 秒
+       倒计时一到，队伍还没见到敌人就"你阵亡了 —— 只拖住 45 秒"。
+       所以倒地状态按**带伤起立**处理（35% 血），伤势由血量表达。 */
+    if (pc != nullptr) {
+        if (pc->downed) {
+            pl->hp = std::max(1.0f, pc->maxHp * 0.35f);
+        } else {
+            pl->hp = clampf(pc->hp, 1.0f, pc->maxHp);
+        }
+        pl->maxHp = pc->maxHp; pl->morale = pc->morale;
+        pl->ammo = pc->ammo; pl->magAmmo = pc->magAmmo;
+        pl->grenades = pc->grenades; pl->smokes = pc->smokes;
+    }
+
+    for (const auto &r : squad) {
+        float rx = 880, ry = 900;
+        recommend_of(r.id, rx, ry);
+        Unit *u = make_unit(r, rx + rr(-8, 8), ry + rr(-8, 8), Team::Ally, false);
+        u->hasHome = true; u->homePos = { rx, ry };
+        if (!carried) continue;
+        /* 找到这个人的继承档案，把血量 / 弹药 / 士气 / 战绩原样交回去。
+           **阵亡的根本不在 CARRY 里**，所以这里"查不到"就是"上一关已经死了"，
+           按新兵（满血满弹）建出来 —— 这就是补员。 */
+        for (const auto &c : p_carry->units) {
+            if (c.id != r.id) continue;
             u->hp = clampf(c.hp, 1.0f, c.maxHp); u->maxHp = c.maxHp;
             u->morale = c.morale;
             u->ammo = c.ammo; u->magAmmo = c.magAmmo;
             u->rockets = c.rockets; u->grenades = c.grenades; u->smokes = c.smokes;
             u->kills = c.kills; u->shots = c.shots; u->hits = c.hits;
-            if (c.downed) { u->downed = true; u->downTimer = 45; u->state = "失能"; u->hp = 0; }
-        }
-    } else {
-        for (const auto &r : ROSTER) {
-            float rx = 880, ry = 900;
-            recommend_of(r.id, rx, ry);
-            Unit *u = make_unit(r, rx + rr(-8, 8), ry + rr(-8, 8), Team::Ally, false);
-            u->hasHome = true; u->homePos = { rx, ry };
+            /* 继承过来的倒地伤员给 **120 秒**而不是新兵倒地那 45 秒。
+               为什么：45 秒是"当场被打倒"的窗口，伤员是被抬下来的、
+               开局就躺在部署区，医疗兵要先从阵位上过来；给 45 秒等于
+               "上一关拼命救回来的人，下一关开局 45 秒集体断气"
+               （实测第 4 关：带进来 3 个伤员，45 秒时全部阵亡，
+               其中倒地的玩家因此触发转进）。救与不救都一样的话，
+               "把伤员带出来"这件事就没有任何意义。 */
+            if (c.downed) { u->downed = true; u->downTimer = 120; u->state = "失能"; u->hp = 0; }
+            break;
         }
     }
 
+    /* ROSTER = **当前这一关真正在场的人**（含玩家那条）。
+       语音呼号（GROUPS / ROLE_CALL）与胸像、三维模型键（ally_art_key）全都按它走，
+       所以必须在建队之后立刻重建 —— 留着上一阵地的人名，
+       就等于可以对着一个不在场的人下命令。 */
+    ROSTER.clear();
+    ROSTER.push_back(pdef);
+    for (const auto &r : squad) ROSTER.push_back(r);
+    rebuild_roster_index();
     // 地雷
     const float mineSpots[4][2] = { { 1120, 662 }, { 1040, 672 }, { 620, 655 }, { 540, 658 } };
     const int eastIdx[2] = { 0, 1 }, westIdx[2] = { 2, 3 };
@@ -423,6 +519,10 @@ void init_world(uint32_t seed, int p_level, const CarryOver *p_carry) {
     } else {
         W.boxWhere = (RNG.next() < 0.6f) ? "apc" : "officer";
     }
+    /* 五个阵地的任务只有"拖延"一条 —— 密码箱整体下线。
+       抽取照旧（少一次 RNG.next() 会把后面的车队顺序整体平移一格，
+       旧基线的数据全废），只把结论改成 "none"。 */
+    if (p_level >= 0) W.boxWhere = "none";
 
     /* 车队顺序随机。**战役里换成关卡自己的编成表**：涟川山口来的是骑 1 师
        （两辆装甲车 + 一辆坦克），内外加山是上百辆车的装甲集群（三辆坦克）——
@@ -501,7 +601,7 @@ void build_convoy() {
         }
     }
     // 卡车上放密码箱（优先）
-    if (W.boxWhere != "officer") {
+    if (W.boxWhere == "truck" || W.boxWhere == "apc") {
         const bool wantTruck = (W.boxWhere == "truck");
         for (auto &v : W.vehicles) v.hasBox = false;
         for (auto &v : W.vehicles) {

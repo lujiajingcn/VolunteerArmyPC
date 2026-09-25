@@ -75,6 +75,18 @@ struct WorldState {
     bool  hasBox = false;
     BoxItem box;
 
+    /* ---- 五个伏击阵地：伤亡过半后的「撤 / 守」选择 ----
+       三个字段分开记，是因为"提示弹出来了"、"玩家选了什么"、"什么时候弹的"
+       是三个独立事实，合成一个枚举会让"提示弹了但玩家没选"这个状态消失，
+       而那正是需要 HUD 一直把提示条挂在屏幕上的时候。 */
+    bool  retreatOffered = false;   // 伤亡已达半数、提示条已经弹过
+    int   retreatChoice = 0;        // 0=还没选  1=撤向下一阵地  2=继续死守
+    float retreatOfferT = -1.0f;    // 弹出的战局时刻（取证用：能算出玩家犹豫了多久）
+    /* 玩家阵亡。**单列一个标志而不是去看 W.player->dead**：
+       玩家一死就转进，W.player 指针在下一关会被换成新的人，
+       结算面板要讲的"你阵亡了，由 XXX 接替"这句话得在换人之后还能说出来。 */
+    bool  playerLost = false;
+
     // 车队
     bool  convoyStarted = false, convoyEscaped = false;
     float convoyProgress = 0;

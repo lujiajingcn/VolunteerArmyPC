@@ -574,6 +574,7 @@ void Hud::_draw() {
     draw_compass();
     draw_objectives();
     draw_alert();
+    draw_retreat_prompt();
     draw_killfeed();
     draw_squad();
     draw_command_panel();
@@ -1121,6 +1122,13 @@ void Hud::draw_info_strip() {
 // ===========================================================================
 //  中央目标横幅
 // ===========================================================================
+const Ref<Texture2D> &Hud::portrait_of(const std::string &p_id) {
+    auto it = art_port_.find(ally_art_key(p_id));
+    if (it != art_port_.end()) return it->second;
+    static const Ref<Texture2D> kNone;      // 缺素材时画个占位方块，不崩
+    return kNone;
+}
+
 void Hud::draw_objectives() {
     const float w = 520.0f * s_;
     const float x = vp_.x * 0.5f - w * 0.5f;
@@ -1249,6 +1257,35 @@ void Hud::draw_alert() {
     }
     tx_c(String::utf8(pick->text.c_str()), vp_.x * 0.5f, box.position.y + h * 0.5f + fsz * 0.36f,
          fsz, Color(base.r * 1.0f, base.g * 1.05f, base.b * 1.05f, alpha));
+}
+
+/* 伤亡过半后的「撤 / 守」选择条。
+   **为什么不用 toast 顶一下就算了**：toast 是 5 秒就淡出的瞬时提示，而这是一个
+   需要玩家**做决定**的状态 —— 它必须一直挂在屏幕上直到玩家按键，
+   否则玩家在交火中错过那 5 秒，就再也没有机会选择了（提示只弹一次）。
+   放在警报条正下方：两者都是"中央、需要立刻处理"的信息，叠在一起会互相盖住。 */
+void Hud::draw_retreat_prompt() {
+    if (!va::CAM.active || va::W.over) return;
+    if (!va::W.retreatOffered || va::W.retreatChoice != 0) return;
+
+    const float w = 420.0f * s_;
+    const float h = 104.0f * s_;
+    const Rect2 box(vp_.x * 0.5f - w * 0.5f, 232.0f * s_, w, h);
+    const Color am = c_amber();
+    const float pulse = 0.74f + 0.26f * std::sin(clock_ * 5.0f);
+
+    poly_panel(box, 10.0f * s_, Color(0.10f, 0.075f, 0.03f, 0.88f),
+               Color(am.r, am.g, am.b, 0.80f * pulse), 2.0f * s_);
+    draw_rect(Rect2(box.position.x, box.position.y, 4.0f * s_, box.size.y),
+              Color(am.r, am.g, am.b, 0.90f * pulse), true);
+
+    tx_c(String::utf8("伤亡过半 — 撤还是守？"), vp_.x * 0.5f, box.position.y + 30.0f * s_,
+         20, Color(0.99f, 0.93f, 0.80f, 1.0f));
+    const float lx = box.position.x + 26.0f * s_;
+    tx_mid(String::utf8("[1]  撤向下一个伏击阵地"), lx, box.position.y + 62.0f * s_, 17,
+           Color(0.90f, 0.94f, 0.97f, 0.96f));
+    tx_mid(String::utf8("[2]  继续死守阵地"),       lx, box.position.y + 87.0f * s_, 17,
+           Color(0.90f, 0.94f, 0.97f, 0.96f));
 }
 
 // ===========================================================================
@@ -1960,19 +1997,17 @@ void Hud::draw_end_panel() {
 // （"直接跑工程目录"时 res:// 就是盘上的工程目录），绕开整套导入系统。
 // 反过来，如果哪天有人用编辑器打开过工程把图导入了，ResourceLoader 那条路
 // 更快也更省内存，所以两条都试、谁成用谁。
-// 小队名册的显示顺序与对应的 Unit id。
-// 玩家排第一（他不在 ROSTER 里 —— 那是 va_config.cpp 的 PLAYER_DEF），
-// 其余 10 人按花名册原序。下标与 Hud::art_port_ 一一对应。
-constexpr int kRosterN = Hud::kRosterMax;
-static const char *const kRosterIds[kRosterN] = {
-    "player", "ajie", "laozhou", "xiaoxia", "daliu",
-    "alan", "shitou", "houzi", "laobai", "xiaoman", "tietou",
-};
-// 这张表与 Hud::art_port_ 是按**下标**配对的（负载时同一个下标、绘制时同一个下标），
-// 所以两边的长度必须严格相等，而且顺序改动也要同步。
-// 长度不等会在越界读胸像之前就先编译失败，比运行期看出"第 9 格是空的"早得多。
-static_assert(sizeof(kRosterIds) / sizeof(kRosterIds[0]) == (size_t)kRosterN,
-              "kRosterIds 长度必须等于 Hud::kRosterMax");
+/* 小队名册的显示顺序：**直接读当前这一关的花名册**（va::ROSTER）。
+   不能再写死一张 id 表 —— 五个阵地各有自己的 10 个人（共 50 个名字），
+   写死的表从第二关起整排对不上号，表现为"名册上全是陌生人"，
+   而这类偏差**没有任何日志**，只能靠眼睛看出来。
+   ROSTER[0] 恒为队长（也就是玩家），顺序即名册顺序。 */
+static std::vector<std::string> cur_roster_ids() {
+    std::vector<std::string> out;
+    for (const auto &r : va::ROSTER) out.push_back(r.id);
+    if (out.size() > (size_t)Hud::kRosterMax) out.resize((size_t)Hud::kRosterMax);
+    return out;
+}
 
 Ref<Texture2D> Hud::load_tex(const String &p_res_path) {
     const String &path = p_res_path;
@@ -1998,20 +2033,22 @@ void Hud::load_art() {
     art_win_     = load_tex("res://assets/art/art_end_win.png");
     art_lose_    = load_tex("res://assets/art/art_end_lose.png");
 
-    // 队员胸像。路径由 ally_art_key() 导出 —— 与三维角色模型用的是**同一套键**，
-    // 所以以后加一个角色只有一处映射要改，不会出现"模型换了、胸像还是旧的"。
+    /* 队员胸像。路径由 ally_art_key() 导出 —— 与三维角色模型用的是**同一套键**，
+       所以以后加一个角色只有一处映射要改，不会出现"模型换了、胸像还是旧的"。
+       **按模型键缓存而不是按名册下标**：五个阵地 50 个名字一共只复用 11 套
+       模型/胸像，按下标存会在换阵地时把上一个人的头像安到下一个格子上。 */
     int n_ok = 0;
-    for (int i = 0; i < kRosterN; ++i) {
-        art_port_[i] = load_tex(String("res://assets/art/char/portrait/") +
-                                String::utf8(ally_art_key(kRosterIds[i]).c_str()) + ".png");
-        if (art_port_[i].is_valid()) ++n_ok;
+    for (const auto &k : all_art_keys()) {
+        Ref<Texture2D> t = load_tex(String("res://assets/art/char/portrait/") +
+                                    String::utf8(k.c_str()) + ".png");
+        if (t.is_valid()) { art_port_[k] = t; ++n_ok; }
     }
     UtilityFunctions::print(String::utf8("[ui] 任务素材 menu="), art_menu_.is_valid(),
                             " brief=", art_brief_.is_valid(),
                             " chapter=", art_chapter_.is_valid(),
                             " win=", art_win_.is_valid(),
                             " lose=", art_lose_.is_valid(),
-                            String::utf8(" 胸像="), n_ok, "/", kRosterN);
+                            String::utf8(" 胸像="), n_ok, "/", (int)all_art_keys().size());
 }
 
 // 按「cover」铺满 + 横向渐变压暗。
@@ -2145,37 +2182,49 @@ void Hud::draw_roster(float p_cx, float p_baseline) {
     const float tw = 122.0f * s_;                 // 格子宽
     const float gap = 30.0f * s_;
     const float ph = tw * 332.0f / 256.0f;        // 胸像高（源图固定 256x332）
-    const float strip_w = kRosterN * tw + (kRosterN - 1) * gap;
+    const std::vector<std::string> ids = cur_roster_ids();
+    const int n = (int)ids.size();
+    if (n <= 0) return;
+    const float strip_w = n * tw + (n - 1) * gap;
     const float p_x = p_cx - strip_w * 0.5f;
     const float p_y = p_baseline;
 
+    /* 编制与分组都**按当前花名册现算**：五个阵地的人不一样多、分组名也可能不同，
+       写死"11 人 · 1组 / 2组 / 支援组"在换阵地之后就是一句假话。 */
+    std::string gtxt = "编制 " + std::to_string(n) + " 人";
+    if (!va::GROUPS.empty()) {
+        gtxt += " · ";
+        for (size_t gi = 0; gi < va::GROUPS.size(); ++gi) {
+            if (gi) gtxt += " / ";
+            gtxt += va::GROUPS[(size_t)gi].name;
+        }
+    }
     tx(String::utf8("小 队 名 册"), p_x, p_y, 17, c_text());
-    tx_r(String::utf8("编制 11 人 · 1组 / 2组 / 支援组"), p_x + strip_w, p_y, 12, c_shell_dim());
+    tx_r(String::utf8(gtxt.c_str()), p_x + strip_w, p_y, 12, c_shell_dim());
 
     const float y = p_y + 28.0f * s_;
-    for (int i = 0; i < kRosterN; ++i) {
+    for (int i = 0; i < n; ++i) {
         const float x = p_x + i * (tw + gap);
+        const std::string &rid = ids[(size_t)i];
 
         // ---- 身份：编制表 ----
-        const bool is_player = (i == 0);
+        const bool is_player = (rid == "player");
         std::string nm_s = "你（队长）";
         std::string role_s = "队长";
-        if (!is_player) {
-            const va::RosterDef *d = va::roster_of(kRosterIds[i]);
-            if (d != nullptr) { nm_s = d->name; role_s = d->role; }
-        }
+        const va::RosterDef *d = va::roster_of(rid);
+        if (d != nullptr) { nm_s = d->name; role_s = d->role; }
 
         // ---- 状态：战局 ----
         const va::Unit *u = nullptr;
         for (const auto &cand : va::W.units) {
-            if (cand.team == va::Team::Ally && cand.id == kRosterIds[i]) { u = &cand; break; }
+            if (cand.team == va::Team::Ally && cand.id == rid) { u = &cand; break; }
         }
         const bool dead = (u != nullptr && u->dead);
         const bool down = (u != nullptr && u->downed && !u->dead);
 
         // ---- 胸像 ----
         const Rect2 pr(x, y, tw, ph);
-        const Ref<Texture2D> &tex = art_port_[i];
+        const Ref<Texture2D> &tex = portrait_of(rid);
         if (tex.is_valid()) {
             draw_texture_rect(tex, pr, false, Color(1.0f, 1.0f, 1.0f, dead ? 0.32f : 1.0f));
         } else {
