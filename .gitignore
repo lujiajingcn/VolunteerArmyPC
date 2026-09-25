@@ -93,6 +93,11 @@ run_ui_*.log.*
 # 注意规则只匹配 veh/ 这一层的 png，**不会**波及 veh/model/*.glb
 # （成品是我们自己生成的，照常入库）。
 /assets/art/veh/*.png
+# veh/model/ 下同理：四辆车的 .glb 是走 Godot 导入器的（旁边有 .glb.import），
+# 于是导入器把内嵌贴图抽成了同级 jpg —— 实见 12 个文件、共 504 KB。
+# 它们与 .glb 内容重复、删掉下次启动照样重新抽出来，不上库。
+# （char/ wpn/ vm/ prop/ 四个 model/ 目录早有同名规则，veh/ 是漏掉的一条。）
+/assets/art/veh/model/*_texture_pbr_*.jpg
 
 # --- 第一人称手模的参考图（同理不入库）---
 # assets/art/vm/*.png 是 vm_hand_r / vm_hand_l 的图生3D 输入：
@@ -119,6 +124,20 @@ run_ui_*.log.*
 # 也就是说 raw/ 被处理产物完全覆盖，留着只是占地方，且带着水印的图
 # 在 Public 仓库里容易让人误以为是正式素材。
 /assets/art/char/raw/
+
+# --- 工程根的临时排查脚本与产物（`_` 前缀，一次性用）---
+# 构建/取证日志（`_build*.log` / `_verify_*.log` / `_fx*.log` 这一类）已被上面的
+# `*.log` 兜住，这里补的是**没有扩展名或扩展名不同**的几种：
+#   `_glb_report.json` / `_glb_scan.log`   GLB 几何扫描的原始报告
+#   `_inspect_glb*.py`                     GLB 几何探针（读 root 变换再统计）
+#   `_check_shader.gd` + `.uid`            着色器能否编译的一次性冒烟脚本
+#   `_fx_scan.py`                          PNG 阵营色扫描探针
+# 它们都随时可重新生成，且只在"为什么这个数不对"的那一次排查里有意义。
+#
+# 唯一的例外是 `_cleanrun.py`：它是**构建入口**（原始环境块按名字小写去重后传给
+# 子进程，绕开 MSB6001，见 README「构建」），必须入库。所以写成 `_*` + 反选。
+/_*
+!/_cleanrun.py
 
 # --- 本地 AI 会话记忆 ---
 /.workbuddy/
