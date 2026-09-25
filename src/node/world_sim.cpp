@@ -208,6 +208,10 @@ void WorldSim::build_unit_showcase() {
         return;
     }
 
+    if (mode.rfind("run:", 0) == 0) {
+        return;
+    }
+
     if (mode.rfind("veh:", 0) == 0) {
         /* ---- 载具近景 / 陈列排：veh:<type>[:<临时偏航角>] 或 veh:row ----
          【为什么载具要单独一条通道】战场截图答不了载具的三个问题：
@@ -686,6 +690,17 @@ void WorldSim::_ready() {
     vm_.build(cam_, this);
     va_trace("_ready:cam ok");
 
+    /* 音频层。必须在 cam_ 建好之后 —— 听者是相机的子节点（跟着转头），
+       传 cam_ 而不是 this。素材与声学口径见 node/audio.h。 */
+    dbg_sfx_ = (std::getenv("VA_DBG_SFX") != nullptr);
+    snd_.setup(this, cam_);
+    /* 听者初始位置：不设就停在原点，而一局开始的 "ambush" 号角立刻就要用，
+       第一声会被按「到世界原点的距离」误判（地图 110×65 m，起点离原点可以很远）
+       —— 表现为「开局那一下没声」，很难归因。 */
+    if (va::W.player != nullptr) snd_.set_listener(va::W.player->x, va::W.player->y);
+    va_trace("_ready:snd ok");
+
+
     aim_at_road();
     sync_entity_nodes();
     va_trace("_ready:sync ok");
@@ -1109,7 +1124,7 @@ void WorldSim::sync_entity_nodes() {
         // 被隐藏的"自己"照样摆位（只是不画）：位置若停在原点，
         // VA_DBG_UNITS 就会把"自己 d=0.00 m"报成"自己 61 米外"，
         // 那正是这个探针唯一要回答的问题。
-        n->set_transform(unit_transform(u.x, u.y, u.facing, u.downed));
+        //
     }
     for (size_t i = 0; i < va::W.vehicles.size(); ++i) {
         const va::Vehicle &v = va::W.vehicles[i];
@@ -1217,6 +1232,9 @@ void WorldSim::_process(double p_delta) {
         const float cam_h = (va::IN.ctrl ? 1.05f : EYE_H) + bob
                           + ground_h(p->x, p->y) + env_f("VA_CAM_H", 0.0f);
         cam_->set_position(to3(p->x, p->y, cam_h));
+        // 听者位置与相机同步。用**逻辑层米数**（不是 to3 之后的世界单位），
+        // 与 audio.cpp 里 ref/max 两个米制常数同口径 —— 见 audio.h 的说明。
+        snd_.set_listener(p->x, p->y);
 
         // 逻辑层朝向回写：yaw = -facing - π/2  ⇒  facing = -yaw - π/2
         va::W.viewPitch = pitch_;
@@ -1233,6 +1251,7 @@ void WorldSim::_process(double p_delta) {
     }
 
     va_trace("_process:cam ok");
+
 
     // HUD：采样世界状态 + 推进动画。整屏内容一次 _draw() 画完，
     // 所以这里只需每帧调一次 update（它内部会 queue_redraw）。
@@ -1576,11 +1595,29 @@ void WorldSim::on_say(const std::string &who, const std::string &text, const std
 void WorldSim::on_log(const std::string &text, const std::string &cls) { (void)text; (void)cls; }
 
 void WorldSim::on_sfx(const std::string &id, float x, float y, float gain, bool local) {
-    // 音频模块（XAudio2/Godot 混音）尚未接入；此处只做去重节流，避免刷屏
-    (void)id; (void)x; (void)y; (void)gain; (void)local;
+    /* 音效的唯一落点。**逻辑层是在 va::step_once 内部同步调用这里的**，
+       所以本函数必须便宜：真正的发声/限流/空间化都在 Audio 里（见 node/audio.h
+       顶部那段口径说明），这里只转调 + 一个可选的诊断行。
+
+       历史：这一格原来是一句空实现（注释「音频模块尚未接入」），只做去重节流。
+       现在音频层接上了 —— 逻辑层那些 sfx(...) 调用点一行都没动，它们本来就
+       按「id + 逻辑坐标 + 增益 + 是否居中」把话说清楚了。 */
+    snd_.play(id, x, y, gain, local);
+
+    if (!dbg_sfx_) return;
+    /* 每秒一行累计量。**这里为什么要独立于 audio.cpp 的逐条打印**：
+       逐条打印在交火高峰一秒能刷几十行，日志就没法当回归判据用了；
+       而 `丢弃` 这个数字恰恰只能这样看趋势 —— 它非零 = 逻辑层发了某个
+       audio.cpp 的 kSnd 表里没有的 id（改了逻辑层忘了加素材），是这条链路上
+       最容易漏的一类 bug，静默失声不会有任何报错。 */
     const double now = (double)Time::get_singleton()->get_ticks_msec() / 1000.0;
-    if (now - last_sfx_t_ < 0.0) return;
+    if (now - last_sfx_t_ < 1.0) return;
     last_sfx_t_ = now;
+    UtilityFunctions::print(String::utf8("[snd] 累计声源 "), (int64_t)snd_.played(),
+                            String::utf8("，未登记丢弃 "), (int64_t)snd_.dropped(),
+                            snd_.dropped() > 0
+                                ? String::utf8("（") + snd_.unknown_summary() + String::utf8("）")
+                                : String());
 }
 void WorldSim::on_toast(const std::string &text) {
     if (hud_ != nullptr) hud_->ev_toast(text);
@@ -1592,6 +1629,22 @@ void WorldSim::on_end(const std::string &kind, const std::string &text) {
     /* 结算本身由 HUD 的结算面板呈现（成败、评级、统计）；
        这里只把逻辑层给的这段文案留个记录，方便对照逻辑输出。 */
     UtilityFunctions::print(String::utf8("[结算] "), String::utf8(kind.c_str()), String::utf8("："), String::utf8(text.c_str()));
+    /* 音效链路的收尾诊断：载入数 + 实际触发分布 + 未登记丢弃。
+       「哪些 id 一次都没响过」比「总共响了多少次」有用得多 ——
+       它直接指出哪条 sfx(...) 链路没被走到（而不是合成得不对）。 */
+    if (dbg_sfx_) {
+        UtilityFunctions::print(String::utf8("[snd] 收尾：载入 "), snd_.loaded(), "/", snd_.attempted(),
+                                String::utf8("，累计声源 "), (int64_t)snd_.played(),
+                                String::utf8("，未登记丢弃 "), (int64_t)snd_.dropped());
+        UtilityFunctions::print(String::utf8("[snd] 触发分布 "), snd_.played_summary());
+        if (snd_.dropped() > 0) {
+            /* P0 只做了 25 个 id，逻辑层一共会发 35 个 —— 剩下的 10 个
+               （ambush/boxDrop/evac/grenadeThrow/incoming/pickup/reinforce/
+                 rocketFire/radioTx/radioRx）会落在这一行里。这是**已知缺口**，
+               不是故障；P1 批次补上素材与 kSnd 条目后这行自然消失。 */
+            UtilityFunctions::print(String::utf8("[snd] 未登记 id（P1 待补）: "), snd_.unknown_summary());
+        }
+    }
     /* 「转进」= 这一关打下来了、还有下一关 —— 它和"成功/胜利/失败"不是一回事：
        战绩全达标但没过关（比如撤离人数不够）也会走 end_game，那种不能推进关卡。
        所以只认 end_game 给出的 kind，不自己看 stats 反推。 */
@@ -1706,6 +1759,7 @@ String WorldSim::get_diag() const {
     s += String::utf8(" · 载具 ") + String::num_int64((int64_t)va::W.vehicles.size());
     s += String::utf8(" · 掩体 ") + String::num_int64((int64_t)va::W.props.size());
     s += String::utf8(" · 路线点 ") + String::num_int64((int64_t)va::CONVOY_WAY.size());
+    s += String::utf8(" · ");
     return s;
 }
 

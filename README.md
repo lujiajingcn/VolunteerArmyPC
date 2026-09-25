@@ -1878,8 +1878,14 @@ tools/capture_prop.sh row             # 四件地物陈列排，固定顺序 roc
   但要先把参考图推上去。眼下没有必须用它的场景（半透明叶簇已改走文生3D，
   硬质实体单视图就够），留作备用。
 - 载具模型精致化（目前仍是块状体）
-- 特效层：曳光弹、爆炸、弹壳抛出、烟尘
-- 音频层（网页版有 62 个程序化音效 id，PC 版尚未接入）
+- 音频层：**P0 战斗可闻已接入**（枪声 / 命中 / 爆炸 / 换弹，25 个 id）。
+  素材由 `tools/gen_sfx.py` 程序化合成到 `assets/audio/`，播放走
+  `src/node/audio.cpp`（`SimEvents::on_sfx` 的落点），逻辑层一行未改。
+  未做的：**P1 流程音**（ambush / boxDrop / evac / grenadeThrow / incoming /
+  pickup / reinforce / rocketFire / radioTx / radioRx —— 这 10 个 id 现在会被
+  音频层记成「未登记丢弃」，`VA_DBG_SFX=1` 时按名字报出来）、**P2 环境层**
+  （风 / 雨 / 夜虫鸣底噪、载具引擎循环）、远处高频的空气吸收。
+- 单位动作：**两层都已接入**，逻辑层 `src/sim/` 一行未改。
 - 语音指挥：计划走 **SAPI 识别 + TTS 回话 + 面板兜底**
 
 ## 许可

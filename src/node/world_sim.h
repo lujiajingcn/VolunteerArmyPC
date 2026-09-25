@@ -12,6 +12,7 @@
 #include <godot_cpp/classes/node3d.hpp>
 #include <godot_cpp/variant/string.hpp>
 
+#include "node/audio.h"
 #include "node/hud.h"
 #include "node/scene_builder.h"
 #include "node/viewmodel.h"
@@ -101,6 +102,7 @@ private:
     SceneRefs refs_;
     godot::Camera3D *cam_ = nullptr;
     ViewModel vm_;                 // 第一人称武器视图模型（相机的子节点）
+    Audio snd_;                    // 音效层：SimEvents::on_sfx 的落点（见 node/audio.h）
     std::vector<godot::Node3D *> unit_nodes_;
     std::vector<godot::Node3D *> veh_nodes_;
     godot::Node3D *box_node_ = nullptr;
@@ -134,6 +136,9 @@ private:
 
     // 音频节流（同一音效 id 在极短时间内不重复触发）
     double last_sfx_t_ = 0.0;
+    // VA_DBG_SFX=1：音效链路诊断（载入数 / 触发数 / 未登记 id 的丢弃数）。
+    // 注意它和 VA_DBG_VM 是两件事，判读场合不重叠。
+    bool dbg_sfx_ = false;
 
     // 视图模型手感：靠「观测量跳变」判断开火/换弹，不去侵入逻辑层。
     // 逻辑层删掉开火事件回调也不影响这里 —— 渲染层只读状态。

@@ -42,6 +42,7 @@ set(VA_SOURCES
     src/sim/va_flow.cpp
     src/node/viewmodel.cpp
     src/node/hud.cpp
+    src/node/audio.cpp
     src/node/world_sim.cpp
     src/node/scene_builder.cpp
 )
