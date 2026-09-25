@@ -1533,6 +1533,15 @@ const char *ViewModel::skin_label() const {
     return wpn_label(skin_key());
 }
 
+// ============================================================ 枪口世界坐标
+// 见 .h 里 muzzle_world 那一段：这里只确认节点还在树上（不在树上时
+// get_global_position 给的是尚未同步的局部变换），然后把全局坐标读出去。
+bool ViewModel::muzzle_world(Vector3 &r_out) const {
+    if (muzzle == nullptr || !muzzle->is_inside_tree()) return false;
+    r_out = muzzle->get_global_position();
+    return true;
+}
+
 void ViewModel::on_shot() {
     if (!valid()) return;
     // 一次冲量：位移 + 角速度。数值靠手感调 —— 太大像在"点头"，太小没反馈。

@@ -62,6 +62,18 @@ constexpr float kTracerLen = 2.30f;
 constexpr float kTracerWidth = 0.045f;
 constexpr float kTracerH = 1.25f;
 
+/* 曳光弹条带在**近处**的宽度上限（角，弧度）。世界空间恒宽 0.045 m 在 1 m 处是 2.6°
+   （约 43 px @1080p）—— 读起来是一块"贴在枪口的白片"，而不是一段弹道。
+   按角度封顶后同一个位置约 11 px。远处**不受影响**：那里宽度由 ang_tracer_w_ 从
+   下方抬着（50 m 处已是 0.15 m），远大于这个上限，min 取不到这一支。
+   实际受益的基本只有玩家自己那发 —— 它的起点就是枪口，整段都落在 1~3 m 内。 */
+constexpr float kTracerNearAng = 0.012f;
+
+/* 玩家自己那发弹的**最小头端长度**（米）。子弹 spawn 时 p.t 被清零 ⇒ "已飞出 0 m"，
+   不兜底的话出膛那一帧条带会退化成零长度、什么都不画（而那一帧恰恰是"从枪口射出"
+   最该被看见的一帧）。见 build_tracers 的玩家分支。 */
+constexpr float kOwnHeadMin = 0.60f;
+
 // ---------------------------------------------------------------- 阵营配色
 // 色相照搬网页版曳光弹（index.html:4583：友军冷青白 / 敌方暖橙），但**饱和度加重**。
 //
@@ -143,6 +155,12 @@ Ref<Texture2D> make_glow_tex() {
     return Ref<Texture2D>(ImageTexture::create_from_image(img).ptr());
 }
 
+// 诊断用：屏幕像素坐标 → "x,y"。Vector2 没有现成的可读字符串形式，
+// 手拼比绕 Variant 稳，也让诊断行保持单行可 grep。
+String px_str(const Vector2 &p_v) {
+    return String::num(p_v.x, 0) + String::utf8(",") + String::num(p_v.y, 0);
+}
+
 } // namespace
 
 // ============================================================ setup
@@ -162,6 +180,8 @@ void FxLayer::setup(Node3D *p_parent, Camera3D *p_cam) {
     muz_on_ = env_flag("VA_FX_MUZ", true);
     tracer_on_ = env_flag("VA_FX_TRACER", true);
     spark_on_ = env_flag("VA_FX_SPARK", true);
+    // 玩家自己的弹道起点用枪模枪口（见 set_player_muzzle）。关掉即回退旧口径。
+    pmuz_on_ = env_flag("VA_FX_PMUZ", true);
     /* ⚠️ 增益**不能给大**。光效走加色混合，颜色本身已被推到 HDR；
        再乘 3.0 会让三个通道全部远超 1.0，经 ACES 色调映射后**统一压成纯白** ——
        实测扫图（sweep/v_fx_look/cap_220s.png）确认：友军冷青白变成了纯白，
@@ -176,6 +196,7 @@ void FxLayer::setup(Node3D *p_parent, Camera3D *p_cam) {
     ang_muz_ = env_f("VA_FX_ANG", 0.020f);
     ang_tracer_w_ = env_f("VA_FX_TW", 0.0030f);
     ang_tracer_l_ = env_f("VA_FX_TL", 0.016f);
+    ang_tracer_near_ = env_f("VA_FX_TNW", 0.012f);
     tracer_gain_ = env_f("VA_FX_TGAIN", 1.15f);
     probe_ = (int)env_f("VA_FX_PROBE", 0.0f);
     dbg_ = env_flag("VA_DBG_FX", false);
@@ -275,7 +296,21 @@ void FxLayer::setup(Node3D *p_parent, Camera3D *p_cam) {
         String::utf8("（枪口焰/曳光弹按阵营分色：友军冷青白 · 敌军暖橙）"));
     UtilityFunctions::print(
         String::utf8("[fx] 分项开关 枪口焰="), muz_on_, String::utf8(" 曳光弹="), tracer_on_,
-        String::utf8(" 弹着火花="), spark_on_, String::utf8(" 探针="), probe_);
+        String::utf8(" 弹着火花="), spark_on_, String::utf8(" 探针="), probe_,
+        String::utf8(" · 玩家弹道起点=枪口"), pmuz_on_);
+}
+
+// ============================================================ 玩家枪口（见 .h）
+void FxLayer::set_player_muzzle(bool p_valid, const Vector3 &p_pos) {
+    if (!enabled_) return;
+    /* VA_FX_PMUZ=0 时**连坐标都不收** —— 这样 pmuz_valid_ 恒为 false，
+       build_tracers 自然走旧口径，回退路径只有一条、不会出现"半开"的中间态。 */
+    if (!pmuz_on_) {
+        pmuz_valid_ = false;
+        return;
+    }
+    pmuz_valid_ = p_valid;
+    if (p_valid) pmuz_ = p_pos;
 }
 
 // ============================================================ 池分配
@@ -363,32 +398,77 @@ void FxLayer::build_tracers(const va::WorldState &p_w) {
     const Vector3 cam = (cam_ != nullptr) ? cam_->get_global_position() : Vector3();
 
     bool begun = false;
+    last_pmuz_ = 0;
     for (const va::Projectile &p : p_w.projectiles) {
         if (!is_tracer_kind(p.kind)) continue;
 
         const float a = std::atan2(p.vy, p.vx);
-        const float h = ground_h(p.x, p.y) + kTracerH;
-        const Vector3 B = to3(p.x, p.y, h);   // 前端 = 子弹当前位置
 
-        /* ⚠️ 单位口径（踩过，静默错）：`kTracerLen` 是**米**，而 `p.x / p.y` 是
-           **逻辑坐标** —— 1 逻辑单位 = S = 0.05 m（scene_builder.h:27）。
-           第一版把"2.3 m"直接减在逻辑坐标上，于是曳光弹实际只有 2.3 逻辑单位
-           = **0.115 m** 长，短了一个数量级 —— 这正是"画面上看不到曳光弹"的直接原因，
-           而它在日志/计数里完全正常（`[fx] 曳光弹 24`），只有看画面才发现。
-           网页版是纯 2D 画布、逻辑坐标即像素，没有这一层换算，照抄会踩。
-           与 audio 层"SND 的 ref/max 是逻辑单位、必须 ×S"是同一类坑。 */
-        const float d_head = (cam_ != nullptr) ? std::sqrt(B.distance_squared_to(cam)) : 0.0f;
-        const float len_m = std::max(kTracerLen, d_head * ang_tracer_l_);
-        const float len_lu = len_m / S;       // 米 → 逻辑单位
+        /* 条带两端 A（尾）→ B（头）。两条路：
+             · 通用（场上所有单位：AI 步兵 / 载具机枪）：逻辑坐标映射到
+               "地面 + kTracerH"这个水平面上，取子弹当前位置往回 kTracerLen 一段；
+             · **玩家自己**：从枪模枪口出发（见 set_player_muzzle）。
+           为什么玩家非单列一条不可：第一人称相机架在玩家单位正上方 1.65 m，枪模枪口
+           在相机前方约 0.8 m、高约 1.6 m；而逻辑层给的子弹出生点是"前方 8 逻辑单位
+           （0.4 m）"、映射后离地 1.25 m —— 两者方向差 **30° 以上**。
+           照通用口径画出来的玩家弹道因此从画面下方凭空冒出，跟右下角的枪口对不上
+           （实测：旧口径下那一段的前端落在相机前方 0.4 m、**下方 0.40 m**，
+            即屏幕下方约 45° —— 已在画面之外；只有子弹飞远后的一小截才进画面，
+            看起来就是"悬空的断线"）。 */
+        Vector3 A, B, d;
 
-        const float x1 = p.x - std::cos(a) * len_lu;
-        const float y1 = p.y - std::sin(a) * len_lu;
+        /* "这个枪口真的长在这个玩家手上吗" —— 枪模挂在**相机**下，而检阅台
+           （VA_UNIT_SHOW）与菜单外壳会把相机摆到地图别处，枪口于是跟着相机一起跑；
+           此时若还按它算弹道，玩家那发弹的线会从几十米外凭空长出来（比原症状更糟）。
+           判据用**逻辑单位**的水平距离：60 逻辑单位 = 3 m，远超一个持枪臂展，
+           正常第一人称下这个距离是 0.8 m 上下。平方比较，不开方。 */
+        bool own = false;
+        if (pmuz_valid_ && p.owner != nullptr && p.owner->isPlayer) {
+            const float dxl = pmuz_.x / S - p.owner->x;
+            const float dzl = pmuz_.z / S - p.owner->y;
+            own = (dxl * dxl + dzl * dzl) < 3600.0f;
+        }
 
-        // 两端共用同一个地面高度：数米跨度内地形起伏可忽略，省一次 ground_h。
-        const Vector3 A = to3(x1, y1, h);
-        Vector3 d = B - A;
-        if (d.length_squared() < 1e-8f) continue;
-        d = d.normalized();
+        if (own) {
+            /* 玩家自己：以枪口为原点，沿**逻辑弹道方向**按"已经飞出多远"截取一段。
+               ⚠️ 不能照搬通用路径的"从子弹位置往回退 kTracerLen"：玩家那颗弹出膛后
+               前几帧仍在相机前方 0.4 m 处，往回退 2.3 m 会得到一段**穿过玩家自己身体**
+               的线（起点跑到相机背后去）。按"飞了多远"截取天然满足"起点永不早于枪口"，
+               且第一帧就是从枪口射出的一小段 —— 这正是需求要的观感。
+               方向取逻辑层的弹道角 a：它与命中判定同源，且逻辑层弹道本来就躺在
+               水平面上（俯仰由"有效射程"折算，见 va_units.cpp:75）。 */
+            const float spd_lu = std::sqrt(p.vx * p.vx + p.vy * p.vy);
+            const float flown_m = spd_lu * p.t * S;      // p.t = 出膛后经过的逻辑秒数
+            const float head_m = std::max(flown_m, kOwnHeadMin);
+            const float tail_m = std::max(0.0f, head_m - kTracerLen);
+            d = Vector3(std::cos(a), 0.0f, std::sin(a));
+            A = pmuz_ + d * tail_m;
+            B = pmuz_ + d * head_m;
+            ++last_pmuz_;
+        } else {
+            const float h = ground_h(p.x, p.y) + kTracerH;
+            B = to3(p.x, p.y, h);   // 前端 = 子弹当前位置
+
+            /* ⚠️ 单位口径（踩过，静默错）：`kTracerLen` 是**米**，而 `p.x / p.y` 是
+               **逻辑坐标** —— 1 逻辑单位 = S = 0.05 m（scene_builder.h:27）。
+               第一版把"2.3 m"直接减在逻辑坐标上，于是曳光弹实际只有 2.3 逻辑单位
+               = **0.115 m** 长，短了一个数量级 —— 这正是"画面上看不到曳光弹"的直接原因，
+               而它在日志/计数里完全正常（`[fx] 曳光弹 24`），只有看画面才发现。
+               网页版是纯 2D 画布、逻辑坐标即像素，没有这一层换算，照抄会踩。
+               与 audio 层"SND 的 ref/max 是逻辑单位、必须 ×S"是同一类坑。 */
+            const float d_head = (cam_ != nullptr) ? std::sqrt(B.distance_squared_to(cam)) : 0.0f;
+            const float len_m = std::max(kTracerLen, d_head * ang_tracer_l_);
+            const float len_lu = len_m / S;       // 米 → 逻辑单位
+
+            const float x1 = p.x - std::cos(a) * len_lu;
+            const float y1 = p.y - std::sin(a) * len_lu;
+
+            // 两端共用同一个地面高度：数米跨度内地形起伏可忽略，省一次 ground_h。
+            A = to3(x1, y1, h);
+            d = B - A;
+            if (d.length_squared() < 1e-8f) continue;
+            d = d.normalized();
+        }
 
         /* 手搓面向相机的条带。Godot 的 PRIMITIVE_LINES 线宽固定 1 像素，
            几米外的曳光细到看不见，所以自己算宽度：
@@ -398,9 +478,12 @@ void FxLayer::build_tracers(const va::WorldState &p_w) {
         if (to_cam.length_squared() < 1e-6f) continue;
         Vector3 side = d.cross(to_cam.normalized());
         if (side.length_squared() < 1e-8f) continue;   // 正对着看：投影不出宽度，跳过
-        /* 宽度也给角下限：0.045 m 的条带在 50 m 外是亚像素宽，等于没画。 */
+        /* 宽度两步走：先按"世界尺寸下限"与"远处最小角宽"取大（保证远处看得见），
+           再用"近处角宽上限"收回（保证近处不会摊成一块白片 —— 玩家自己那发
+           整段都在枪口前 1~3 m 内，是唯一的实际受益者）。见 kTracerNearAng 的说明。 */
         const float dist_mid = std::sqrt(to_cam.length_squared());
-        const float w_m = std::max(kTracerWidth, dist_mid * ang_tracer_w_);
+        const float w_far = std::max(kTracerWidth, dist_mid * ang_tracer_w_);
+        const float w_m = std::min(w_far, dist_mid * ang_tracer_near_);
         side = side.normalized() * (w_m * 0.5f);
 
         if (!begun) {
@@ -527,6 +610,11 @@ void FxLayer::reset() {
     for (OmniLight3D *l : lights_) l->set_visible(false);
     if (tracer_mesh_.is_valid()) tracer_mesh_->clear_surfaces();
     peak_muz_ = peak_tracer_ = 0;
+    /* 玩家枪口坐标**必须一起清**：它是相机子节点的世界坐标，换关/重开一局时
+       玩家会被传送到新出生点 —— 留着上一局的旧坐标会让第一发弹的弹道
+       从地图另一头凭空长出。下一帧 WorldSim 会重新喂进来。 */
+    pmuz_valid_ = false;
+    last_pmuz_ = 0;
 }
 
 // ============================================================ 诊断
@@ -548,6 +636,22 @@ String FxLayer::dump() const {
          String::utf8(" · 正面 ") + String::num((double)cum_front_) +
          String::utf8("/背后 ") + String::num((double)cum_behind_) +
          String::utf8(" · 角尺寸 ") + String::num((double)ang_muz_, 4);
+
+    /* 玩家自己的弹道起点（枪模枪口）。这一行是专为"弹道不从枪口出"这个症状加的：
+       "弹道还是从画面下方冒出"有两种根因 —— 枪口坐标压根没喂进来（本层退回旧口径），
+       与"喂进来了但玩家自己这一帧没开枪"。只报一个数分不出来，所以三件事一起报：
+       收到了没有、枪口此刻落在屏幕哪儿、本帧有几发弹走了这条路。 */
+    if (!pmuz_on_) {
+        s += String::utf8(" · 玩家枪口 **VA_FX_PMUZ=0 已关**（玩家弹道回退旧口径）");
+    } else if (!pmuz_valid_) {
+        s += String::utf8(" · 玩家枪口 **未喂进来**（枪模未建好 / VA_VM_HIDE=1）⇒ 玩家弹道走旧口径");
+    } else {
+        const Vector3 cp = (cam_ != nullptr) ? cam_->get_global_position() : Vector3();
+        s += String::utf8(" · 玩家枪口 px ")
+           + px_str(cam_ != nullptr ? cam_->unproject_position(pmuz_) : Vector2())
+           + String::utf8(" · 距相机 ") + String::num((double)std::sqrt(pmuz_.distance_squared_to(cp)), 2)
+           + String::utf8("m · 本帧走枪口路径 ") + String::num((double)last_pmuz_);
+    }
     return s;
 }
 

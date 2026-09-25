@@ -1365,6 +1365,19 @@ void WorldSim::_process(double p_delta) {
        第三个参数是**本帧推进的逻辑秒数**（n 步 × 1/60），不是墙钟 ——
        枪口焰只有 0.055 s，掉帧或 VA_FF 快进时一帧能推进 0.1~0.13 s，
        用"当前时刻落在窗口内"去判会整帧跳过闪光。详见 fx_layer.h 的 step 说明。 */
+    /* 玩家自己那发弹的**弹道起点** = 第一人称枪模的枪口世界坐标
+       （见 fx_layer.h 的 set_player_muzzle）。不喂的话本层回退旧口径，
+       玩家开枪时弹道线又从画面下方凭空冒出 —— 与右下角的枪口对不上。
+       ⚠️ 这里读到的是**上一帧**的枪口变换：vm_.update() 在 _process 后段（输入
+       处理之后），而本行在它之前。差一帧 = 16 ms，枪口在这个尺度上的位移是
+       sway/bob 的量级（毫米级），对"弹道从枪口出发"没有可见影响；不值得为消掉
+       这一帧去动 _process 的段落顺序（那一段有自己的理由：相机先落地，光效才量得准
+       近距剔除）。muzzle_world() 在枪模未建好时返回 false，本层自动回退。 */
+    {
+        Vector3 mz;
+        fx_.set_player_muzzle(vm_.muzzle_world(mz), mz);
+    }
+
     fx_.step(va::W, (float)p_delta, (float)((double)n * H));
 
     // HUD：采样世界状态 + 推进动画。整屏内容一次 _draw() 画完，

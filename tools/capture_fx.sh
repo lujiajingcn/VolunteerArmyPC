@@ -70,14 +70,19 @@ esac
 #    带指纹的目录名从根上绕开它：不同批次天然隔离，同名即为同一次采样。
 FXOFF=""
 [ "${VA_FX:-1}" = "0" ] && FXOFF="_off"
+# 玩家弹道起点（VA_FX_PMUZ）也要分出独立目录：它是**同一帧内**唯一会变的量，
+# 落在同一个目录里两批会互相覆盖（表现仍是"图上少了一版"，不报错）。
+PMOFF=""
+[ "${VA_FX_PMUZ:-1}" = "0" ] && PMOFF="_pmuzoff"
 # 指纹要吃进**所有会改变画面的输入**，不只是时刻列表 ——
 # 只按 TIMES 打指纹时，同一时刻、不同机位（VA_CAM_H / VA_CAM_PITCH）的两次拍摄
 # 会撞进同一个目录、后者覆盖前者，而失败表现同样是"图上少了一版"（2026-09-25 踩到：
 # ANG 判别实验的近景组与俯视组写到了同一处，只剩俯视那 3 张）。
-TAG="$(printf '%s|%s|%s|%s|%s|%s|%s' "$TIMES" "${VA_FF:-3}" "${VA_CAM_H:-}" \
+TAG="$(printf '%s|%s|%s|%s|%s|%s|%s|%s' "$TIMES" "${VA_FF:-3}" "${VA_CAM_H:-}" \
        "${VA_CAM_PITCH:-}" "${VA_FX_ANG:-}" "${VA_FX_TW:-}" "${VA_FX_PROBE:-}" \
+       "${VA_FX_PMUZ:-}" \
        | cksum | awk '{print $1}')"
-OUT="sweep/v_fx_${MODE}${FXOFF}_${TAG}"
+OUT="sweep/v_fx_${MODE}${FXOFF}${PMOFF}_${TAG}"
 
 export VA_SEED="${VA_SEED:-20260925}"
 export VA_SCRIPT_A=1
@@ -114,7 +119,7 @@ done
 WIN_ROOT="$(cygpath -w "$ROOT" 2>/dev/null || echo "$ROOT")"
 LOG="$OUT/run.log"
 
-echo "模式=$MODE   VA_FX=${VA_FX:-1}${VA_FX_PROBE:+   VA_FX_PROBE=$VA_FX_PROBE}   VA_FF=$VA_FF   VA_SEED=$VA_SEED"
+echo "模式=$MODE   VA_FX=${VA_FX:-1}${VA_FX_PROBE:+   VA_FX_PROBE=$VA_FX_PROBE}   VA_FX_PMUZ=${VA_FX_PMUZ:-1}   VA_FF=$VA_FF   VA_SEED=$VA_SEED"
 echo "时刻=$TIMES"
 echo "目录=$OUT"
 echo "启动…（交火窗口跑到 260 战局秒，ff=$VA_FF 时约 $((260 / VA_FF)) 秒真实时间）"
