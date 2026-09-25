@@ -15,6 +15,8 @@
 #include "node/audio.h"
 #include "node/hud.h"
 #include "node/scene_builder.h"
+#include "node/unit_anim.h"
+#include "node/unit_leg.h"
 #include "node/viewmodel.h"
 #include "sim/va_world.h"
 #include "sim/va_campaign.h"   // 战役：关卡表 / 跨关花名册（CarryOver）
@@ -103,6 +105,14 @@ private:
     godot::Camera3D *cam_ = nullptr;
     ViewModel vm_;                 // 第一人称武器视图模型（相机的子节点）
     Audio snd_;                    // 音效层：SimEvents::on_sfx 的落点（见 node/audio.h）
+    /* 单位跑动节奏（见 node/unit_anim.h）。与 snd_ 同一类：只读逻辑层状态、
+       挂在 sync_entity_nodes 里、删掉不影响任何逻辑。 */
+    UnitAnim anim_;
+    /* 双腿交替（见 node/unit_leg.h）：用着色器顶点位移把左右腿按相位交替前后摆，
+       相位由 anim_ 提供（PoseVals::leg_phase / leg_deg）。
+       与 anim_ 同一类：只读逻辑层状态、挂在 sync_entity_nodes 里、
+       **VA_LEG=0 时完全不动作**（连材质都不换），删掉不影响任何逻辑。 */
+    UnitLeg leg_;
     std::vector<godot::Node3D *> unit_nodes_;
     std::vector<godot::Node3D *> veh_nodes_;
     godot::Node3D *box_node_ = nullptr;

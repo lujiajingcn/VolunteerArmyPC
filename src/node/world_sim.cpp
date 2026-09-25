@@ -102,6 +102,10 @@ void WorldSim::aim_at_road() {
      VA_UNIT_SHOW=1 | row        陈列排：11 个角色等距摆两排，看彼此差异与整体齐备度
      VA_UNIT_SHOW=one:<键>[:<度>]  近景单体：把<键>那个模型单独摆到镜头前 5 米，
                                   看朝向 / 脚底 / 比例（可加第三段临时偏航角度）
+     VA_UNIT_SHOW=run:<键>[:<速度>] 跑动排：同一个模型按一个步态周期均分相位摆一排
+                                  （默认 6 格 / 满速），一张静态截图看完整个跑动循环。
+                                  相位是给定值，不依赖帧对齐 —— 见该分支里的说明。
+                                  格数 / 速度：VA_RUN_DEMO_N / VA_RUN_DEMO_SPEED。
 
    载具另有两条（前面多了 veh: 前缀，不与角色撞键）：
      VA_UNIT_SHOW=veh:<类型>[:<度>]  单车近景，类型 = jeep | apc | tank | truck
@@ -184,6 +188,11 @@ void WorldSim::build_unit_showcase() {
             const float lx = p->x + fx * DIST_M * U;
             const float ly = p->y + fy * DIST_M * U;
             nd->set_transform(unit_transform(lx, ly, a + PI + dyaw, false));
+            /* 站立单体也要挂上腿摆层（摆角 0）—— 不是为了让它动，是为了**材质一致**：
+               若这里走原始 StandardMaterial3D、而跑动排走着色器材质，
+               两边的取证图就不可比，"换了材质外观到底有没有变"这个问题会答不了。
+               挂上之后 VA_LEG=0/1 的对照才落在同一套取景与姿态上。 */
+            leg_.apply(nd, key, 0.0f, 0.0f);
             stage->add_child(nd);
         }
         /* 取景推导（这几行数字不是拍的，是算的，改之前先算一遍）：
@@ -209,6 +218,64 @@ void WorldSim::build_unit_showcase() {
     }
 
     if (mode.rfind("run:", 0) == 0) {
+        /* ---- 跑动排：run:<键>[:<速度 m/s>] ----
+         把**同一个模型**按一个步态周期均分相位摆一排，一张静态截图就能看到
+         整段跑动循环的动作幅度与相位关系。
+
+         【为什么不做成"动的那一个"】要证明"在跑"，最直觉的办法是隔 0.15 秒拍三张。
+         但那要求两次/多次拍摄的**帧对齐**完全一致 —— 本工程踩过：`acc_ += p_delta*ff`，
+         ff>1 时不同运行的帧数根本不对齐，截到的战局时刻差零点几秒，单位早移动了。
+         摆成一排则是**静态**的：相位是给定值，不依赖任何时序，可重复、可逐格比对。
+         这也是当年"角色模型检阅台"存在的同一个理由 —— 战场截图答不了姿态问题。 */
+        std::string rest = mode.substr(4);
+        std::string key = rest, spd_s;
+        const size_t c = rest.find(':');
+        if (c != std::string::npos) { key = rest.substr(0, c); spd_s = rest.substr(c + 1); }
+        float spd = 0.0f;
+        if (!spd_s.empty()) spd = (float)std::strtod(spd_s.c_str(), nullptr);
+        if (spd <= 0.0f) spd = env_f("VA_RUN_DEMO_SPEED", anim_.full_speed_mps());
+        int N = (int)env_f("VA_RUN_DEMO_N", 6.0f);
+        if (N < 2) N = 2;
+        if (N > 12) N = 12;
+
+        constexpr float DIST_M = 6.6f;
+        constexpr float CAM_H  = 1.05f;
+        constexpr float SPACING_M = 1.05f;   // 相邻两格的横向间距
+        if (refs_.units != nullptr) refs_.units->set_visible(false);
+
+        const float row_w = SPACING_M * (float)(N - 1);
+        const float lx0 = p->x + fx * DIST_M * U - rx * (row_w * 0.5f) * U;
+        const float ly0 = p->y + fy * DIST_M * U - ry * (row_w * 0.5f) * U;
+
+        int placed = 0;
+        for (int k = 0; k < N; ++k) {
+            Node3D *nd = make_unit_node_by_key(key, refs_.units);
+            if (nd == nullptr) break;
+            const float lx = lx0 + rx * (SPACING_M * (float)k) * U;
+            const float ly = ly0 + ry * (SPACING_M * (float)k) * U;
+            const float phase = 2.0f * PI * (float)k / (float)N;
+            const UnitAnim::PoseVals pv = anim_.pose_at(phase, spd);
+            nd->set_transform(unit_transform(lx, ly, a + PI, false)
+                              * UnitAnim::pose_transform(pv));
+            /* 腿摆：这一排本来就是把**一个步态周期按相位均分**摆开的，
+               把相位喂进去之后，**一张静态截图就能看到左右腿的交替** ——
+               不依赖帧对齐，也不需要 VA_FF（那两条正是"拍三张对照"最容易翻车的地方）。 */
+            leg_.apply(nd, key, pv.leg_phase, pv.leg_deg);
+            stage->add_child(nd);
+            ++placed;
+            UtilityFunctions::print(String::utf8("[show] 跑动排 #"), k,
+                                    String::utf8(" 相位 "), phase * 180.0f / PI, String::utf8("°"),
+                                    String::utf8(" 起伏 "), pv.bob, String::utf8("m 前倾 "),
+                                    pv.lean, String::utf8("° 摇 "), pv.roll, String::utf8("°"),
+                                    String::utf8(" 腿摆 "), pv.leg_deg, String::utf8("°"));
+        }
+        cam_->set_position(to3(p->x, p->y, CAM_H));
+        cam_->set_rotation(Vector3(0.04f, yaw_, 0));
+        if (std::getenv("VA_FOV") == nullptr) cam_->set_fov(32.0f);
+        UtilityFunctions::print(String::utf8("[show] 跑动排 "), String::utf8(key.c_str()),
+                                String::utf8(" 共 "), placed, String::utf8(" 格，速度 "),
+                                spd, String::utf8(" m/s（满速 "), anim_.full_speed_mps(),
+                                String::utf8(" m/s），距离 "), DIST_M, String::utf8("m"));
         return;
     }
 
@@ -499,6 +566,11 @@ void WorldSim::build_unit_showcase() {
         // 倒地的那一个额外叠 84° 侧翻（unit_transform 内部处理），
         // 让他**沿排面**倒下（facing 与同排一致），躺姿才读得出来。
         nd->set_transform(unit_transform(lx, ly, a + PI, downed));
+        /* 站立陈列也要挂上腿摆层（摆角 0）—— 与 one: / run: 同口径。
+           不是为了让它动，而是为了让**所有角色渲染路径共用同一套材质**：
+           哪条路径漏挂，那条路径就会退回原始 StandardMaterial3D，
+           于是两个模式下的取证图无法互相比对，而这类偏差在截图上根本看不出来。 */
+        leg_.apply(nd, key, 0.0f, 0.0f);
         stage->add_child(nd);
         ++built;
     }
@@ -699,6 +771,15 @@ void WorldSim::_ready() {
        —— 表现为「开局那一下没声」，很难归因。 */
     if (va::W.player != nullptr) snd_.set_listener(va::W.player->x, va::W.player->y);
     va_trace("_ready:snd ok");
+
+    /* 跑动节奏层（见 node/unit_anim.h）。与音频层同性质：只读逻辑层状态。
+       放在 sync 之前 —— 第一帧就要能算出姿态。 */
+    anim_.setup();
+
+    /* 双腿交替层（见 node/unit_leg.h）：着色器顶点位移，把左右腿按相位交替前后摆。
+       摆角由 anim_ 算（PoseVals::leg_phase / leg_deg），所以必须排在 anim_.setup() 之后。
+       VA_LEG=0 时内部直接返回 —— 不加载着色器、不换材质，画面与未加本层时逐像素相同。 */
+    leg_.setup();
 
 
     aim_at_road();
@@ -1065,6 +1146,12 @@ void WorldSim::spawn_entity_nodes() {
 
 // 单位节点若数量对不上（例如增援/重开一局），整体重建
 void WorldSim::sync_entity_nodes() {
+    /* 跑动节奏：在**位置已更新之后**取一帧的相位与包络（时间基是 va::W.t）。
+       放在这里而不是 _process 里，是因为本函数有 4 个调用点，而"同步了位置"
+       才是动作的输入前提 —— 漏掉任何一处都会让那一帧的动作滞后一帧。
+       同一帧被调多次时内部 dt=0，一切保持，不会把包络抖掉。 */
+    anim_.step(va::W.units);
+
     if (unit_nodes_.size() != va::W.units.size()) {
         va_trace("sync:rebuild units");
         for (auto *n : unit_nodes_) n->queue_free();
@@ -1125,6 +1212,16 @@ void WorldSim::sync_entity_nodes() {
         // VA_DBG_UNITS 就会把"自己 d=0.00 m"报成"自己 61 米外"，
         // 那正是这个探针唯一要回答的问题。
         //
+        // 跑动节奏用**右乘**叠在姿态之后：unit_transform 仍然独占"人在哪、朝哪、
+        // 倒没倒"这三件事，跑动层只加"自己在动"的局部摆动。
+        // 这样倒地/朝向的判据不会因为加动作而改变（VA_UNIT_SHOW 检阅台也走这条）。
+        const UnitAnim::PoseVals pv = anim_.pose_vals(i);
+        n->set_transform(unit_transform(u.x, u.y, u.facing, u.downed)
+                         * UnitAnim::pose_transform(pv));
+        /* 双腿交替（见 node/unit_leg.h）：把**同一帧的同一个相位**喂给网格顶点位移层。
+           显式取一次 pose_vals 再复用，而不是再走一遍 local_pose —— 后者内部会重算，
+           一旦两处取到的不是同一帧的值，腿和躯干就会差一帧，快进时肉眼可见。 */
+        leg_.apply(n, unit_model_key(u), pv.leg_phase, pv.leg_deg);
     }
     for (size_t i = 0; i < va::W.vehicles.size(); ++i) {
         const va::Vehicle &v = va::W.vehicles[i];
@@ -1218,6 +1315,10 @@ void WorldSim::_process(double p_delta) {
 
     sync_entity_nodes();
     va_trace("_process:sync ok");
+
+    // VA_DBG_RUN=1：每秒打一行"跑动人数 / 最快速度"。**静帧截图证明不了"在跑"**，
+    // 这条数字才是"确实有单位被驱动"的判据（相位在动、幅度不为 0）。
+    anim_.tick_diag(p_delta);
 
     // 相机跟随：位置取玩家单位，朝向由 yaw/pitch 决定
     const va::Unit *p = va::W.player;
@@ -1645,6 +1746,13 @@ void WorldSim::on_end(const std::string &kind, const std::string &text) {
             UtilityFunctions::print(String::utf8("[snd] 未登记 id（P1 待补）: "), snd_.unknown_summary());
         }
     }
+    // 跑动层收尾：这一局到底有多少个单位被真正驱动过。VA_DBG_RUN=1 时打。
+    if (std::getenv("VA_DBG_RUN") != nullptr) {
+        UtilityFunctions::print(String::utf8("[run] 收尾："), anim_.dump());
+        /* 腿摆层一并收尾。**「一条腿都没挂上」和「挂上了但摆角一直是 0」是两种
+           完全不同的故障**，而画面上都表现为"腿没摆" —— 这个数就是把它们分开的那一条。 */
+        UtilityFunctions::print(String::utf8("[leg] 收尾："), leg_.dump());
+    }
     /* 「转进」= 这一关打下来了、还有下一关 —— 它和"成功/胜利/失败"不是一回事：
        战绩全达标但没过关（比如撤离人数不够）也会走 end_game，那种不能推进关卡。
        所以只认 end_game 给出的 kind，不自己看 stats 反推。 */
@@ -1760,6 +1868,7 @@ String WorldSim::get_diag() const {
     s += String::utf8(" · 掩体 ") + String::num_int64((int64_t)va::W.props.size());
     s += String::utf8(" · 路线点 ") + String::num_int64((int64_t)va::CONVOY_WAY.size());
     s += String::utf8(" · ");
+    s += anim_.dump();
     return s;
 }
 
