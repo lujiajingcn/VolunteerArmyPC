@@ -13,6 +13,7 @@
 #include <godot_cpp/variant/string.hpp>
 
 #include "node/audio.h"
+#include "node/fx_layer.h"
 #include "node/hud.h"
 #include "node/scene_builder.h"
 #include "node/unit_anim.h"
@@ -113,6 +114,11 @@ private:
        与 anim_ 同一类：只读逻辑层状态、挂在 sync_entity_nodes 里、
        **VA_LEG=0 时完全不动作**（连材质都不换），删掉不影响任何逻辑。 */
     UnitLeg leg_;
+    /* 射击光效（见 node/fx_layer.h）：枪口焰 / 曳光弹 / 弹着火花，
+       全部从逻辑层**早就在发**的 fx 与 projectiles 里读，按阵营分色。
+       与 anim_/leg_ 同一类：只读逻辑层状态、删掉不影响任何逻辑；
+       **VA_FX=0 时一个节点都不建**，画面与未加本层时逐像素相同。 */
+    FxLayer fx_;
     std::vector<godot::Node3D *> unit_nodes_;
     std::vector<godot::Node3D *> veh_nodes_;
     godot::Node3D *box_node_ = nullptr;

@@ -781,6 +781,11 @@ void WorldSim::_ready() {
        VA_LEG=0 时内部直接返回 —— 不加载着色器、不换材质，画面与未加本层时逐像素相同。 */
     leg_.setup();
 
+    /* 射击光效层（见 node/fx_layer.h）：枪口焰 / 曳光弹 / 弹着火花，按阵营分色。
+       挂在 this（WorldSim 自己）而不是 cam_ —— 光效属于世界，不跟着镜头走。
+       传 cam_ 只为近距剔除（玩家自己那发枪口焰在相机前 0.4 m，不剔除会糊屏）。
+       与 snd_ 同性质：只读逻辑层的 fx / projectiles，一行逻辑都不改。 */
+    fx_.setup(this, cam_);
 
     aim_at_road();
     sync_entity_nodes();
@@ -1353,6 +1358,14 @@ void WorldSim::_process(double p_delta) {
 
     va_trace("_process:cam ok");
 
+    /* 射击光效（见 node/fx_layer.h）。位置有讲究：必须在**相机更新之后** ——
+       近距剔除和曳光弹的条带朝向都要用当帧的相机位置；
+       也必须在 sync_entity_nodes 之后 —— 枪口坐标是单位逻辑坐标推出来的。
+       它只读逻辑层的 fx / projectiles，不写回任何状态，也不改任何判定。
+       第三个参数是**本帧推进的逻辑秒数**（n 步 × 1/60），不是墙钟 ——
+       枪口焰只有 0.055 s，掉帧或 VA_FF 快进时一帧能推进 0.1~0.13 s，
+       用"当前时刻落在窗口内"去判会整帧跳过闪光。详见 fx_layer.h 的 step 说明。 */
+    fx_.step(va::W, (float)p_delta, (float)((double)n * H));
 
     // HUD：采样世界状态 + 推进动画。整屏内容一次 _draw() 画完，
     // 所以这里只需每帧调一次 update（它内部会 queue_redraw）。
@@ -1753,6 +1766,12 @@ void WorldSim::on_end(const std::string &kind, const std::string &text) {
            完全不同的故障**，而画面上都表现为"腿没摆" —— 这个数就是把它们分开的那一条。 */
         UtilityFunctions::print(String::utf8("[leg] 收尾："), leg_.dump());
     }
+    /* 光效层收尾：本局一共画过多少发枪口焰、其中敌方占几发、曳光弹峰值多少。
+       **「一个光效都没画」和「画了但都落在镜头外」是两种故障**，
+       而画面上都表现为"没看见光" —— 这个数把它们分开。 */
+    if (std::getenv("VA_DBG_FX") != nullptr || std::getenv("VA_DBG_RUN") != nullptr) {
+        UtilityFunctions::print(String::utf8("[fx] 收尾："), fx_.dump());
+    }
     /* 「转进」= 这一关打下来了、还有下一关 —— 它和"成功/胜利/失败"不是一回事：
        战绩全达标但没过关（比如撤离人数不够）也会走 end_game，那种不能推进关卡。
        所以只认 end_game 给出的 kind，不自己看 stats 反推。 */
@@ -1846,6 +1865,10 @@ void WorldSim::reset_mission() {
        而且"失败 → 重打"会越打越弱，最后变成无解。
        camp_level_ 不动：reset 是"重来这一关"，转进才改关卡下标。 */
     begin_level();
+    /* 光效层也要清空：逻辑层 init_world 里已经 W.fx.clear()、projectiles 也重建了，
+       但表现层的池是有状态的（哪些槽在用、曳光弹 mesh 里还留着上一局的线段）。
+       不清的话，重开的第一帧会闪出上一局最后那几发弹的曳光。 */
+    fx_.reset();
 }
 
 Dictionary WorldSim::get_status() const {
