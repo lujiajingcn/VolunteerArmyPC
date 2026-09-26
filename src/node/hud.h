@@ -97,6 +97,12 @@ public:
     bool   take_start();
     // 玩家选了退出
     bool   take_quit();
+    // 玩家在简报里按了 V：重播任务介绍语音（消费一次）
+    bool   take_replay();
+    /* 语音层是否可用（world_sim 在 _ready 里同步一次）。
+       不可用时简报页不画"V 重播任务介绍"—— 提示了一个按不出声音的键，
+       比不提示更糟。 */
+    void   set_vo_ready(bool p_on) { vo_ready_ = p_on; }
 
     // ---- 视图模型的引用（world_sim 在 _ready 里挂一次）----
     // 【为什么需要它】开镜时准星是**刻意**让位给枪上那颗红点的（见 draw_crosshair），
@@ -218,6 +224,8 @@ private:
     float  brief_t_ = 0;          // 简报停留时长
     bool   start_req_ = false;    // 玩家确认开始（take_start 消费）
     bool   quit_req_ = false;     // 玩家选择退出（take_quit 消费）
+    bool   replay_req_ = false;   // 玩家按 V 重播语音（take_replay 消费）
+    bool   vo_ready_ = false;     // 语音层可用？（决定简报页画不画 V 提示）
 
     // ======================================================== 各区块
     void draw_compass();          // 顶部罗盘刻度带（含目标方位标记）

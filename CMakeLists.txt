@@ -43,6 +43,7 @@ set(VA_SOURCES
     src/node/viewmodel.cpp
     src/node/hud.cpp
     src/node/audio.cpp
+    src/node/voice.cpp
     src/node/unit_anim.cpp
     src/node/unit_leg.cpp
     src/node/fx_layer.cpp

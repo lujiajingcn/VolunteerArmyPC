@@ -785,6 +785,15 @@ void WorldSim::_ready() {
     if (va::W.player != nullptr) snd_.set_listener(va::W.player->x, va::W.player->y);
     va_trace("_ready:snd ok");
 
+    /* 任务介绍语音（见 node/voice.h）。与音效层并列的一条独立声部：
+       简报页一打开就把这一关的任务念出来。同样必须在 cam_ 之后 ——
+       它虽然不空间化（旁白居中），但声部要挂在场景树上。 */
+    vo_.setup(this);
+    /* 告诉 HUD 语音可不可用 —— 简报页据此决定画不画"V 重播任务介绍"。
+       放在 vo_.setup 之后：VO 的开关与素材载入结果都在那一步才定下来。 */
+    if (hud_ != nullptr) hud_->set_vo_ready(vo_.enabled() && vo_.loaded() > 0);
+    va_trace("_ready:vo ok");
+
     /* 跑动节奏层（见 node/unit_anim.h）。与音频层同性质：只读逻辑层状态。
        放在 sync 之前 —— 第一帧就要能算出姿态。 */
     anim_.setup();
@@ -1289,6 +1298,7 @@ void WorldSim::_process(double p_delta) {
     if (shell_owns_input()) {
         if (hud_ != nullptr) {
             hud_->update(p_delta);
+            vo_step();   // 进出简报时起停任务介绍语音（见 vo_step）
             if (hud_->take_start()) { enter_play(); return; }
             if (hud_->take_quit()) { get_tree()->quit(); return; }
         }
@@ -1707,6 +1717,14 @@ void WorldSim::apply_key(Key p_code, bool p_down) {
                 if (in != nullptr) in->set_mouse_mode(Input::MOUSE_MODE_VISIBLE);
             }
             break;
+        /* B：重播任务介绍语音（纯表现层，只动 Voice，不碰 va:: 里任何逻辑量）。
+           【为什么战斗中也要给这个键】简报页通常只停十几秒，玩家读完就按开始了；
+           而开打之后还有 30 秒情报 + 120 秒部署，那才是"想再听一遍"的时候。
+           只把重播锁在简报页，等于逼玩家为了听清楚而赖在简报页不走。
+           【为什么是 B 不是 V】见简报页那段说明：V 已经给了"切武器外观"。 */
+        case Key::KEY_B:
+            if (p_down) vo_.play(va::cur_level().id);
+            break;
         default: break;
     }
 }
@@ -1737,7 +1755,42 @@ void WorldSim::clear_held_input(bool p_reacquire_ok) {
 }
 
 // 从任务简报切进战斗。
+// ---------------------------------------------------------------- 任务介绍语音
+void WorldSim::vo_step() {
+    if (hud_ == nullptr || !vo_.enabled()) return;
+
+    const int sc = (int)hud_->screen();
+    if (sc == vo_screen_) {
+        /* 同一屏期间只处理一件事：简报页里按 V 重播。
+           （不是"每帧重放"—— 那是 60 次每秒的重启，还听不出是重播。） */
+        if (sc == (int)Hud::SCREEN_BRIEF && hud_->take_replay()) {
+            vo_.play(va::cur_level().id);
+        }
+        return;
+    }
+
+    /* 换屏了。进简报 = 念这一关的任务介绍；进菜单 = 念一次开场。
+       菜单那条**只念一次**：玩家在菜单里来回点（简报 → Esc → 简报）不该被
+       反复念同一句。简报那条则每次进都念 —— 它是"这一关要干什么"，
+       重打、转进、Esc 回来重看，都需要再听一遍。 */
+    if (sc == (int)Hud::SCREEN_BRIEF) {
+        vo_.play(va::cur_level().id);
+    } else if (sc == (int)Hud::SCREEN_MENU && !vo_menu_done_) {
+        vo_menu_done_ = true;
+        vo_.play("menu");
+    }
+    vo_screen_ = sc;
+}
+
 void WorldSim::enter_play() {
+    /* 开打就把旁白停掉：玩家已经按了开始，语音还在念"各就各位"就错位了 ——
+       更实际的是，简报可以只读两秒就按开始，剩下十几秒的人声会盖住接敌第一枪。
+       想再听一遍随时按 B（apply_key 里有），部署期长达 150 秒，够听好几遍。 */
+    if (vo_.playing()) {
+        godot::UtilityFunctions::print(godot::String::utf8(
+            "[vo] 进入战斗 —— 停掉没播完的任务介绍（按 B 可随时重播）"));
+    }
+    vo_.stop();
     if (hud_ != nullptr) hud_->set_screen(Hud::SCREEN_PLAY);
     Input *in = Input::get_singleton();
     if (in != nullptr) in->set_mouse_mode(Input::MOUSE_MODE_CAPTURED);
@@ -1898,6 +1951,7 @@ void WorldSim::begin_level() {
 
 /* 结算面板上按 R：过关了就往下走，没打过就重打这一关。 */
 void WorldSim::advance_level() {
+    const int level_before = camp_level_;
     if (camp_won_) {
         /* 六关都打完了 → 重新入伍。**必须把 CARRY 清掉**：
            不清的话新战役第一关会带着上一轮最后那几个人进来。 */
@@ -1914,6 +1968,15 @@ void WorldSim::advance_level() {
     camp_cleared_ = false;
     camp_won_ = false;
     reset_mission();
+
+    /* 换到新阵地 = 一次新任务，把这一关的任务介绍念一遍。
+       【为什么不放进 reset_mission】那个函数同时管"打输了重打这一关"，
+       而重打同一关再念一遍同样的话很烦。这里用"关卡下标有没有真的变"来分：
+         · 转进（camp_cleared_）→ +1，变了 → 念；
+         · 打完第五关重新入伍（camp_won_）→ 归零，也变了 → 念；
+         · 打输了重打本关 → 没变 → 不念（玩家按 B 还是能自己听）。
+       顺序上必须在 reset_mission **之后** —— 它内部会把语音停掉。 */
+    if (camp_level_ != level_before) vo_.play(va::cur_level().id);
 }
 
 void WorldSim::start_mission(bool p_skip_deploy) {
@@ -1932,6 +1995,12 @@ void WorldSim::reset_mission() {
        但表现层的池是有状态的（哪些槽在用、曳光弹 mesh 里还留着上一局的线段）。
        不清的话，重开的第一帧会闪出上一局最后那几发弹的曳光。 */
     fx_.reset();
+    /* 语音侧同样要清一次：调度只看"HUD 当前停在哪一屏"（vo_screen_），
+       重开一局若不清这个样本，下一帧会被当成"屏没变"——
+       而那时玩家可能已经退回简报页，于是新一关的任务介绍一声不吭。
+       vo_menu_done_ 刻意**不重置**：菜单开场白整场会话只念一次。 */
+    vo_.stop();
+    vo_screen_ = -1;
 }
 
 Dictionary WorldSim::get_status() const {

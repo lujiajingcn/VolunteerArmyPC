@@ -19,6 +19,7 @@
 #include "node/unit_anim.h"
 #include "node/unit_leg.h"
 #include "node/viewmodel.h"
+#include "node/voice.h"
 #include "sim/va_world.h"
 #include "sim/va_campaign.h"   // 战役：关卡表 / 跨关花名册（CarryOver）
 
@@ -107,6 +108,10 @@ private:
     godot::Camera3D *cam_ = nullptr;
     ViewModel vm_;                 // 第一人称武器视图模型（相机的子节点）
     Audio snd_;                    // 音效层：SimEvents::on_sfx 的落点（见 node/audio.h）
+    /* 任务介绍语音（见 node/voice.h）：把简报页那几行"这是哪、打谁、干什么"
+       念出来。与 snd_ 同一类 —— 表现层的东西，删掉不影响任何逻辑，
+       **VA_VO=0 时素材不载、声部不建**。 */
+    Voice vo_;
     /* 单位跑动节奏（见 node/unit_anim.h）。与 snd_ 同一类：只读逻辑层状态、
        挂在 sync_entity_nodes 里、删掉不影响任何逻辑。 */
     UnitAnim anim_;
@@ -150,6 +155,14 @@ private:
     void init_level_world();       // 只铺逻辑世界（_ready 用：那时静态场景还没建）
     void begin_level();            // 按 camp_level_ 铺关并把队伍带进去
     void advance_level();          // 结算面板按 R：过关就转进下一阵地，否则重打本关
+
+    /* 任务介绍语音的调度：看 HUD 当前停在哪一屏，进出简报时起停语音。
+       【为什么由表现层看屏幕，而不是逻辑层发"简报开始"事件】简报是外壳的一屏，
+       逻辑层在菜单/简报期间**一步都没走过**（见 _process 开头的冻结说明）——
+       压根没有"某一帧"可以发那个事件。屏幕状态就在 hud_ 手里，就近判断最省事。 */
+    void vo_step();
+    int  vo_screen_ = -1;          // 上一帧的 HUD 屏幕（-1 = 还没样本）
+    bool vo_menu_done_ = false;    // 菜单语音只播一次（回菜单不重复念）
 
     // 音频节流（同一音效 id 在极短时间内不重复触发）
     double last_sfx_t_ = 0.0;

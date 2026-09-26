@@ -69,6 +69,14 @@ struct SndDef {
 // 按 id 查参数；找不到返回 nullptr。
 const SndDef *snd_lookup(const std::string &p_id);
 
+/* 载入一个 wav：先走编辑器导入那条（若存在），再直接读盘。
+   【为什么是自由函数】本工程所有 wav 都是脚本烘出来的，从没经过 Godot 编辑器的
+   导入工序（res:// 下没有 .import），所以 `ResourceLoader` 那条路常常找不到、
+   必须回落到 `AudioStreamWAV::load_from_file`。这个"两条路都试"的约定原先只写在
+   audio.cpp 的匿名命名空间里，语音层（voice.cpp）同样的坑要再踩一遍 ——
+   提出来共用，省得两边慢慢走岔。 */
+godot::Ref<godot::AudioStream> load_wav_resource(const godot::String &p_res_path);
+
 class Audio {
 public:
     // 建语音池 + 载入素材 + 铺一条带限幅的 SFX 总线。

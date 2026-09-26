@@ -99,9 +99,13 @@ double now_s(double p_t0) {
     return (double)t->get_ticks_usec() / 1e6 - p_t0;
 }
 
+} // namespace
+
 // 载入一个 wav：先走编辑器导入那条（若存在），再直接读盘。
 // 顺序与理由见 hud.cpp:1955-1991（那里是 PNG，这里是 wav，同一个坑）。
-godot::Ref<godot::AudioStream> load_wav(const godot::String &p_res_path) {
+// 【注意】它**不在**匿名命名空间里 —— 语音层（node/voice.cpp）要共用同一份实现，
+// 声明在 audio.h。改这里时两边一起受益，别在 voice.cpp 里再抄一份。
+godot::Ref<godot::AudioStream> load_wav_resource(const godot::String &p_res_path) {
     godot::ResourceLoader *rl = godot::ResourceLoader::get_singleton();
     if (rl != nullptr && rl->exists(p_res_path)) {
         godot::Ref<godot::AudioStream> s = rl->load(p_res_path);
@@ -113,8 +117,6 @@ godot::Ref<godot::AudioStream> load_wav(const godot::String &p_res_path) {
     }
     return godot::Ref<godot::AudioStream>();
 }
-
-} // namespace
 
 // ============================================================ 查表
 const SndDef *snd_lookup(const std::string &p_id) {
@@ -210,7 +212,7 @@ void Audio::setup(godot::Node3D *p_parent, godot::Camera3D *p_cam) {
         const godot::String path = godot::String("res://assets/audio/") +
                                    godot::String(kSnd[i].id) + godot::String(".wav");
         ++attempted_;
-        godot::Ref<godot::AudioStream> s = load_wav(path);
+        godot::Ref<godot::AudioStream> s = load_wav_resource(path);
         if (s.is_valid()) {
             streams_[(size_t)i] = s;
             ++loaded_;

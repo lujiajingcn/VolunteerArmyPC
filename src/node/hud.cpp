@@ -2399,17 +2399,27 @@ void Hud::draw_brief() {
     // ---- 下部：小队名册（填满左右两栏之下的整宽空带，关于视口中轴对称）----
     draw_roster(vp_.x * 0.5f, 626.0f * s_);
 
-    // ---- 底部：开始 / 返回 ----
+    // ---- 底部：开始 / 返回 / 重播语音 ----
     const float pulse = 0.70f + 0.30f * std::sin(brief_t_ * 3.6f);
     tx_c(String::utf8("按 Enter 或点击任意处开始行动"), vp_.x * 0.5f, vp_.y - 90.0f * s_, 22,
          Color(0.96f, 0.68f, 0.26f, pulse));
-    tx_c(String::utf8("Esc 返回主菜单"), vp_.x * 0.5f, vp_.y - 60.0f * s_, 13, c_shell_faint());
+    /* 「进入简报即自动念一遍」是主路径，B 是给"没听清/想再听"的人的补手。
+       【为什么是 B 不是 V】V 已经被"切武器外观"占了（见 apply_key 里那段注释）；
+       在剩下的字母里，briefing 的首字母最能自解释，也不与任何移动/射击键相撞。
+       语音层不可用时（VA_VO=0 或素材全缺）**不画右半段** ——
+       提示了一个按不出声音的键，比不提示更糟。 */
+    tx_c(vo_ready_ ? String::utf8("Esc 返回主菜单    ·    B 重播任务介绍")
+                   : String::utf8("Esc 返回主菜单"),
+         vp_.x * 0.5f, vp_.y - 60.0f * s_, 13, c_shell_faint());
 }
 
 // ---------------------------------------------------------------- 外壳状态机
 void Hud::set_screen(Screen s) {
     if (s == screen_) return;
     screen_ = s;
+    /* 离开简报页就丢掉没被消费掉的重播请求：否则在简报里按了 V 又立刻 Esc，
+       那个请求会一直挂着，下次进简报时多触发一次播放（同一句连着念两遍）。 */
+    if (s != SCREEN_BRIEF) replay_req_ = false;
     if (s == SCREEN_MENU) {
         menu_sel_ = 0;
         menu_t_ = 0.0f;
@@ -2449,6 +2459,10 @@ bool Hud::shell_key(int64_t p_keycode) {
     // 简报
     if (k == Key::KEY_ENTER || k == Key::KEY_KP_ENTER || k == Key::KEY_SPACE) {
         start_req_ = true;
+        return true;
+    }
+    if (k == Key::KEY_B) {
+        replay_req_ = true;   // 重播任务介绍语音（world_sim 的 vo_step 消费）
         return true;
     }
     if (k == Key::KEY_ESCAPE) {
@@ -2495,6 +2509,12 @@ bool Hud::take_start() {
 bool Hud::take_quit() {
     if (!quit_req_) return false;
     quit_req_ = false;
+    return true;
+}
+
+bool Hud::take_replay() {
+    if (!replay_req_) return false;
+    replay_req_ = false;
     return true;
 }
 
