@@ -15,6 +15,7 @@
 #include <godot_cpp/classes/material.hpp>
 #include <godot_cpp/classes/mesh.hpp>
 #include <godot_cpp/classes/quad_mesh.hpp>
+#include <godot_cpp/classes/viewport.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include "node/scene_builder.h"
@@ -161,6 +162,47 @@ String px_str(const Vector2 &p_v) {
     return String::num(p_v.x, 0) + String::utf8(",") + String::num(p_v.y, 0);
 }
 
+/* 两个方向之间的夹角（度）。用于"玩家弹道指着准星没有"这条判据。
+   取世界坐标而不是屏幕坐标：屏幕坐标要相机真的渲染过才有视口尺寸，
+   `--headless` 下拿不到，而这个数要在 headless 回归里也能读。 */
+float angle_deg(const Vector3 &p_a, const Vector3 &p_b) {
+    const Vector3 a = p_a.normalized();
+    const Vector3 b = p_b.normalized();
+    if (a.length_squared() < 1e-8f || b.length_squared() < 1e-8f) return -1.0f;
+    return std::acos(std::max(-1.0f, std::min(1.0f, a.dot(b)))) * 57.2957795f;
+}
+
+/* 相机**视线方向**（Godot 相机看向自身 -Z）。相机的旋转含俯仰，
+   所以这就是"准星指着哪"。相机不在（离线/检阅台）时返回 false。 */
+bool cam_forward(const Camera3D *p_cam, Vector3 &r_fwd) {
+    if (p_cam == nullptr) return false;
+    r_fwd = -p_cam->get_global_transform().basis.get_column(2);
+    if (r_fwd.length_squared() < 1e-8f) return false;
+    r_fwd = r_fwd.normalized();
+    return true;
+}
+
+/* **屏幕空间**的判据：把弹道的两端投到屏幕上，量"它在屏幕上指偏准星多少度"。
+   准星画在**视口中心**（hud.cpp 的 draw_crosshair: `c = vp_ * 0.5f`），
+   所以这一条用的是"屏幕上那个真的准星"，不再依赖"相机 -Z = 屏幕中心射线"的推导 ——
+   它是上面那条世界空间判据的**独立复核**。
+   视口尺寸拿不到时返回 -999（`--headless` 下没有真实视口）——
+   用 -999 而不是 -1，是为了与一个合法的 "-1.0°" 分开。 */
+float screen_aim_deg(const Camera3D *p_cam, const Vector3 &p_a, const Vector3 &p_b) {
+    if (p_cam == nullptr) return -999.0f;
+    const Viewport *vp = p_cam->get_viewport();
+    if (vp == nullptr) return -999.0f;
+    const Vector2 sz = vp->get_visible_rect().size;
+    if (sz.x < 8.0f || sz.y < 8.0f) return -999.0f;
+    const Vector2 pa = p_cam->unproject_position(p_a);
+    const Vector2 pb = p_cam->unproject_position(p_b);
+    const Vector2 v1 = pb - pa;          // 屏幕上弹道的走向
+    const Vector2 v2 = sz * 0.5f - pa;   // 屏幕上"枪口 → 准星"的走向
+    if (v1.length_squared() < 4.0f || v2.length_squared() < 4.0f) return -999.0f;
+    const float crs = v1.x * v2.y - v1.y * v2.x;
+    return std::atan2(crs, v1.dot(v2)) * 57.2957795f;   // 带符号
+}
+
 } // namespace
 
 // ============================================================ setup
@@ -182,6 +224,8 @@ void FxLayer::setup(Node3D *p_parent, Camera3D *p_cam) {
     spark_on_ = env_flag("VA_FX_SPARK", true);
     // 玩家自己的弹道起点用枪模枪口（见 set_player_muzzle）。关掉即回退旧口径。
     pmuz_on_ = env_flag("VA_FX_PMUZ", true);
+    // 玩家弹道的**方向**走"枪口 → 准星"（相机视线）。关掉即退回水平逻辑弹道方向。
+    paim_on_ = env_flag("VA_FX_PAIM", true);
     /* ⚠️ 增益**不能给大**。光效走加色混合，颜色本身已被推到 HDR；
        再乘 3.0 会让三个通道全部远超 1.0，经 ACES 色调映射后**统一压成纯白** ——
        实测扫图（sweep/v_fx_look/cap_220s.png）确认：友军冷青白变成了纯白，
@@ -397,8 +441,22 @@ void FxLayer::build_tracers(const va::WorldState &p_w) {
     tracer_mesh_->clear_surfaces();
     const Vector3 cam = (cam_ != nullptr) ? cam_->get_global_position() : Vector3();
 
+    /* 玩家自己那发弹的**方向** = 从枪口指向准星（见 .h 的 set_player_muzzle）。
+       准星画在屏幕中心 ⇒ "指向准星"就是"沿相机视线方向"，而相机视线**带俯仰**。
+       ⚠️ 为什么不能用逻辑弹道方向 `atan2(vy, vx)`：那是**水平**的（俯仰被逻辑层
+       折算成"有效射程"，见 va_units.cpp:75），抬枪/压枪时它会指着地平线而不是准星。
+       屏幕上看就是"弹道偏出准星整整一个俯仰角"。"从枪口位置到准星"这条需求
+       指的就是这里 —— 起点（枪口）上一版已经修好，这一版修的是方向。 */
+    Vector3 aim_fwd;
+    /* ⚠️ 只在**取方向**这一步看 paim_on_；测偏角那一步不看 —— 否则
+       VA_FX_PAIM=0 时量不出数，"旧口径偏了多少度"就没了对照。 */
+    const bool aim_ok = cam_forward(cam_, aim_fwd);
+
     bool begun = false;
     last_pmuz_ = 0;
+    last_pmuz_skip_ = 0;
+    last_paim_dev_ = -1.0f;
+    last_paim_screen_ = -999.0f;
     for (const va::Projectile &p : p_w.projectiles) {
         if (!is_tracer_kind(p.kind)) continue;
 
@@ -430,20 +488,31 @@ void FxLayer::build_tracers(const va::WorldState &p_w) {
         }
 
         if (own) {
-            /* 玩家自己：以枪口为原点，沿**逻辑弹道方向**按"已经飞出多远"截取一段。
+            /* 玩家自己：以枪口为原点，沿**枪口 → 准星**的方向按"已经飞出多远"截取一段。
                ⚠️ 不能照搬通用路径的"从子弹位置往回退 kTracerLen"：玩家那颗弹出膛后
                前几帧仍在相机前方 0.4 m 处，往回退 2.3 m 会得到一段**穿过玩家自己身体**
                的线（起点跑到相机背后去）。按"飞了多远"截取天然满足"起点永不早于枪口"，
                且第一帧就是从枪口射出的一小段 —— 这正是需求要的观感。
-               方向取逻辑层的弹道角 a：它与命中判定同源，且逻辑层弹道本来就躺在
-               水平面上（俯仰由"有效射程"折算，见 va_units.cpp:75）。 */
+               方向用**相机视线**（含俯仰），不是逻辑层的水平弹道角 a —— 理由见本函数开头。
+               相机不在或 VA_FX_PAIM=0 时退回水平口径，两种口径各自是两步消融的一档。 */
             const float spd_lu = std::sqrt(p.vx * p.vx + p.vy * p.vy);
             const float flown_m = spd_lu * p.t * S;      // p.t = 出膛后经过的逻辑秒数
             const float head_m = std::max(flown_m, kOwnHeadMin);
             const float tail_m = std::max(0.0f, head_m - kTracerLen);
-            d = Vector3(std::cos(a), 0.0f, std::sin(a));
+            d = (aim_ok && paim_on_) ? aim_fwd : Vector3(std::cos(a), 0.0f, std::sin(a));
             A = pmuz_ + d * tail_m;
             B = pmuz_ + d * head_m;
+            /* 方向判据（两条，互为独立复核）：
+               ① 世界空间 —— 本条弹道方向与"准星方向（相机视线）"的夹角；
+               ② 屏幕空间 —— 把两端投到屏幕上，量它指偏屏幕中心（= 准星）多少度。
+               新口径两条都是 ~0°；退回水平口径（VA_FX_PAIM=0）时 ① ≈ 当时的俯仰角。
+               留两条是因为 ① 依赖"相机 -Z == 屏幕中心射线"这个推导，而 ② 用的是
+               屏幕上真正的准星位置（hud.cpp: draw_crosshair 的 vp_*0.5）——
+               ② 拿不到视口时（--headless）自己会返回 -999，不影响 ①。 */
+            if (aim_ok) {
+                last_paim_dev_ = angle_deg(d, aim_fwd);
+                last_paim_screen_ = screen_aim_deg(cam_, A, B);
+            }
             ++last_pmuz_;
         } else {
             const float h = ground_h(p.x, p.y) + kTracerH;
@@ -477,7 +546,10 @@ void FxLayer::build_tracers(const va::WorldState &p_w) {
         const Vector3 to_cam = cam - mid;
         if (to_cam.length_squared() < 1e-6f) continue;
         Vector3 side = d.cross(to_cam.normalized());
-        if (side.length_squared() < 1e-8f) continue;   // 正对着看：投影不出宽度，跳过
+        if (side.length_squared() < 1e-8f) {
+            if (own) ++last_pmuz_skip_;   // 见 .h 的 last_pmuz_skip_：这是新方向引入的风险
+            continue;   // 正对着看：投影不出宽度，跳过
+        }
         /* 宽度两步走：先按"世界尺寸下限"与"远处最小角宽"取大（保证远处看得见），
            再用"近处角宽上限"收回（保证近处不会摊成一块白片 —— 玩家自己那发
            整段都在枪口前 1~3 m 内，是唯一的实际受益者）。见 kTracerNearAng 的说明。 */
@@ -615,6 +687,11 @@ void FxLayer::reset() {
        从地图另一头凭空长出。下一帧 WorldSim 会重新喂进来。 */
     pmuz_valid_ = false;
     last_pmuz_ = 0;
+    last_pmuz_skip_ = 0;
+    last_paim_dev_ = -1.0f;
+    /* 屏幕角也要清：它只在 last_paim_dev_ >= 0 时才被打印，留着上一关的旧值
+       会跟下一关新算出的世界角**配错对**（两个数来自不同时刻的弹）。 */
+    last_paim_screen_ = -999.0f;
 }
 
 // ============================================================ 诊断
@@ -651,6 +728,27 @@ String FxLayer::dump() const {
            + px_str(cam_ != nullptr ? cam_->unproject_position(pmuz_) : Vector2())
            + String::utf8(" · 距相机 ") + String::num((double)std::sqrt(pmuz_.distance_squared_to(cp)), 2)
            + String::utf8("m · 本帧走枪口路径 ") + String::num((double)last_pmuz_);
+    }
+
+    /* 玩家弹道的**方向**：走"枪口 → 准星"（相机视线）还是退回水平口径，
+       以及本帧那一发**方向偏离准星多少度**。"轨迹应该从枪口到准星"这条需求
+       修的就是它：旧口径下这个角≈当时的俯仰角，新口径下是 0.00°。
+       顺带验的是"取相机 -Z 那一列"没取错（取成 +Z 会读 180°、取成 Y 会读 90°）。 */
+    if (!paim_on_) {
+        s += String::utf8(" · 玩家弹道方向 **VA_FX_PAIM=0**（退回水平口径）");
+    }
+    if (last_paim_dev_ >= 0.0f) {
+        s += String::utf8(" · 玩家弹道方向偏离准星 ") + String::num((double)last_paim_dev_, 2)
+           + String::utf8("°");
+        if (last_paim_screen_ > -900.0f) {
+            s += String::utf8("（屏幕上 ") + String::num((double)std::fabs(last_paim_screen_), 2)
+               + String::utf8("°）");
+        }
+    }
+    // 只在非 0 时才报：0 是常态，每行都打会把这一行撑得读不动。
+    if (last_pmuz_skip_ > 0) {
+        s += String::utf8(" · ⚠️ 玩家弹道正对镜头被跳过 ") + String::num((double)last_pmuz_skip_)
+           + String::utf8("（应恒为 0）");
     }
     return s;
 }
