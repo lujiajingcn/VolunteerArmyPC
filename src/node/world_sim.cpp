@@ -928,6 +928,17 @@ void WorldSim::dbg_input_key(int64_t p_code, bool p_pressed, bool p_echo) {
                             String::utf8(" ctrl="), va::IN.ctrl ? 1 : 0);
 }
 
+/* 鼠标键的事件表（与上面按键那张表并列，但**没有** echo 这一列 —— 鼠标不会
+   被操作系统重发按下）。ads 与 fire 是这两颗键唯一的产物，直接打在结果里：
+   「点一下右键 → IN.ads 变没变」在这里一眼可读，不必去数 FOV 或看准星。 */
+void WorldSim::dbg_input_btn(int64_t p_button, bool p_pressed) {
+    if (!dbg_input_) return;
+    UtilityFunctions::print(String::utf8("[dbg-input] mouse 键="), p_button,
+                            String::utf8(" pressed="), p_pressed ? 1 : 0,
+                            String::utf8("  →  IN(ads)="), va::IN.ads ? 1 : 0,
+                            String::utf8(" fire="), va::IN.fire ? 1 : 0);
+}
+
 /* 位置心跳。报的是**两次心跳之间的位移**（米）而不是坐标 ——
    "按住了却位移 0" 与 "松开了还在位移" 是同一枚硬币的两面，
    坐标列本身读不出这件事，位移列一眼就能读出来。 */
@@ -1601,17 +1612,35 @@ void WorldSim::_input(const Ref<InputEvent> &p_event) {
 
     if (Ref<InputEventMouseButton> mb = p_event; mb.is_valid()) {
         if (mb->get_button_index() == MouseButton::MOUSE_BUTTON_LEFT && mb->is_pressed()) {
-            if (!captured) { in->set_mouse_mode(Input::MOUSE_MODE_CAPTURED); return; }
+            if (!captured) {
+                in->set_mouse_mode(Input::MOUSE_MODE_CAPTURED);
+                dbg_input_btn(1, true);
+                return;
+            }
             va::IN.fire = true;
             va::IN.firePressed = true;
+            dbg_input_btn(1, true);
             return;
         }
         if (mb->get_button_index() == MouseButton::MOUSE_BUTTON_LEFT && !mb->is_pressed()) {
             va::IN.fire = false;
+            dbg_input_btn(1, false);
             return;
         }
-        if (mb->get_button_index() == MouseButton::MOUSE_BUTTON_RIGHT) {
-            va::IN.ads = mb->is_pressed();
+        /* 右键 = 瞄准**开关**：点一下进、再点一下退（不是"按住才瞄"）。
+           改的只是**写 IN.ads 的时机**，`IN.ads` 本身一格没改 —— 逻辑层只声明、
+           从不读它（`src/sim/` 里 `ads` 只有 va_world.h 那一行声明），所以瞄准
+           始终是**纯表现层**状态：HUD 准星让位 + 枪模开镜姿态 + 相机 FOV。
+           ⇒ **离线基线 va_sweep 不受影响**，`src/sim/` 一行未改。
+
+           ⚠️ 只在鼠标已捕获（= 真在战斗里）时切换。旧口径 `= mb->is_pressed()`
+           是"按住即瞄"，松开自己归位，在菜单/简报里误按一下不留痕迹；改成闩锁
+           之后就必须挡住 —— 否则简报页点一下右键，开镜会被带进战场。
+           另外两条兜底：进界面外壳时 clear_held_input 会清（Esc 释放鼠标 = 收镜），
+           进战斗时 enter_play 再显式清一次。 */
+        if (mb->get_button_index() == MouseButton::MOUSE_BUTTON_RIGHT && mb->is_pressed()) {
+            if (captured) va::IN.ads = !va::IN.ads;
+            dbg_input_btn(2, true);
             return;
         }
         return;
@@ -1916,6 +1945,10 @@ void WorldSim::enter_play() {
     if (hud_ != nullptr) hud_->set_screen(Hud::SCREEN_PLAY);
     Input *in = Input::get_singleton();
     if (in != nullptr) in->set_mouse_mode(Input::MOUSE_MODE_CAPTURED);
+    /* 开打一律先收镜。瞄准是**闩锁**（右键切换，见 _input），而"进战斗"是一条
+       跨模式的入口 —— 带着上一段的开镜状态进来，玩家会莫名其妙举着枪开局。
+       进外壳那条路已由 clear_held_input 清了，这里补另一条入口。 */
+    va::IN.ads = false;
     /* 简报期间逻辑层一步都没走过，实体节点还停在 _ready 建出来的位置上。
        这里对齐一次，并把视线重新指向公路来向 —— 保证"开打"这一帧画面就是对的，
        而不是先闪一帧歪的。 */

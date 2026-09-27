@@ -287,6 +287,11 @@ private:
     double dbg_in_x_ = 0.0, dbg_in_y_ = 0.0;   // 上次心跳时的玩家位置
     bool   dbg_in_have_prev_ = false;          // 第一条心跳只建基准，不报位移
     void   dbg_input_key(int64_t p_code, bool p_pressed, bool p_echo);
+    /* 鼠标键**不在**上面那张表里：它没有「echo」这个概念（操作系统不会像键盘那样
+       重发按下），语义是「按一下 = 一个动作」。右键的"开镜开关"正好属于这类，
+       所以单独一条 —— 没有它，VA_DBG_INPUT 在"只按鼠标、不碰键盘"的场景下
+       一行都不出，右键切换无从取证。p_button 用 Godot 的编号（1=左 2=右）。 */
+    void   dbg_input_btn(int64_t p_button, bool p_pressed);
     void   dbg_input_heartbeat(double p_delta);
 
     // UI：全套使命召唤风格 HUD，手绘在一个 Control 里（见 node/hud.h）

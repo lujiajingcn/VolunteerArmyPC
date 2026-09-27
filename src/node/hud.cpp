@@ -1910,7 +1910,7 @@ void Hud::draw_help() {
     if (a <= 0.01f) return;
 
     const String s = String::utf8(
-        "WASD 移动 · Shift 疾跑 · Ctrl 蹲 · 左键 射击 · 右键 瞄准 · R 换弹 · G 手雷 · F 烟雾 · Z 标记 · Esc 释放鼠标");
+        "WASD 移动 · Shift 疾跑 · Ctrl 蹲 · 左键 射击 · 右键 开镜（切换） · R 换弹 · G 手雷 · F 烟雾 · Z 标记 · Esc 释放鼠标");
     tx_c(s, vp_.x * 0.5f, vp_.y - 8.0f * s_, 13, Color(0.86f, 0.90f, 0.94f, 0.55f * a));
 }
 
