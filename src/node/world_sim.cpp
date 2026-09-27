@@ -1217,6 +1217,13 @@ void WorldSim::setup_runtime_ui() {
     // 上一轮"画面正中央那根黑竖条到底是谁"靠肉眼认几何体认错过一次，
     // 所以凡是"这块黑东西属于哪一层"的问题，一律用消融来答，不靠眼看。
     if (std::getenv("VA_HIDE_HUD") != nullptr) hud_->set_visible(false);
+
+    /* 界面三维主视觉（见 node/menu_stage.h）：挂在**外壳的 CanvasLayer** 上，
+       与 hud_ 同级。放在这里而不是 _ready 更早处，是因为它要用到 layer；
+       放在 hud_ 之后，是为了让"图层顺序"有唯一解释：Hud 先建、舞台后建，
+       于是舞台压在 Hud 之上 —— 主菜单右侧那块与左栏文字不重叠，
+       但把它放在上面是安全的默认（将来若要压字，调 layer 顺序即可）。 */
+    stage_.setup(layer);
 }
 
 void WorldSim::spawn_entity_nodes() {
@@ -1340,6 +1347,14 @@ void WorldSim::sync_entity_nodes() {
 
 void WorldSim::_process(double p_delta) {
     if (cam_ == nullptr) return;
+
+    /* 界面三维主视觉（见 node/menu_stage.h）：**每一帧都要调，而且必须在下面
+       shell_owns_input() 那个提前 return 之前**。
+       它自己按"当前是第几屏"决定显隐（只认菜单屏），所以：
+         · 漏在 return 之前 → 从菜单进战斗之后那块 SubViewport 一直挂在画面上；
+         · 放进外壳分支里 → 进战斗后再也没有一帧把它藏起来，同样漏。
+       时间基用**墙钟** p_delta：外壳期战局 t 冻结，用 t 驱动的话菜单里的章不动。 */
+    if (hud_ != nullptr) stage_.step(p_delta, (int)hud_->screen());
 
     /* 界面外壳期间**冻结战局**：逻辑不步进、实体不同步、视图模型不更新。
        玩家在菜单里按 WASD 不该把正在潜伏的小队推着走；
@@ -2103,6 +2118,13 @@ void WorldSim::on_end(const std::string &kind, const std::string &text) {
        这一行把它们分开。VA_FACE=0 时它照样报（那才是消融的对照数）。 */
     if (std::getenv("VA_DBG_FACE") != nullptr || std::getenv("VA_DBG_RUN") != nullptr) {
         UtilityFunctions::print(String::utf8("[face] 收尾："), face_.dump());
+    }
+    /* 界面三维主视觉收尾：**「模型没挂上」和「挂上了但一帧都没显示」是两种故障**，
+       而画面上都表现为"菜单右边什么都没有" —— 这个数把它们分开。
+       它的显示帧只在主菜单累加，所以"跑完整局都进不了菜单"的取证运行这里必然是 0，
+       那是**预期**，不是故障。 */
+    if (std::getenv("VA_DBG_STAGE") != nullptr || std::getenv("VA_DBG_RUN") != nullptr) {
+        UtilityFunctions::print(String::utf8("[stage] 收尾："), stage_.dump());
     }
     /* 「转进」= 这一关打下来了、还有下一关 —— 它和"成功/胜利/失败"不是一回事：
        战绩全达标但没过关（比如撤离人数不够）也会走 end_game，那种不能推进关卡。

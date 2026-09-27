@@ -139,6 +139,13 @@ godot::Node3D *make_unit_node(const va::Unit &u, godot::Node *p_proto_parent);
 // make_unit_node 内部就是先 unit_model_key(u) 再转到这里。
 godot::Node3D *make_unit_node_by_key(const std::string &p_key, godot::Node *p_proto_parent);
 
+/* 界面三维主视觉（node/menu_stage）用的模型加载：
+   读 res://assets/art/ui/model/<键>.glb，归一化成「最大维 = 1 米、几何中心在原点」，
+   返回可直接挂进舞台的节点；缺文件返回 nullptr（调用方负责降级成"不启用"）。
+   与 load_unit_proto 的差别只有归一化口径：角色按**身高**缩放（人得一样高），
+   界面道具按**最大维**缩放（章体、沙盘这类东西没有"身高"这个概念）。 */
+godot::Node3D *make_stage_model(const std::string &p_key);
+
 // 单位在场景里的姿态：偏航（模型前方 = +X，故绕 Y 转 -facing）+ 倒地时绕**自身前方轴**
 // 的 84° 侧翻；p_x / p_y 是逻辑层的 2D 坐标。
 //

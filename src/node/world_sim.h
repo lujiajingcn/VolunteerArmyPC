@@ -14,6 +14,7 @@
 
 #include "node/audio.h"
 #include "node/fx_layer.h"
+#include "node/menu_stage.h"
 #include "node/hud.h"
 #include "node/mic.h"
 #include "node/scene_builder.h"
@@ -140,6 +141,12 @@ private:
        与 anim_/leg_ 同一类：只读逻辑层状态、删掉不影响任何逻辑；
        **VA_FX=0 时一个节点都不建**，画面与未加本层时逐像素相同。 */
     FxLayer fx_;
+    /* 界面外壳的三维主视觉（见 node/menu_stage.h）：主菜单右侧缓转的纪念章。
+       与上面几层不同，它**不读逻辑层任何东西**，也不挂在 sync_entity_nodes 里 ——
+       它是挂在**外壳的 CanvasLayer** 上的界面元素（SubViewport 自成一套 3D 世界），
+       因此外壳期战局冻结、相机被摆到地图别处都不影响它。
+       **VA_STAGE=0 时一个节点都不建**，界面与加本层之前逐像素相同。 */
+    MenuStage stage_;
     std::vector<godot::Node3D *> unit_nodes_;
     std::vector<godot::Node3D *> veh_nodes_;
     godot::Node3D *box_node_ = nullptr;

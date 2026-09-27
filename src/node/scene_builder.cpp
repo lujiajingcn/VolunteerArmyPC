@@ -742,6 +742,40 @@ Node3D *make_unit_node(const va::Unit &u, Node *p_proto_parent) {
     return make_soldier_node(u.team == va::Team::Enemy, u.downed);
 }
 
+Node3D *make_stage_model(const std::string &p_key) {
+    const String path = String("res://assets/art/ui/model/") +
+                        String::utf8(p_key.c_str()) + String(".glb");
+    Node3D *raw = load_glb_root(path, "stage");
+    if (raw == nullptr) return nullptr;
+
+    AABB box;
+    bool has = false;
+    collect_aabb(raw, Transform3D(), box, has);
+    if (!has || box.size.x <= 1e-5f) {
+        UtilityFunctions::print(String::utf8("[stage] 模型没有网格 "), path);
+        raw->queue_free();
+        return nullptr;
+    }
+    /* 归一化到「最大维 = 1 米、几何中心在原点」。
+       取**最大维**而不是 y：纪念章是竖着挂的（绶带在上），沙盘是横着铺的，
+       用 y 会把沙盘缩成一个点、用 x 会把章体撑出画面。
+       一次性给全 set_transform（缩放 + 平移在同一个 Basis 里）——
+       分两步 set_scale / set_position 会依赖 Node3D 内部的 euler/scale 合成顺序。 */
+    const float mx = std::max(box.size.x, std::max(box.size.y, box.size.z));
+    const float k = 1.0f / mx;
+    Basis b;
+    b.scale(Vector3(k, k, k));
+    Node3D *outer = memnew(Node3D);
+    outer->set_transform(Transform3D(b, -box.get_center() * k));
+    outer->add_child(raw);
+
+    UtilityFunctions::print(String::utf8("[stage] 模型 "), String::utf8(p_key.c_str()),
+                            String::utf8(" 包围盒 "), box.size,
+                            String::utf8(" 最大维 "), mx,
+                            String::utf8(" 缩放 "), k);
+    return outer;
+}
+
 // ---------------------------------------------- 武器三维模型（图生3D 产物）
 //
 // 参考图与生成方式：tools/fetch_wpn_refs.sh（取图）+ tools/gen3d_batch.py --kind wpn

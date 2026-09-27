@@ -406,7 +406,10 @@ sweep/sim/va_sweep.exe campaign   # 五个伏击阵地连着跑（见「五个�
 | `VA_FF` | **快进倍率**（默认 1）。逻辑层按真实经过时间推进，而车队要等 `CFG.convoyIn` 才上公路（战役五关都是 30 s，非战役默认 175 s）—— 不打快进的话，"打到交火"仍要一分多钟真实时间。它只放大"喂进来的时间"，步长仍是固定 1/60，所以同一战局秒数下的状态与不快进时一致。**但标称倍率在 1080p 下会被削**：每帧最多跑 `8 × 倍率` 个固定步（= 0.8 秒仿真/帧），帧率跟不上时就地触顶 —— 报告里别把它当实测值写 |
 | `VA_CAPTURE_EV` | **战斗事件当帧自动落盘**：命中标记只亮 0.24 秒，定时截图撞不上，改由事件自己声明"该留证据了"。落盘时机是**等 0.05 秒墙钟 + 至少跨 1 帧**（不是"隔 N 帧"），理由与判读方法见下节 |
 | `VA_HUD_EV` | 把命中/击杀/队友阵亡/倒地的**触发时刻**打成 `[hud-ev]` 日志（把"事件什么时候发生"变成可读的数字） |
-| `VA_MODEL_YAW` | 覆盖三维模型的朝向校正角（默认 90°），现场调朝向用 |
+| `VA_STAGE` | **界面三维主视觉总开关**（默认开）。`=0` 时**一个节点都不建**，界面与未加本层逐像素相同 |
+| `VA_STAGE_SPIN` / `VA_STAGE_YAW` / `VA_STAGE_PITCH` | 主视觉的自转角速度（rad/s，默认 **0.30**）/ 固定偏航 / 俯仰（度，默认 0） |
+| `VA_STAGE_FRAC` / `VA_STAGE_MARGIN` | 主视觉视口边长 = **视口高 × `FRAC`**（默认 0.54）/ 距右边缘的像素数（默认 150，已乘 `s_`） |
+| `VA_DBG_STAGE` | 打 `[stage]` 就绪行与收尾 dump（模型包围盒 / 最大维 / 缩放 / 自转 / 实测帧数） |
 | `VA_VEH_YAW` | 覆盖**载具**模型的朝向校正角（默认 **0°**，见「载具形象」那节的实测），现场扫角度用 |
 | `VA_TERRAIN` | **峡谷地形总开关**（默认开）。写 `VA_TERRAIN=0` 时地形网格不建、地板也回到 `h=0` —— 与改动前逐像素一致，A/B 对照靠它 |
 | `VA_TERRAIN_IN` | **地图内最高点**的高度（米，默认 **4.5**），出现在地图边界（距路中心 32.5 米）处。这是玩家真的走得到的最高点，所以它受"2D 子弹遮挡"约束（见「峡谷地形」那节），调大要接受视线与判定脱节 |
@@ -782,6 +785,7 @@ VA_UNIT_SHOW=one:char_rifleman:180   VA_CAPTURE=1 ...   # 背面
 
 判朝向用**身体**（胸挂 / 背囊 / 脚），不要用脸 —— 面部姿态常常是烧进网格的
 （立绘里头只占很小一块，生成器会把微侧 / 低头一起烘进去）。
+
 
 ## 武器形象（参考图 → 三维模型 → 按键换外观）
 
@@ -2877,6 +2881,54 @@ Kangkang 男声）：`全体开火` / `全体撤退` / `全体隐蔽` → `sweep
 **建议同时开 `VA_DBG_MIC=1`** —— 万一还不动，日志现在能直接指出断在哪一段。
 另：想确保去 **C 点那座桥**，说「全体，**撤退到 C 点**」比「全体撤退」更稳
 （`probe` 实测 n0.0 是 **0.97 对 0.79**，前者有地点分加持）。
+
+## 界面三维主视觉（主菜单里缓转的纪念章）
+
+界面外壳（主菜单 / 简报 / 结算）此前是**纯 2D** —— 整屏走 `Hud::_draw()` 画在 `CanvasLayer` 上，
+一个 3D 节点都没有。要让菜单有三维主视觉，得**新建一条 SubViewport 管线**，
+不是在既有场景里摆东西。新增 `src/node/menu_stage.{h,cpp}`，接口三件套
+（`setup(parent)` / `step(delta, screen)` / `dump()`）与 `UnitAnim` / `UnitLeg` / `UnitFace`
+同构，但**不读逻辑层任何东西**。
+
+> ![主菜单三维主视觉](docs/menu_stage.png)
+
+**管线**：`SubViewportContainer(set_stretch(true))` → `SubViewport(transparent_background
++ use_own_world_3d + UPDATE_ALWAYS + MSAA_4X)` → `Camera3D` + `WorldEnvironment(BG_SKY + ACES)`
++ 3 盏 `DirectionalLight3D`（主光 + 冷色补光 + 顶部轮廓光）→ `pivot`（自转）→ 模型。
+容器**挂在外壳的 `CanvasLayer` 上**（不是 3D 世界），所以透明背景之上直接透出 key art 山景。
+
+四个容易踩的点：
+
+| 点 | 说明 |
+|---|---|
+| **自转的时间基** | 外壳期逻辑层的 `t` 是冻结的（`_process` 里 `shell_owns_input()` 提前 return），自转必须用**墙钟** `p_delta` |
+| **`step()` 的位置** | 必须在那个 `shell_owns_input()` 的 return **之前**。漏在 return 之后 ⇒ 进战斗后还挂在画面上；放进外壳分支里 ⇒ 再没有一帧把它藏起来 |
+| **摆位口径** | 用**同一套** `s_ = clamp(视口高/1080, 0.62, 2.20)`（`hud.cpp:162`），否则窗口一变就与 HUD 对不上 |
+| **C++ 里的灯属性名** | `DirectionalLight3D` **没有** `set_light_color` / `set_light_energy`（那是 GDScript 属性名）⇒ 用 `set_color()` + `set_param(Light3D::PARAM_ENERGY, v)`。`Environment` 上同理：没有 `set_tonemap_mode` / `set_reflected_light_source`，正确名是 `set_tonemapper()` / `set_reflection_source()` |
+
+**归一化口径与角色不同**：新建 `make_stage_model(key)` 按**最大维 = 1 m、几何中心在原点**
+（`load_unit_proto` 那条按**身高**）。界面道具没有"身高"概念，按 y 归一化会把横铺的沙盘
+缩成一个点、用 x 又会把竖挂的章体撑出画面。
+
+**素材**：`assets/art/ui/model/menu_medal.glb`（10 万面 / 2.81 MB，
+由 45.3 MB 瘦身而来；生成走内置通道，`job_id 1495781240879448064`，2m57s）。
+⚠️ `--face-count` **必须显式给** —— 不给则服务端默认 **500000 面 / 15 MB**。
+
+```bash
+# 主菜单取景（⚠️ VA_CAPTURE 一出现就等价于 VA_SKIP_MENU，要拍菜单必须显式 VA_SCREEN=menu）
+VA_SCREEN=menu VA_CAPTURE="1,3" VA_DBG_STAGE=1 \
+  VA_CAPTURE_DIR=res://sweep/stage sdk/godot/Godot_v4.5-stable_win64_console.exe --path .
+```
+
+| 判据 | 结果 |
+|---|---|
+| 构建 | **0 error / 0 warning** |
+| 就绪行 | `[stage] 模型 menu_medal 包围盒 (0.7297, 1.0762, 0.1461) 最大维 1.0762 缩放 0.9292`、`界面三维主视觉就绪：自转 0.3 rad/s` |
+| 画面 | 章体悬浮在菜单右侧；**背景完全透明**（透出 key art 山景）；金属 PBR 高光 / 暗部层次正常；与左栏文字不冲突 |
+| 消融（`VA_STAGE=0`） | 差分 `bbox 归一化 u[0.728..0.842] v[0.326..0.668]`、占屏宽 11.5% 高 34.3%，**左侧 7/10 全 0**（零外溢） |
+
+`VA_STAGE=0` 时**一个节点都不建** —— 界面与加本层之前逐像素相同。
+可复用于简报页（3D 立体沙盘）/ 结算页（3D 勋章）：换 `make_stage_model` 的键 + 摆位即可。
 
 ## 当前进度
 
