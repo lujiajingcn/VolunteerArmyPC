@@ -439,6 +439,94 @@ const char *weather_cn(const std::string &w) {
     return w.c_str();
 }
 
+/* ---------------------------------------------------- 语音路径置信度探针
+   「按住 Q 喊了命令没有任何反应」是**最难自查**的失败形态：麦克风拾到没有 /
+   识别器定稿没有 / 解析过没过 / 队员听不听 —— 四步里任何一步断掉，观感一模一样。
+   本探针只回答第三步里最隐蔽的一环：**parse_command 的置信度**。
+
+   为什么离线扫描（campaign / 各方案）永远发现不了它：
+     机械剧本走 run_command_text(c, "voice", true)       ← typed = true
+     而 va_parser 里有 `if (typed) conf = max(conf, 0.93f)` —— 0.93 高于 0.70 门槛，
+     于是噪声再怎么打折也**必然通过**。
+   真人语音走的是
+     parse_command(text, W.noise, <asr>, typed=false, "voice")   ← 见 world_sim.cpp::mic_step
+   这一条才同时吃「战场噪声」与「ASR 三档置信度」两重折扣，而它从来没被量过。
+   本探针把那条路径原样跑一遍，扫 noise × asr。 */
+void run_probe() {
+    init_world(20240915, 0, nullptr);
+
+    const char *cmds[] = {
+        "全体撤退", "全体撤离", "全体开火", "全体隐蔽", "全体，停止射击",
+        "全体，前进", "全体，火力压制", "全体，散开", "全体，原地待命",
+        "全体，前往A点", "全体，撤退到C点", "全体，集火",
+        "反坦克手，打坦克", "医疗兵，救伤员", "撤退", "开火",
+    };
+    const float noises[] = { 0.0f, 0.2f, 0.4f, 0.6f, 0.8f };
+    struct Asr { const char *name; float v; };
+    const Asr asrs[] = {
+        { "OneCore High   = 0.95  （现状）", 0.95f },
+        { "OneCore Medium = 0.80  （现状）", 0.80f },
+        { "OneCore Low    = 0.55  **修正前** —— 「全体」短口令的必死区", 0.55f },
+        { "OneCore Low    = 0.80  **修正后**（= Medium / = SAPI 标称）", 0.80f },
+    };
+
+    std::printf("语音路径置信度探针 —— 与 world_sim.cpp::mic_step 同一条调用\n");
+    std::printf("  parse_command(text, W.noise, <asr>, typed=false, \"voice\")\n");
+    std::printf("执行门槛 conf >= 0.70（va_parser.cpp）；低于则不下发，HUD 只提示一句\n");
+    std::printf("标 '*' = 不通过。\n\n");
+    std::printf("参照：W.noise 每发枪声 +0.02、爆炸 +0.5、每帧衰减 dt*0.30（va_combat / va_flow）\n\n");
+
+    for (const auto &a : asrs) {
+        std::printf("=== asr = %s ===\n", a.name);
+        for (const char *c : cmds) {
+            std::printf("「%s」 ", c);
+            std::string act;
+            for (float n : noises) {
+                const ParsedCmd pc = parse_command(c, n, a.v, false, "probe");
+                std::printf(" n%.1f=%4.2f%c", n, pc.confidence, pc.ok ? ' ' : '*');
+                if (act.empty()) act = pc.actId.empty() ? std::string("(无)") : pc.actId;
+            }
+            std::printf("  -> %s\n", act.c_str());
+        }
+        std::printf("\n");
+    }
+    std::printf("（对照：同一句若走 typed=true，conf 一律被抬到 0.93，恒通过 ——\n");
+    std::printf("  这就是「离线全绿、真人喊不动」的来源）\n\n");
+
+    /* ---------------------------------------------------- 实战噪声剖面
+       修复力度取决于「交火期 W.noise 到底多大」。每发枪声只 +0.02，衰减 0.30/秒，
+       所以它是个**平衡值**：射击率 > 15 发/秒 就能把噪声顶到 0.3 以上，一次爆炸
+       直接 +0.5。若典型交火常年 0.6+，那 `conf -= noise*0.35` 的实际含义就是
+       「只要在打枪，全体口令一律喊不动」—— 那不是难度，是坏掉。 */
+    std::printf("=== 实战噪声剖面（第一关 · 机械剧本式触发 · 前 300 秒）===\n");
+    init_world(20240915, 0, nullptr);
+    W.smokes.clear();
+    W.started = true;
+    W.deployDone = true;
+    {
+        float tLast = -100.0f;
+        bool  trig = false;
+        double nSum = 0;
+        long   nCnt = 0;
+        float  nMax = 0;
+        const int steps = (int)(300.0f / DT);
+        for (int i = 0; i < steps; ++i) {
+            step_once(DT);
+            const Vehicle *lead = W.vehicles.empty() ? nullptr : &W.vehicles[0];
+            if (!trig && lead != nullptr && W.t > CFG.tDeploy) { trigger_ambush("mine"); trig = true; }
+            nSum += W.noise; ++nCnt;
+            if (W.noise > nMax) nMax = W.noise;
+            if (W.t - tLast >= 20.0f) {
+                tLast = W.t;
+                std::printf("  t=%3.0fs  noise=%.2f  已交火=%d  我方存活=%d\n",
+                            W.t, W.noise, (int)W.triggered, (int)allies().size());
+            }
+        }
+        std::printf("  → 均值 %.2f   峰值 %.2f\n", nSum / (double)nCnt, nMax);
+        std::printf("  对照门槛：「全体撤退」+ Medium 档在 noise>=0.58 就不通过。\n");
+    }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -449,9 +537,11 @@ int main(int argc, char **argv) {
     bool verbose = false;
     int  campSeed = 20240915;
     bool campaign = false;
+    bool probe = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-v") == 0) verbose = true;
         else if (std::strcmp(argv[i], "campaign") == 0) campaign = true;
+        else if (std::strcmp(argv[i], "probe") == 0) probe = true;
         else if (campaign) campSeed = std::atoi(argv[i]);
         else filter = argv[i];
     }
@@ -470,6 +560,7 @@ int main(int argc, char **argv) {
        这一句就是"扫描数字"与"实机行为"之间的那根绳子。 */
     g_bal_defaults = BAL;
 
+    if (probe)    { run_probe(); return 0; }
     if (campaign) { run_campaign(campSeed, verbose); return 0; }
 
     std::printf("VolunteerArmyPC · 无头平衡扫描（无渲染 / 无引擎）\n");

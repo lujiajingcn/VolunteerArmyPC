@@ -1918,6 +1918,11 @@ void WorldSim::mic_step() {
 
     std::string text;
     float conf = 0.0f;
+    /* VA_DBG_MIC=1：本层每一步都留痕。**提到分支外**是必须的 —— 见 else 里那段。 */
+    static const bool mic_dbg = [] {
+        const char *v = std::getenv("VA_DBG_MIC");
+        return v != nullptr && *v != '0' && *v != '\0';
+    }();
     while (mic_.poll(text, conf)) {
         /* 把识别置信度**真的**喂进逻辑层：parse_command 的 asr 形参就是为它留的
            （conf = lerpf(conf, asr, 0.55)）。若走 run_command_text，那里写死 asr=-1，
@@ -1927,23 +1932,53 @@ void WorldSim::mic_step() {
         if (cmd.valid()) {
             /* 判据用的一条日志：识别 → 解析 → 下发 三件事一次说清。
                离线验证（VA_MIC_WAV 喂 wav）全靠它 —— say() 只进字幕队列，
-               headless 下不落任何东西，光看 [mic] 听清说明不了指令真的生效了。 */
-            static const bool mic_dbg = [] {
-                const char *v = std::getenv("VA_DBG_MIC");
-                return v != nullptr && *v != '0' && *v != '\0';
-            }();
+               headless 下不落任何东西，光看 [mic] 听清说明不了指令真的生效了。
+               ⚠️ 打**两个**置信度：conf 是识别引擎给的（OneCore 三档 / SAPI 标称），
+               cmd.confidence 才是决定去留的那个。只打前者，会把"解析没过"
+               误读成"麦克风不行"。 */
             if (mic_dbg) {
                 UtilityFunctions::print(String::utf8("[mic] 下发：「"),
                                         String::utf8(text.c_str()), String::utf8("」→ "),
                                         String::utf8(cmd.actId.c_str()),
-                                        String::utf8("  conf="), conf);
+                                        String::utf8("  解析置信度="), cmd.confidence,
+                                        String::utf8(" 引擎conf="), conf,
+                                        String::utf8(" 噪声="), va::W.noise);
             }
             va::issue_command(cmd, false);
-        } else if (hud_ != nullptr) {
+        } else {
             /* 没解析出来要**把听到的说出来**：识别错字与"这压根不是指令"是两回事。
                只回一句"没听懂"，玩家分不清是自己说错了还是游戏没听见 ——
-               下一次还是不知道该怎么喊。 */
-            hud_->ev_alert(std::string("未听清指令：") + (text.empty() ? "(空)" : text), 2.6f);
+               下一次还是不知道该怎么喊。
+
+               ⚠️⚠️ 这里**必须也写日志**，而且是本层最要紧的一条。
+               2026-09-27 实测：玩家报「按住 Q 喊『全体撤退』没有任何反应」，
+               而整份 debug_run.log 里**一条 [mic] 都没有** —— 因为原实现只在
+               "下发成功"那条路打日志，未通过只闪一句 HUD（HUD 又过期即散）。
+               于是「麦克风没拾到 / 定稿来晚了 / 解析没过 / 队员抗命」四种
+               完全不同的失败，在日志里长得一模一样：都是什么都没有。
+               这一条把第三种（解析没过）单独点亮，并给出**分数与理由**。 */
+            if (mic_dbg) {
+                std::string notes;
+                for (size_t i = 0; i < cmd.notes.size(); ++i) {
+                    if (i) notes += "; ";
+                    notes += cmd.notes[i];
+                }
+                UtilityFunctions::print(String::utf8("[mic] 未通过：「"),
+                                        String::utf8(text.c_str()),
+                                        String::utf8("」 解析置信度="), cmd.confidence,
+                                        String::utf8("（需 0.70） 引擎conf="), conf,
+                                        String::utf8(" 噪声="), va::W.noise,
+                                        String::utf8(" 理由="), String::utf8(notes.c_str()));
+            }
+            if (hud_ != nullptr) {
+                /* HUD 那条也把分数带上：玩家的下一句话该怎么说，取决于
+                   "他是没听清"还是"听清了但不够确信" —— 只说"未听清"没法区分。 */
+                char b[192];
+                std::snprintf(b, sizeof(b), "未听清指令：%s（%.0f%%，需 %.0f%%）",
+                              text.empty() ? "(空)" : text.c_str(),
+                              (double)(cmd.confidence * 100.0f), 70.0);
+                hud_->ev_alert(b, 3.2f);
+            }
         }
     }
 }

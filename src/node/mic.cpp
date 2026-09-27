@@ -130,13 +130,30 @@ std::string hr_e_text(const winrt::hresult_error &e) {
 
 /* WinRT 的置信度是**三档枚举**，不是概率。
    映射到 0~1 只是为了让逻辑层的 parse_command(asr=...) 有东西可用 ——
-   那里 conf = lerpf(conf, asr, 0.55)，本工程自己会对"战场噪声"再打折。 */
+   那里 conf = lerpf(conf, asr, 0.55)，本工程自己会对"战场噪声"再打折。
+
+   ⚠️ Low 档原来是 **0.55**，2026-09-27 实测证明它**必然打死短口令**。
+   离线探针（sweep/sim/va_sweep.exe probe）扫出来的表：
+     「全体撤退」这类「全体 + 两字动作」的语法分上限只有 **0.78**
+     （= 0.30 基 + 0.34 两字动作 + 0.06 全体呼号 + 0.08 四字长），
+     再经 lerpf(0.78, 0.55, 0.55) = **0.65** —— 低于 0.70 门槛，
+     **连零噪声都过不去**。而 OneCore 把短词、口音、环境稍吵的句子判成 Low
+     是常事，于是「按住 Q 喊『全体撤退』毫无反应」就成了**必现**。
+   注意失败的形态：不崩、不报错、队友不动、状态标签不变，HUD 只闪一句 ——
+   「最像麦克风坏了」的那种失败，实际坏在置信度上。
+
+   为什么抬到 0.80 是对的：Low 只表示"引擎对这一句不太确定"，而**文本对不对
+   由 parse_command 判定** —— 它拿 50+ 动作词 + 呼号 + 地点做精确/模糊匹配，
+   真听错字（"撤退"→"撤回"）压根解析不出动作。这与下面 sapi_confidence()
+   回标称 0.80 是同一条理由：真正的闸门是**语法匹配**与**战场噪声**，
+   不是引擎这个三档枚举。
+   代价：Low 与 Medium 合并成一档，三档只剩两档区分度 —— 值。 */
 float conf_value(WSR::SpeechRecognitionConfidence c) {
     using C = WSR::SpeechRecognitionConfidence;
     if (c == C::High)   return 0.95f;
     if (c == C::Medium) return 0.80f;
-    if (c == C::Low)    return 0.55f;
-    return 0.30f;
+    if (c == C::Low)    return 0.80f;   // 原 0.55 —— 见上，它会打死「全体+两字动作」
+    return 0.30f;                       // Rejected / 未知：真的不该执行
 }
 
 /* SAPI5 的置信度：**用不了，不要假装能用。**
