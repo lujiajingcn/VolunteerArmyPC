@@ -48,6 +48,7 @@ set(VA_SOURCES
     src/node/unit_anim.cpp
     src/node/unit_face.cpp
     src/node/unit_leg.cpp
+    src/node/unit_pose.cpp
     src/node/fx_layer.cpp
     src/node/menu_stage.cpp
     src/node/world_sim.cpp

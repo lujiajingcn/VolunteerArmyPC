@@ -830,6 +830,13 @@ void WorldSim::_ready() {
        VA_LEG=0 时内部直接返回 —— 不加载着色器、不换材质，画面与未加本层时逐像素相同。 */
     leg_.setup();
 
+    /* 姿态切换层（见 node/unit_pose.h）：走路画行军模型，**正在开火时**改画
+       <键>_fire 那套据枪模型（判据只有逻辑层的 Unit::fireCd）。
+       排在 leg_ 之后只是书写顺序 —— 两者在每帧的调用次序才是耦合点：
+       resolve() 决定"这一帧画哪个节点、用哪个键"，leg_ 拿到的是它的返回值。
+       VA_POSE=0 时 resolve() 立刻原样返回，画面与未加本层时逐像素相同。 */
+    pose_.setup();
+
     /* 朝向平滑层（见 node/unit_face.h）：逻辑层的 Unit::facing 没有角速度限制，
        而表现层原来是逐帧原样上屏 —— "队友原地快速转圈"就是这条链的结果。
        VA_FACE=0 时 display() 原样返回 u.facing，画面与未加本层时逐像素相同。 */
@@ -902,15 +909,34 @@ void WorldSim::dbg_units_dump(const char *p_when) const {
 
     UtilityFunctions::print(String::utf8("[dbg-units] "), String::utf8(p_when),
                             String::utf8(" 镜头最近的 6 个单位（水平距离 / 米；vis=是否在画，self=是不是玩家自己）"));
+    /* 视口尺寸：用来判 px 落没落在画框里。headless 下拿不到就退化成"只报坐标"。 */
+    Vector2 vp_sz(0.0f, 0.0f);
+    if (const Viewport *vp = get_viewport()) vp_sz = vp->get_visible_rect().size;
     const size_t n = std::min<size_t>(6, rows.size());
     for (size_t k = 0; k < n; ++k) {
         const size_t i = rows[k].i;
         const va::Unit &u = va::W.units[i];
         const std::string key = unit_model_key(u);
+        /* px = 把单位原点投到屏幕的像素坐标。
+           【为什么必须有这一列】"这张图里那个刚换成据枪姿的人在哪"过去只能靠肉眼在图里
+           找 —— 而远景单位只有一两百像素、还常被枪口焰盖住，本机已经因此把敌方士兵
+           认成过队友。有了 px 就能直接裁剪放大那一小块，把"日志说 #4 切了"和
+           "图上 #4 确实端着枪"扣在一起。
+           投的是 unit_nodes_[i] 的原点：据枪节点与它**共用同一个变换**
+           （unit_pose 每帧整份拷贝），所以换不换模型都不影响这个坐标。 */
+        const Vector3 gp = unit_nodes_[i]->get_global_position();
+        const Vector2 sp = cam_->unproject_position(gp);
+        const bool behind = cam_->is_position_behind(gp);
+        const bool in_frame = !behind && vp_sz.x > 0.0f
+                           && sp.x >= 0.0f && sp.y >= 0.0f && sp.x < vp_sz.x && sp.y < vp_sz.y;
         UtilityFunctions::print(String::utf8("    #"), (int)i, " ", String::utf8(key.c_str()),
                                 String::utf8("  d="), String::num(rows[k].d, 2),
                                 String::utf8(" m  vis="), unit_nodes_[i]->is_visible() ? 1 : 0,
                                 " self=", u.isPlayer ? 1 : 0,
+                                String::utf8(" 据枪="), pose_.firing(i) ? 1 : 0,
+                                String::utf8(" px=("), (int)sp.x, ",", (int)sp.y,
+                                String::utf8(") 在画="), in_frame ? 1 : 0,
+                                String::utf8(" 背="), behind ? 1 : 0,
                                 u.dead ? String::utf8("  [阵亡]") : String(""));
     }
 }
@@ -1296,7 +1322,14 @@ void WorldSim::sync_entity_nodes() {
            只在 spawn 时藏一次的话，重开一局遮挡就回来了。 */
         const bool self_hidden = u.isPlayer && !show_self_;
         n->set_visible(!u.dead && !self_hidden);
-        if (u.dead) continue;
+        if (u.dead) {
+            /* 阵亡要**显式收掉据枪节点**（见 node/unit_pose.h 的 release 说明）：
+               下面 continue 了就走不到 resolve()，而据枪节点是独立于 unit_nodes_ 的
+               另一批节点 —— 不收的话"正在开火时被打死"的单位会留下一个**站着端枪的
+               据枪模型**，与已经侧翻倒地的行军模型重叠成两个人。 */
+            pose_.release(i);
+            continue;
+        }
         // 姿态由 scene_builder 的 unit_transform 统一给出（偏航 + 倒地侧翻）。
         //
         // 【为什么姿态必须在这里施加】这段原来只写 position/rotation，而倒地姿态是在
@@ -1322,10 +1355,18 @@ void WorldSim::sync_entity_nodes() {
            逐像素等同未加本层。位置/倒地/跑动三条口径都没变。 */
         n->set_transform(unit_transform(u.x, u.y, face_.display(i), u.downed)
                          * UnitAnim::pose_transform(pv));
+        /* 姿态切换（见 node/unit_pose.h）：这一帧到底该画**行军**还是**据枪**，
+           由它一个人说了算 —— 它返回节点，并把配套的模型键写进 mkey。
+           ⚠️ 键必须用它的返回值，不要在这里再 unit_model_key(u) 算一遍：
+           双腿层的材质缓存是按键索引的，键与节点对不上就是"把行军模型的髋高
+           用在据枪模型上"（腿从腰上摆起来）。
+           VA_POSE=0 时它原样返回 n 与行军键，下面两行与未加本层时逐字节相同。 */
+        std::string mkey;
+        Node3D *drawn = pose_.resolve(i, n, unit_model_key(u), u, refs_.units, mkey);
         /* 双腿交替（见 node/unit_leg.h）：把**同一帧的同一个相位**喂给网格顶点位移层。
            显式取一次 pose_vals 再复用，而不是再走一遍 local_pose —— 后者内部会重算，
            一旦两处取到的不是同一帧的值，腿和躯干就会差一帧，快进时肉眼可见。 */
-        leg_.apply(n, unit_model_key(u), pv.leg_phase, pv.leg_deg);
+        leg_.apply(drawn, mkey, pv.leg_phase, pv.leg_deg);
     }
     for (size_t i = 0; i < va::W.vehicles.size(); ++i) {
         const va::Vehicle &v = va::W.vehicles[i];
@@ -1444,6 +1485,10 @@ void WorldSim::_process(double p_delta) {
        也证明不了"没在转" —— 只有"逻辑层单帧 Δ朝向峰值"与"平滑后 Δ 峰值"
        这两个数一起看，才知道原来抖成什么样、本层压掉了多少。 */
     face_.tick_diag(p_delta);
+    /* 据枪切换层同上一类：**静帧截图证明不了"换了模型"**（换的是网格不是变换），
+       也证明不了"没换" —— 这一行把"这一帧有几个单位处于据枪态、累计切了几次、
+       有多少次因为缺模型而放弃"变成可读的数字，而且它就在截图点的前后。 */
+    pose_.tick_diag(p_delta, (double)va::W.t);
 
     // 相机跟随：位置取玩家单位，朝向由 yaw/pitch 决定
     const va::Unit *p = va::W.player;
@@ -1468,6 +1513,41 @@ void WorldSim::_process(double p_delta) {
         const float cam_pitch = env_set("VA_CAM_PITCH") ? env_f("VA_CAM_PITCH", 0.0f) * PI / 180.0f : pitch_;
         const float cam_yaw   = env_set("VA_CAM_YAW")   ? env_f("VA_CAM_YAW", 0.0f)   * PI / 180.0f : yaw_;
         cam_->set_rotation(Vector3(cam_pitch, cam_yaw, 0));
+
+        /* ---- 取证机位：把相机**对准某个单位**（VA_CAM_LOOK）---------------------
+           值可以是单位下标（`VA_CAM_LOOK=4`），也可以是 `fire`（当前处于据枪态的
+           第一个单位）。``VA_DBG_UNITS`` 打的 px 是"这个单位在图里的哪个像素"，
+           本旋钮是它的反向操作 —— "把图对准这个单位"。
+
+           【为什么需要它】伏击阵地上小队是围着玩家散开的，而相机跟着玩家的视线朝
+           车队来向（东）。实测种子 1 的第 70 秒：正在据枪的 #4 在 px=(-4404,1024)，
+           离画框左边 4400 多像素 —— **根本不在图里**，所以"把这一帧放大看看"
+           永远看不到当事人。靠 VA_CAM_YAW 手动扫也能碰对，但那要先算方位角，
+           而方位角本身又要先知道玩家的 yaw。
+
+           ⚠️ 与 VA_CAM_H / VA_CAM_PITCH / VA_CAM_YAW 同一条纪律：**只覆盖相机变换，
+           不写回** va::W.viewPitch / IN.*，所以 VA_AUTO 的瞄准与命中判定都不受影响
+           （"子弹有效射程"仍按玩家真实视角算）。 */
+        if (const char *lk = std::getenv("VA_CAM_LOOK"); lk != nullptr && *lk != '\0') {
+            int idx = -1;
+            if (std::strcmp(lk, "fire") == 0) {
+                /* ⚠️ 只判 firing()，**不要**再判 unit_nodes_[i]->is_visible()：
+                   正在据枪的单位，它的**行军节点恰恰是被藏起来的**
+                   （pose_.resolve 每帧把 p_walk 藏掉）—— 加上那个条件就永远找不到人，
+                   而症状是"相机纹丝不动"，看着像本旋钮根本没接上。 */
+                for (size_t i = 0; i < unit_nodes_.size(); ++i) {
+                    if (pose_.firing(i)) { idx = (int)i; break; }
+                }
+            } else {
+                idx = std::atoi(lk);
+            }
+            if (idx >= 0 && (size_t)idx < unit_nodes_.size()) {
+                // 抬到胸高再瞄：单位原点在脚底，直接瞄脚下会让画面朝下压得很低。
+                cam_->look_at(unit_nodes_[(size_t)idx]->get_global_position()
+                                  + Vector3(0.0f, 1.0f, 0.0f),
+                              Vector3(0.0f, 1.0f, 0.0f));
+            }
+        }
     }
     // 相机落地后的第一帧才量得出真数字 —— 在此之前 cam_ 还停在原点，
     // 量出来的"距离"全是到世界原点的距离（与开局的"谁挡在镜头前"没有关系）。
@@ -2107,6 +2187,13 @@ void WorldSim::on_end(const std::string &kind, const std::string &text) {
            完全不同的故障**，而画面上都表现为"腿没摆" —— 这个数就是把它们分开的那一条。 */
         UtilityFunctions::print(String::utf8("[leg] 收尾："), leg_.dump());
     }
+    /* 姿态切换层收尾：**「一次都没切」和「切了但画的是同一份模型」是两种故障**，
+       而画面上都表现为"开枪时还是行军姿" —— 这个数把它们分开
+       （前者看"切换 0 次"，后者看"缺模型放弃 … 单位帧"）。
+       注意它按**这一局**累计，重开一关会归零（见 reset_mission）。 */
+    if (std::getenv("VA_DBG_POSE") != nullptr || std::getenv("VA_DBG_RUN") != nullptr) {
+        UtilityFunctions::print(String::utf8("[pose] 收尾："), pose_.dump());
+    }
     /* 光效层收尾：本局一共画过多少发枪口焰、其中敌方占几发、曳光弹峰值多少。
        **「一个光效都没画」和「画了但都落在镜头外」是两种故障**，
        而画面上都表现为"没看见光" —— 这个数把它们分开。 */
@@ -2237,6 +2324,16 @@ void WorldSim::reset_mission() {
        st_ 不会因为数量变化被重建 —— 不清的话新一关第一帧会从上一关最后那个
        朝向**平滑转**过去（而不是吸附），开局全队一起甩头。 */
     face_.reset();
+    /* 姿态切换层也要清：据枪节点是**独立于 unit_nodes_ 的一批节点**（挂在同一个
+       refs_.units 下，因为它要跟行军节点共用父节点才能整份抄变换），
+       而 sync_entity_nodes 的数量重建只 free unit_nodes_。
+       不清的话，重开一关时若新一局人数正好与上一局相同、队形编号却指向别人，
+       就会有人顶着上一局的据枪模型站着。
+       ⚠️ 反过来说 sync_entity_nodes 的**数量重建分支**不需要调 reset()：
+       那一条只换 unit_nodes_，而 fire_ 按**单位下标**索引、下标在增援时不会重排，
+       据枪节点照样能拿到新行军节点的变换 —— 在那里 reset 反而会让正在开火的单位
+       闪一下回行军姿再切回来。 */
+    pose_.reset();
     /* 语音侧同样要清一次：调度只看"HUD 当前停在哪一屏"（vo_screen_），
        重开一局若不清这个样本，下一帧会被当成"屏没变"——
        而那时玩家可能已经退回简报页，于是新一关的任务介绍一声不吭。

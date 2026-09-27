@@ -21,6 +21,7 @@
 #include "node/unit_anim.h"
 #include "node/unit_face.h"
 #include "node/unit_leg.h"
+#include "node/unit_pose.h"
 #include "node/viewmodel.h"
 #include "node/voice.h"
 #include "sim/va_world.h"
@@ -129,6 +130,13 @@ private:
        与 anim_ 同一类：只读逻辑层状态、挂在 sync_entity_nodes 里、
        **VA_LEG=0 时完全不动作**（连材质都不换），删掉不影响任何逻辑。 */
     UnitLeg leg_;
+    /* 姿态切换（见 node/unit_pose.h）：走路 = 行军模型，**正在开火时**换成
+       <键>_fire 那套据枪模型。本工程的 char_*.glb 全是单块融合网格、没有骨骼，
+       枪与手臂烤在网格里 ⇒ "据枪"只能靠换整份模型。
+       与 anim_/leg_ 同一类：只读逻辑层状态（Unit::fireCd）挂在 sync_entity_nodes 里、
+       **VA_POSE=0 时连一个节点都不建**，画面与未加本层时逐像素相同。
+       ⚠️ 它换的是**节点**，所以 leg_.apply 必须拿到它返回的键（见 resolve 的说明）。 */
+    UnitPose pose_;
     /* 朝向平滑（见 node/unit_face.h）：逻辑层的 Unit::facing 没有角速度限制
        （va_ai_ally.cpp:35 是直接赋值），而表现层原来逐帧原样上屏 ——
        于是 steer_angle 换档 / aiming 翻转这些输入侧噪声 1:1 变成画面上的急转，
