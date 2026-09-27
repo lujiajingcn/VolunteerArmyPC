@@ -46,6 +46,7 @@ set(VA_SOURCES
     src/node/voice.cpp
     src/node/mic.cpp
     src/node/unit_anim.cpp
+    src/node/unit_face.cpp
     src/node/unit_leg.cpp
     src/node/fx_layer.cpp
     src/node/world_sim.cpp

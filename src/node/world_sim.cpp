@@ -828,6 +828,11 @@ void WorldSim::_ready() {
        VA_LEG=0 时内部直接返回 —— 不加载着色器、不换材质，画面与未加本层时逐像素相同。 */
     leg_.setup();
 
+    /* 朝向平滑层（见 node/unit_face.h）：逻辑层的 Unit::facing 没有角速度限制，
+       而表现层原来是逐帧原样上屏 —— "队友原地快速转圈"就是这条链的结果。
+       VA_FACE=0 时 display() 原样返回 u.facing，画面与未加本层时逐像素相同。 */
+    face_.setup();
+
     /* 射击光效层（见 node/fx_layer.h）：枪口焰 / 曳光弹 / 弹着火花，按阵营分色。
        挂在 this（WorldSim 自己）而不是 cam_ —— 光效属于世界，不跟着镜头走。
        传 cam_ 只为近距剔除（玩家自己那发枪口焰在相机前 0.4 m，不剔除会糊屏）。
@@ -1233,6 +1238,10 @@ void WorldSim::sync_entity_nodes() {
        同一帧被调多次时内部 dt=0，一切保持，不会把包络抖掉。 */
     anim_.step(va::W.units);
 
+    /* 朝向平滑：与 anim_ 同一位置、同一时间基。必须在**上屏之前**跑 ——
+       它是"每个单位这一帧该朝哪"的唯一来源（下面 set_transform 读 face_.display）。 */
+    face_.step(va::W.units);
+
     if (unit_nodes_.size() != va::W.units.size()) {
         va_trace("sync:rebuild units");
         for (auto *n : unit_nodes_) n->queue_free();
@@ -1297,7 +1306,12 @@ void WorldSim::sync_entity_nodes() {
         // 倒没倒"这三件事，跑动层只加"自己在动"的局部摆动。
         // 这样倒地/朝向的判据不会因为加动作而改变（VA_UNIT_SHOW 检阅台也走这条）。
         const UnitAnim::PoseVals pv = anim_.pose_vals(i);
-        n->set_transform(unit_transform(u.x, u.y, u.facing, u.downed)
+        /* 朝向走 face_.display(i) 而不是直接用 u.facing：逻辑层的 facing 没有
+           角速度限制（见 node/unit_face.h），原样上屏就会把 steer_angle 换档、
+           perceive 周期上的 aiming 翻转 1:1 变成画面上的急转 ——
+           现象是"队友原地快速转圈"。VA_FACE=0 时 display() 返回的就是 u.facing，
+           逐像素等同未加本层。位置/倒地/跑动三条口径都没变。 */
+        n->set_transform(unit_transform(u.x, u.y, face_.display(i), u.downed)
                          * UnitAnim::pose_transform(pv));
         /* 双腿交替（见 node/unit_leg.h）：把**同一帧的同一个相位**喂给网格顶点位移层。
            显式取一次 pose_vals 再复用，而不是再走一遍 local_pose —— 后者内部会重算，
@@ -1409,6 +1423,10 @@ void WorldSim::_process(double p_delta) {
     // VA_DBG_RUN=1：每秒打一行"跑动人数 / 最快速度"。**静帧截图证明不了"在跑"**，
     // 这条数字才是"确实有单位被驱动"的判据（相位在动、幅度不为 0）。
     anim_.tick_diag(p_delta);
+    /* 朝向抖动的判据与上一条同源：**静帧截图证明不了"在转"**，
+       也证明不了"没在转" —— 只有"逻辑层单帧 Δ朝向峰值"与"平滑后 Δ 峰值"
+       这两个数一起看，才知道原来抖成什么样、本层压掉了多少。 */
+    face_.tick_diag(p_delta);
 
     // 相机跟随：位置取玩家单位，朝向由 yaw/pitch 决定
     const va::Unit *p = va::W.player;
@@ -2043,6 +2061,12 @@ void WorldSim::on_end(const std::string &kind, const std::string &text) {
     if (std::getenv("VA_DBG_FX") != nullptr || std::getenv("VA_DBG_RUN") != nullptr) {
         UtilityFunctions::print(String::utf8("[fx] 收尾："), fx_.dump());
     }
+    /* 朝向层收尾：**逻辑层一共抖了多少次、其中多少次是原地、平滑后还剩多少**。
+       「逻辑层本来就不抖」和「抖了但被本层压住了」在画面上都是"不转圈" ——
+       这一行把它们分开。VA_FACE=0 时它照样报（那才是消融的对照数）。 */
+    if (std::getenv("VA_DBG_FACE") != nullptr || std::getenv("VA_DBG_RUN") != nullptr) {
+        UtilityFunctions::print(String::utf8("[face] 收尾："), face_.dump());
+    }
     /* 「转进」= 这一关打下来了、还有下一关 —— 它和"成功/胜利/失败"不是一回事：
        战绩全达标但没过关（比如撤离人数不够）也会走 end_game，那种不能推进关卡。
        所以只认 end_game 给出的 kind，不自己看 stats 反推。 */
@@ -2150,6 +2174,10 @@ void WorldSim::reset_mission() {
        但表现层的池是有状态的（哪些槽在用、曳光弹 mesh 里还留着上一局的线段）。
        不清的话，重开的第一帧会闪出上一局最后那几发弹的曳光。 */
     fx_.reset();
+    /* 朝向层也要清：状态里有"上一帧的显示朝向"，重打本关时单位数往往一个不差，
+       st_ 不会因为数量变化被重建 —— 不清的话新一关第一帧会从上一关最后那个
+       朝向**平滑转**过去（而不是吸附），开局全队一起甩头。 */
+    face_.reset();
     /* 语音侧同样要清一次：调度只看"HUD 当前停在哪一屏"（vo_screen_），
        重开一局若不清这个样本，下一帧会被当成"屏没变"——
        而那时玩家可能已经退回简报页，于是新一关的任务介绍一声不吭。

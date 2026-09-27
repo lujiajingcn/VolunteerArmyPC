@@ -18,6 +18,7 @@
 #include "node/mic.h"
 #include "node/scene_builder.h"
 #include "node/unit_anim.h"
+#include "node/unit_face.h"
 #include "node/unit_leg.h"
 #include "node/viewmodel.h"
 #include "node/voice.h"
@@ -127,6 +128,13 @@ private:
        与 anim_ 同一类：只读逻辑层状态、挂在 sync_entity_nodes 里、
        **VA_LEG=0 时完全不动作**（连材质都不换），删掉不影响任何逻辑。 */
     UnitLeg leg_;
+    /* 朝向平滑（见 node/unit_face.h）：逻辑层的 Unit::facing 没有角速度限制
+       （va_ai_ally.cpp:35 是直接赋值），而表现层原来逐帧原样上屏 ——
+       于是 steer_angle 换档 / aiming 翻转这些输入侧噪声 1:1 变成画面上的急转，
+       看起来就是"队友在原地快速转圈"。
+       与 anim_/leg_ 同一类：只读逻辑层状态、挂在 sync_entity_nodes 里、
+       **VA_FACE=0 时 display() 原样返回 u.facing**，删掉不影响任何逻辑。 */
+    UnitFace face_;
     /* 射击光效（见 node/fx_layer.h）：枪口焰 / 曳光弹 / 弹着火花，
        全部从逻辑层**早就在发**的 fx 与 projectiles 里读，按阵营分色。
        与 anim_/leg_ 同一类：只读逻辑层状态、删掉不影响任何逻辑；
