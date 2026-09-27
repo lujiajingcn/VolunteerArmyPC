@@ -14,12 +14,20 @@
 
 用法: python tools/press_key_post.py R "VolunteerArmyPC (DEBUG)"
       python tools/press_key_post.py Q "VolunteerArmyPC" 6      # 按住 6 秒
+      python tools/press_key_post.py Q "" 6 --pid 8116          # 按 PID 精准投递
 
 【第 3 个参数：按住多久（秒）】默认 0.06（"点一下"）。语音输入是**按住说话**，
 0.06 秒只说得出一个字的一半，所以那类验证必须显式给时长。
 ⚠️ 这里按住时**不会**产生系统按键重复（PostMessage 不生成）——
 本工程恰好需要这样：Q 是 is_hold_key，靠 keydown/keyup 两个状态即可，
 不需要 echo 重建。若要验"按住类手感"，仍得走 inject_key.py。
+
+【--pid：为什么非要有】标题是**猜**的，PID 是**准**的。两种场合标题法必错：
+  · 同一份工程开着两个实例（比如 VS 里 F5 调着一份，脚本又起一份做取证）——
+    标题一模一样，`find_window` 只会挑"最短的那个"，投给谁全看 EnumWindows 的
+    遍历顺序，实测会**投进正在调试的那个窗口**（把人家的会话搅了）；
+  · 标题里带 (DEBUG) 的窗口同时属于 VS 自己（VS 的标题也含工程名）。
+给了 --pid 就完全绕开标题：只枚举属于该 PID 的可见窗口，没有就安全中止。
 """
 import ctypes
 import ctypes.wintypes as wt
@@ -60,25 +68,65 @@ def find_window(substr):
     return hits[0]
 
 
+def find_window_by_pid(pid):
+    """只认属于 pid 的**可见且带标题**的顶层窗口 —— 多实例并存时唯一可靠的办法。"""
+    hits = []
+
+    def cb(hwnd, _):
+        wpid = wt.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+        if wpid.value != pid or not user32.IsWindowVisible(hwnd):
+            return True
+        n = user32.GetWindowTextLengthW(hwnd)
+        if n > 0:
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(hwnd, buf, n + 1)
+            hits.append((hwnd, buf.value))
+        return True
+
+    user32.EnumWindows(WNDENUMPROC(cb), 0)
+    if not hits:
+        return None, None
+    hits.sort(key=lambda t: len(t[1]))
+    return hits[0]
+
+
 def main():
-    key = (sys.argv[1] if len(sys.argv) > 1 else "R").upper()
-    title = sys.argv[2] if len(sys.argv) > 2 else "VolunteerArmyPC"
-    hold = float(sys.argv[3]) if len(sys.argv) > 3 else 0.06
+    argv = sys.argv[1:]
+    pid = None
+    if "--pid" in argv:
+        i = argv.index("--pid")
+        try:
+            pid = int(argv[i + 1])
+        except (IndexError, ValueError):
+            print("[press] --pid 后面要跟一个整数")
+            return 2
+        del argv[i:i + 2]
+
+    key = (argv[0] if len(argv) > 0 else "R").upper()
+    title = argv[1] if len(argv) > 1 else "VolunteerArmyPC"
+    hold = float(argv[2]) if len(argv) > 2 else 0.06
     if key not in VK:
         print("[press] 未知键:", key)
         return 2
-    hwnd, found = find_window(title)
-    if hwnd is None:
-        print("[press] 找不到标题含 %r 的窗口" % title)
-        return 1
+    if pid is not None:
+        hwnd, found = find_window_by_pid(pid)
+        if hwnd is None:
+            print("[press] pid %d 没有可见的带标题窗口（进程起了吗？）" % pid)
+            return 1
+    else:
+        hwnd, found = find_window(title)
+        if hwnd is None:
+            print("[press] 找不到标题含 %r 的窗口" % title)
+            return 1
     vk = VK[key]
     # lParam 让 Godot 能算出"是不是系统重复"：bit30(0x40000000)=上一次键态。
     # 这里按下/抬起各一次，bit30 都是 0 → 不会被标成 echo。
     user32.PostMessageW(hwnd, WM_KEYDOWN, vk, 0x00100001)
     time.sleep(hold)
     user32.PostMessageW(hwnd, WM_KEYUP, vk, 0xC0100001)
-    print("[press] 已向 pid 窗口 %r (hwnd=0x%08X) 投递 %s（按住 %.2fs）"
-          % (found, hwnd, key, hold))
+    print("[press] 已向 pid=%s 窗口 %r (hwnd=0x%08X) 投递 %s（按住 %.2fs）"
+          % (pid if pid is not None else "(按标题)", found, hwnd, key, hold))
     return 0
 
 

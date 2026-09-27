@@ -8,6 +8,9 @@
 #   tools/capture_mic.sh shot                      # 窗口化截图：收起态（不按 Q）
 #   tools/capture_mic.sh hold                      # 窗口化：按住 Q 跨过截图时刻 → 展开态
 #   tools/capture_mic.sh pair                      # 窗口化：按一下 Q 再松 → 开始听/停止听
+#   tools/capture_mic.sh say                       # 窗口化：**扬声器放指令音频让内置麦听见** + 按住 Q
+#                                                  #   —— OneCore 唯一能自动证明"真的收到了音频"的路
+#                                                  #   （pair 模式下没人说话，出了"开始听"什么都证明不了）
 #   tools/capture_mic.sh off                       # VA_MIC=0 对照：整层不建
 #
 # 【wav 模式为什么要区分后端】VA_MIC_WAV 只有 SAPI5 这条路认 ——
@@ -118,7 +121,8 @@ case "$MODE" in
   shot) export VA_CAPTURE="${VA_CAPTURE:-10}" ;;                 # 不投键 → 收起态
   hold) export VA_CAPTURE="${VA_CAPTURE:-12,20}"; HOLD=40; KEY=Q ;;  # 按住跨过 12s/20s
   pair) unset VA_CAPTURE; HOLD=4; KEY=Q ;;                        # 起停成对，靠日志判
-  *) echo "未知模式：$MODE（probe | wav | shot | hold | pair | off）"; exit 1 ;;
+  say)  unset VA_CAPTURE; HOLD="${VA_SAY_SECS:-30}"; KEY=Q; SAY=1 ;;  # 放音频让内置麦听见 + 按住 Q
+  *) echo "未知模式：$MODE（probe | wav | shot | hold | pair | say | off）"; exit 1 ;;
 esac
 # 所有窗口化模式都必须直接进战斗屏：语音会话只在 SCREEN_PLAY 且外壳未激活时收话
 # （mic_step 里那两条 early-return），而 apply_key 在界面外壳期间被 shell_owns_input()
@@ -138,10 +142,40 @@ for i in $(seq 1 60); do
 done
 sleep 2   # 窗口标题比日志那行晚一点，投早了会「找不到窗口」
 
-if [ -n "${KEY:-}" ]; then
-  echo "投键 $KEY（按住 ${HOLD}s）…"
-  "$PY" "$ROOT/tools/press_key_post.py" "$KEY" "VolunteerArmyPC" "$HOLD" || true
+# ⚠️ 窗口标题是**猜**的：小卢经常同时用 VS 调着一份（标题一模一样），
+#    按标题投键会投进**正在调试**的那个窗口、把人家会话搅了。
+#    所以这里按 PID 投 —— 取刚启动的这台（pid 最大的那个 Godot 主进程）。
+WINPID="$(ps -W 2>/dev/null | grep -F 'Godot_v4.5-stable_win64' | grep -v console \
+          | awk '{print $4}' | tail -1)"
+
+# say 模式：从**扬声器**放指令音频，让**内置麦克风**听见。
+# 这是唯一能自动证明"OneCore 真的收到了音频"的路子 —— 音量受系统音量影响，
+# 所以判据是"有没有 [mic] 听到声音了 / 定稿结果"，而不是"识别得对不对"。
+if [ "${SAY:-0}" = "1" ]; then
+  FFPLAY="${VA_FFPLAY:-D:/ffmpeg/ffplay.exe}"
+  if [ ! -f "$FFPLAY" ]; then
+    echo "⚠️ 找不到 ffplay（$FFPLAY）→ say 模式退化成 pair，判据只剩起停。"
+    echo "   可用 VA_FFPLAY=<路径> 指定；素材在 sweep/mic_wav/。"
+    SAY=0
+  fi
 fi
+if [ "${SAY:-0}" = "1" ]; then
+  echo "播指令音频（$FFPLAY，让内置麦听见）…"
+  ( for r in $(seq 1 10); do
+      for f in 1_fire 2_retreat 3_cover; do
+        "$FFPLAY" -nodisp -autoexit -volume 100 -loglevel quiet \
+                  "$(cygpath -w "$ROOT/sweep/mic_wav/$f.wav")"
+      done
+    done ) > "$OUT/play.log" 2>&1 &
+  PLAYPID=$!
+fi
+
+if [ -n "${KEY:-}" ]; then
+  echo "投键 $KEY（按住 ${HOLD}s，投给 pid=$WINPID）…"
+  "$PY" "$ROOT/tools/press_key_post.py" "$KEY" "" "$HOLD" --pid "$WINPID" || true
+fi
+
+if [ -n "${PLAYPID:-}" ]; then kill "$PLAYPID" 2>/dev/null; fi
 
 if [ "$MODE" = "hold" ]; then
   # 游戏会在最后一张截图后自己退出；等一会儿，等不到就手动收 ——
@@ -166,6 +200,9 @@ grep -E '\[mic\].*(识别器已建|后端就绪|就绪|不可用|回退|start �
 echo "--- 链路层：会话起停（判据在这一段）---"
 grep -E '\[mic\] (开始听|停止听|下发)' "$LOG" | head -10
 echo "开始听=$(grep -c '开始听' "$LOG")  停止听=$(grep -c '停止听' "$LOG")  start失败=$(grep -c 'start 失败' "$LOG")  下发=$(grep -c '\[mic\] 下发' "$LOG")"
+# 这两行是 2026-09-27 加的 —— 语音层最容易"静默失败"：
+# "开始听"打出来了也可能一个字节音频都没进来。所以判据必须有"收到过音频"的正证。
+echo "听到声音了=$(grep -c '听到声音了' "$LOG")  定稿结果=$(grep -c '定稿结果' "$LOG")  回调异常=$(grep -c '接住' "$LOG")  StartAsync状态=$(grep -c 'StartAsync' "$LOG")"
 if [ -n "${VA_CAPTURE:-}" ]; then
   echo "--- 截图 ---"
   ls -1 "$OUT"/cap_*.png 2>/dev/null | head

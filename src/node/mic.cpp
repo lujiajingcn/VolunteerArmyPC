@@ -98,6 +98,21 @@ std::string hr_text(HRESULT hr) {
     return std::string(b);
 }
 
+/* 把 winrt::hresult_error 压成一行「码 + 人话」。
+   ⚠️ 本身必须**不抛**：它专供识别回调的 catch 块用（那里再抛就是二次事故），
+   所以连 message() 都包一层 —— message 没缓存时会去 FormatMessage。 */
+std::string hr_e_text(const winrt::hresult_error &e) {
+    char b[32];
+    std::snprintf(b, sizeof(b), "0x%08X ", (unsigned)e.code().value);
+    std::string s(b);
+    try {
+        s += winrt::to_string(e.message());
+    } catch (...) {
+        s += "(message 取不到)";
+    }
+    return s;
+}
+
 /* WinRT 的置信度是**三档枚举**，不是概率。
    映射到 0~1 只是为了让逻辑层的 parse_command(asr=...) 有东西可用 ——
    那里 conf = lerpf(conf, asr, 0.55)，本工程自己会对"战场噪声"再打折。 */
@@ -235,6 +250,35 @@ struct MicVoice::Impl {
     std::atomic<long> accepted{0};
     std::atomic<long> rejected{0};
 
+    /* 回调里**接住**的异常。为什么不就地打日志：dbg() 走的是
+       godot::UtilityFunctions::print()，而回调跑在识别器的线程上，
+       那里碰 Godot 的对象系统是不安全的。所以只记在这儿，
+       由主线程在 pump() 里补一次日志（见 MicVoice::pump）。 */
+    std::atomic<long> cb_err{0};
+    std::string cb_err_where;
+    long cb_err_reported = 0;
+
+    /* 同样只在回调线程自增、由主线程打出来的"证据计数器"。
+       为什么非要这个：语音这一层最坑的就是**静默失败** ——
+       "开始听"打出来了、HUD 也亮了，玩家对麦喊半天什么都没发生，
+       而日志里一句异常都没有（hypothesis / result 这两条事件
+       此前**一个字节都不落日志**）。设了 VA_DBG_MIC 还看不出
+       "到底有没有音频进来"，等于没有可观测性。 */
+    std::atomic<long> hyp_seen{0};      // 中间结果（说话时每几个字一条）
+    std::string hyp_last;               // 受 mu 保护
+    long hyp_reported = 0;
+    std::atomic<long> res_seen{0};      // 定稿结果
+    std::atomic<long> res_bad{0};       // 定稿但 Status != Success
+    long res_reported = 0;
+    bool start_reported = false;        // StartAsync 的完成状态是否已报过
+
+    void note_cb_error(const char *p_where, const std::string &p_msg) {
+        rejected.fetch_add(1);
+        std::lock_guard<std::mutex> lk(mu);
+        cb_err.fetch_add(1);
+        cb_err_where = std::string(p_where) + "（" + p_msg + "）";
+    }
+
     void push(std::string p_text, float p_conf) {
         std::lock_guard<std::mutex> lk(mu);
         queue.emplace_back(std::move(p_text), p_conf);
@@ -246,6 +290,22 @@ struct MicVoice::Impl {
     // 依据是 MIDL 头里的 ISpeechContinuousRecognitionSession，第一版照着
     // "SpeechRecognizer" 类推写错了。
     WSR::SpeechContinuousRecognitionSession session{nullptr};
+    /* StartAsync 返回的那个异步操作**必须存住**，理由是两条：
+       ① 「OneCore 起不来」是**异步**报出来的：只调不查 = 会话看着起来了
+          （listen_ 被置 true、HUD 也亮红点），其实一句都没听 ——
+          系统的语音隐私开关关掉时就是这个症状，此前整层看不见；
+       ② 连错误码都拿不到。主线程在 pump() 里查它的状态（见 MicVoice::pump）。 */
+    winrt::Windows::Foundation::IAsyncAction start_op{nullptr};
+    /* StopAsync 同样存住，理由和 start_op 相反：它是**阻止**我们再 Start 的那个。
+       ⚠️ 会话处在 Stopping 时调 StartAsync 会**同步**抛 hresult_error
+       （实测 2026-09-27：连按两次 Q 必现）。这里存下来只为查状态，
+       状态查询本身不抛。 */
+    winrt::Windows::Foundation::IAsyncAction stop_op{nullptr};
+    bool defer_start = false;           // 上一次 Stop 没落地 → 下一帧再 Start
+    /* 会话是否**已经起过**（OneCore 走"常开"：起一次，之后只切采信开关）。
+       见 MicVoice::start 里那两条理由 —— Start/Stop 往返在连续识别会话上
+       是个陷阱：StopAsync 既要等当前这句说完、又是异步的，等不到就只能卡住。 */
+    bool sess_live = false;
     winrt::event_token tok_result{};
     winrt::event_token tok_hyp{};
     bool has_result_tok = false;
@@ -346,24 +406,60 @@ bool MicVoice::Impl::setup_winrt(bool p_dictation, std::string &p_err, std::stri
         // 与第一版同一个不变式（谁也不会在对象没了之后还回调）。
         tok_result = session.ResultGenerated(
             [this](const auto &, const WSR::SpeechContinuousRecognitionResultGeneratedEventArgs &a) {
-                auto r = a.Result();
-                if (r.Status() != WSR::SpeechRecognitionResultStatus::Success) {
-                    rejected.fetch_add(1);
-                    return;
+                /* ⚠️⚠️ 这里是 **WinRT 事件回调**，异常一个字都不许逃出去。
+                   C++/WinRT 的事件委托**不做** try/catch，异常会直接穿过 COM 的
+                   ABI 边界 —— 症状就是"按住 Q 说话，游戏没了"（2026-09-27 本机实证：
+                   VS 报 winrt::hresult_error，取消之后进程直接终止）。
+                   整个回调体裹一层是本层的铁律，不是防御性编程：
+                   回调不是我们调的，是我们**被**调的，栈上没有我们的 catch。 */
+                try {
+                    auto r = a.Result();
+                    if (r == nullptr) { rejected.fetch_add(1); return; }
+                    if (r.Status() != WSR::SpeechRecognitionResultStatus::Success) {
+                        rejected.fetch_add(1);
+                        res_bad.fetch_add(1);
+                        return;
+                    }
+                    std::string t = winrt::to_string(r.Text());
+                    if (t.empty()) return;
+                    res_seen.fetch_add(1);
+                    // 只入队：这里在识别器线程上，绝不能碰 va:: 的任何东西。
+                    push(std::move(t), conf_value(r.Confidence()));
+                } catch (const winrt::hresult_error &e) {
+                    note_cb_error("结果回调", hr_e_text(e));
+                } catch (const std::exception &e) {
+                    note_cb_error("结果回调", std::string("std::exception: ") + e.what());
+                } catch (...) {
+                    note_cb_error("结果回调", "未知异常");
                 }
-                std::string t = winrt::to_string(r.Text());
-                if (t.empty()) return;
-                // 只入队：这里在识别器线程上，绝不能碰 va:: 的任何东西。
-                push(std::move(t), conf_value(r.Confidence()));
             });
         has_result_tok = true;
 
         /* 中间结果那条挂在**识别器**上（ISpeechRecognizer2::HypothesisGenerated），
-           不在会话上 —— 这是 WinRT 的既有形状，照 MIDL 头抄，别按会话的思路类推。 */
+           不在会话上 —— 这是 WinRT 的既有形状，照 MIDL 头抄，别按会话的思路类推。
+           ⚠️ 这条比定稿结果**触发得频繁得多**（说几个字就来一条），
+           所以它是"一说话就崩"的第一嫌疑人：不说话的按键测试（pair 模式）
+           永远碰不到它。异常同样必须兜住。 */
         tok_hyp = rec.HypothesisGenerated(
             [this](const auto &, const WSR::SpeechRecognitionHypothesisGeneratedEventArgs &a) {
-                std::lock_guard<std::mutex> lk(mu);
-                interim = winrt::to_string(a.Hypothesis().Text());
+                try {
+                    auto h = a.Hypothesis();
+                    if (h == nullptr) return;
+                    /* 先转成 std::string 再进锁：持锁期间不调 WinRT ——
+                       主线程的 interim() 走的是同一把锁，回调万一被 marshal 到
+                       Godot 的 Main STA 上，就是同线程二次加锁的死锁。 */
+                    std::string s = winrt::to_string(h.Text());
+                    std::lock_guard<std::mutex> lk(mu);
+                    interim = std::move(s);
+                    hyp_seen.fetch_add(1);
+                    hyp_last = interim;
+                } catch (const winrt::hresult_error &e) {
+                    note_cb_error("中间结果回调", hr_e_text(e));
+                } catch (const std::exception &e) {
+                    note_cb_error("中间结果回调", std::string("std::exception: ") + e.what());
+                } catch (...) {
+                    note_cb_error("中间结果回调", "未知异常");
+                }
             });
         has_hyp_tok = true;
 
@@ -399,6 +495,10 @@ void MicVoice::Impl::teardown_winrt() {
     }
     has_result_tok = false;
     has_hyp_tok = false;
+    start_op = nullptr;
+    stop_op = nullptr;
+    defer_start = false;
+    sess_live = false;
     session = nullptr;
     rec = nullptr;
     if (kind == Kind::Winrt) kind = Kind::None;
@@ -666,13 +766,30 @@ void MicVoice::try_start() {
     bool ok = false;
     std::string err;
     if (I.kind == Impl::Kind::Winrt) {
+        using winrt::Windows::Foundation::AsyncStatus;
+        /* ⚠️⚠️ 上一次 StopAsync 还没落地时**绝不能** StartAsync。
+           会话此刻处于 Stopping，再 Start 会**同步**抛 winrt::hresult_error
+           （2026-09-27 实测：连按两次 Q 必现，抛点就在这句）。
+           异常虽然被下面的 catch 接住、流程也走回退，
+           但 **VS 调试器是在"抛出点"中断的**（第一次异常通知）——
+           玩家看到的就是"按住 Q 说话，游戏弹异常/崩了"。
+           推迟一帧就够：want_ 一直存着，pump 会替我们再来一次。 */
+        if (I.stop_op != nullptr && I.stop_op.Status() == AsyncStatus::Started) {
+            I.defer_start = true;
+            return;
+        }
         try {
             /* 不 .get()：StartAsync 要打开麦克风，阻塞等会把主线程卡住几十毫秒。
-               识别结果本来就走事件回队列，不等也拿得到。 */
-            I.session.StartAsync();
+               识别结果本来就走事件回队列，不等也拿得到。
+               ⚠️ 但**必须存住**这个 action：
+               ① 起不来是异步报的，pump() 里要对账；
+               ② 把最后一个引用放掉等于**取消**这个异步操作（实测），会话就废了。 */
+            I.start_op = I.session.StartAsync();
             ok = true;
         } catch (const winrt::hresult_error &e) {
-            err = "winrt start: " + winrt::to_string(e.message());
+            // 一定用 hr_e_text：这个错误的 message 本机取不到（"无法找到与此错误
+            // 代码关联的文本"），不打出码就完全没法定位。
+            err = "winrt start: " + hr_e_text(e);
         } catch (...) {
             err = "winrt start: 未知异常";
         }
@@ -684,7 +801,14 @@ void MicVoice::try_start() {
 
     if (ok) {
         listen_ = true;
-        { std::lock_guard<std::mutex> lk(I.mu); I.interim.clear(); }
+        I.sess_live = true;
+        { std::lock_guard<std::mutex> lk(I.mu); I.interim.clear(); I.queue.clear(); }
+        /* 每轮会话都让"听到声音了 / 定稿了"重新报一次：
+           要确认的是**这一次**按键有没有音频进来，而不是"历史上曾经有过"。
+           −1 是哨兵：表示"本轮还没有过中间结果"（见 pump 里的 first 判定）。 */
+        I.hyp_reported = -1;
+        I.res_reported = I.res_seen.load();
+        I.start_reported = false;
         dbg("开始听（%s）", backend_.c_str());
     } else {
         last_error_ = err;
@@ -721,6 +845,29 @@ void MicVoice::start() {
     if (!enabled_) return;
     want_ = true;
     if (!impl_) return;
+    Impl &I = *impl_;
+
+    /* ---- OneCore 走"会话常开" ----
+       第一次按 Q 才 StartAsync；之后每次按 Q 只把 listen_ 立起来
+       （即"开始采信识别结果"），**不**重启会话。两条理由都是实测来的坑：
+         ① StopAsync 是**异步**的，它没落地时再 StartAsync 会**同步**抛
+            hresult_error —— 而 VS 调试器在抛出点就中断（玩家看到的是"按 Q 说话
+            游戏弹异常/崩了"）。连按两次 Q 就能复现。
+         ② StopAsync 还会等"当前这句话说完"才返回；我们为了不卡住松键那一下
+            又不能 .get() 等它 —— 于是第二下按 Q 会永远起不来（实测：日志里
+            连"开始听"都不出现）。
+       代价只有一个：麦克风从第一次按 Q 起一直开着（Windows 托盘会显示
+       "正在使用麦克风"）。玩家侧语义不变 —— 没按住 Q 时收到的结果由
+       poll() / interim() 丢掉（见那两处）。 */
+    if (I.kind == Impl::Kind::Winrt && I.sess_live) {
+        listen_ = true;
+        { std::lock_guard<std::mutex> lk(I.mu); I.interim.clear(); I.queue.clear(); }
+        // 和 try_start() 成功那条一样：每一轮按键都重新开始看"有没有听到声音"
+        I.hyp_reported = -1;
+        I.res_reported = I.res_seen.load();
+        dbg("开始听（%s，会话常开）", backend_.c_str());
+        return;
+    }
     try_start();
 }
 
@@ -729,12 +876,9 @@ void MicVoice::stop() {
     if (!impl_ || !listen_) return;
     Impl &I = *impl_;
     if (I.kind == Impl::Kind::Winrt) {
-        /* 同样不等：StopAsync 会等"最后一句"识别完才返回，几百毫秒 ——
-           松开按键时卡那一下很难受。让它在后台收尾，结果照样走事件。 */
-        try {
-            if (I.session != nullptr) I.session.StopAsync();
-        } catch (const winrt::hresult_error &) {
-        }
+        /* ⚠️ **故意不调 StopAsync**（见 MicVoice::start 顶部那两条）。
+           会话留着常开，只是不再采信结果。真正停会话只发生在
+           teardown_winrt()：换后端 / 析构时才停。 */
     } else if (I.kind == Impl::Kind::Sapi) {
         std::string err;
         I.sapi_set_active(false, err);
@@ -747,9 +891,90 @@ void MicVoice::pump() {
     if (!impl_) return;
     Impl &I = *impl_;
 
+    /* ---- ① 回调里接住的异常：在这儿补一条日志 ----
+       回调跑在识别器线程，dbg() 走 Godot 的 print（碰对象系统）不安全，
+       所以回调只把"哪条回调 + 什么错"记进 Impl，由主线程一次报出来。
+       报出来**不改变任何行为** —— 异常已经被兜在回调里了，会话照旧；
+       这条日志的用途是：下次真出问题，能一眼看出是 WinRT 哪一步、什么码。 */
+    const long ce = I.cb_err.load();
+    if (ce != I.cb_err_reported) {
+        I.cb_err_reported = ce;
+        std::string w;
+        { std::lock_guard<std::mutex> lk(I.mu); w = I.cb_err_where; }
+        dbg("⚠️ 识别回调里接住 %ld 次异常，最后一次 %s（已兜住，会话不受影响）",
+            ce, w.c_str());
+    }
+
+    /* ---- ①-b 证据计数器：到底有没有音频进来过 ----
+       这是本层唯一能自证"会话真的在工作"的东西。没有它，
+       "按 Q 说话没反应"与"麦克风没拾到"与"识别器没起会话"三者长得一模一样。 */
+    const long hs = I.hyp_seen.load();
+    if (hs > I.hyp_reported) {
+        const bool first = (I.hyp_reported < 0);   // 每轮会话的哨兵（try_start 里置 -1）
+        I.hyp_reported = hs;
+        if (first) {
+            std::string t;
+            { std::lock_guard<std::mutex> lk(I.mu); t = I.hyp_last; }
+            dbg("听到声音了（中间结果第 1 条：「%s」）—— 会话确实在收话", t.c_str());
+        }
+    }
+    const long rs = I.res_seen.load();
+    if (rs > I.res_reported) {
+        I.res_reported = rs;
+        dbg("定稿结果第 %ld 条（已入队，交给 parse_command）", rs);
+    }
+
+    /* ---- ② StartAsync 的成败是**异步**报的，必须在这儿对账 ----
+       只调不查 = "OneCore 起不来"完全静默：listen_=true、HUD 亮红点、
+       玩家对着麦喊半天什么都没有，而且一句日志都不留。
+       查出来就按 auto 的既定规矩回退（与 try_start 里同步失败那条一致）。 */
+    if (I.kind == Impl::Kind::Winrt && I.start_op != nullptr) {
+        using winrt::Windows::Foundation::AsyncStatus;
+        const AsyncStatus st = I.start_op.Status();
+        if (st == AsyncStatus::Error) {
+            char hb[24];
+            std::snprintf(hb, sizeof(hb), "0x%08X", (unsigned)I.start_op.ErrorCode().value);
+            last_error_ = std::string("winrt start(异步) ") + hb;
+            dbg("StartAsync 异步失败：%s", last_error_.c_str());
+            I.start_op = nullptr;
+            listen_ = false;
+            if (pref_ == "auto") pending_fallback_ = true;
+        } else if (st == AsyncStatus::Started) {
+            /* ⚠️ 还在飞 —— 这里**绝对不能**置 nullptr。
+               实测（2026-09-27）：把 IAsyncAction 的最后一个引用放掉，
+               系统会把这个异步操作**取消**掉（下一帧 Status() 变 Canceled），
+               会话就此再也收不到任何音频。这正是原来那句
+               `I.session.StartAsync();`（临时对象出了语句就析构）埋下的坑。 */
+        } else {
+            if (!I.start_reported) {
+                I.start_reported = true;
+                dbg("StartAsync 回来了：%s",
+                    st == AsyncStatus::Completed ? "成功（麦克风已开）" : "已取消");
+            }
+            I.start_op = nullptr;   // 完成 / 取消：引用可以放了
+        }
+    }
+
     if (pending_fallback_) {
         if (!want_) pending_fallback_ = false;
         else { do_fallback(); return; }
+    }
+
+    /* ---- ③ StopAsync 的门槛（兜底）----
+       现在 stop() 不再主动停 OneCore 会话（会话常开，见 MicVoice::start），
+       所以 stop_op 正常一直是空、这两段不会触发。留着是因为它们是"防止
+       StartAsync 在会话 Stopping 时同步抛"的唯一护栏 —— 将来谁要把
+       StopAsync 加回 stop()，这里能挡住那个必现的异常。
+       ① 只放**非 Started** 的 action：放掉一个还在飞的是**取消**它，
+          那会话就永远停在 Stopping 了；
+       ② 被推迟的 Start 在这儿重来一次（仍然会被①挡住，不会变成每帧抛）。 */
+    if (I.kind == Impl::Kind::Winrt && I.stop_op != nullptr) {
+        using winrt::Windows::Foundation::AsyncStatus;
+        if (I.stop_op.Status() != AsyncStatus::Started) I.stop_op = nullptr;
+    }
+    if (I.defer_start) {
+        I.defer_start = false;
+        if (want_ && !listen_) try_start();
     }
 
     /* wav 取证模式（VA_MIC_WAV）**与后端无关**：只要给了这个旋钮，就替玩家走一遍
@@ -766,6 +991,13 @@ bool MicVoice::poll(std::string &p_text, float &p_confidence) {
     if (!impl_) return false;
     Impl &I = *impl_;
     std::lock_guard<std::mutex> lk(I.mu);
+    /* 没按住 Q 时收到的结果一律**丢掉** —— 但**只对 OneCore**。
+       为什么只对它：OneCore 是"会话常开"（见 MicVoice::start），松手之后
+       识别还在继续跑、结果还在往队列里灌，不丢就会"松手后忽然下令"。
+       而 SAPI5 是松手即 SetRecoState(INACTIVE)，之后不会再有新结果，
+       队列里剩下的是**按着的时候**说的那句 —— 那必须照常下发
+       （实测：不加这个 kind 判断，wav 取证就从"听清+下发"退化成只有"听清"）。 */
+    if (I.kind == Impl::Kind::Winrt && !listen_) { I.queue.clear(); return false; }
     if (I.queue.empty()) return false;
     auto one = std::move(I.queue.front());
     I.queue.pop_front();
@@ -776,7 +1008,8 @@ bool MicVoice::poll(std::string &p_text, float &p_confidence) {
 }
 
 std::string MicVoice::interim() const {
-    if (!impl_) return {};
+    // 常开会话：没按住 Q 时不往外显示（HUD 的展开态只在 listening 时为真）
+    if (!impl_ || !listen_) return {};
     Impl &I = *impl_;
     std::lock_guard<std::mutex> lk(I.mu);
     return I.interim;

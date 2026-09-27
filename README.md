@@ -2604,6 +2604,38 @@ reg add "HKCU\Software\Microsoft\Speech_OneCore\Settings\OnlineSpeechPrivacy" \
 - **没解析出来要把听到的说出来**：识别错字与"这压根不是指令"是两回事。
   只回一句"没听懂"，玩家分不清是自己说错了还是游戏没听见 ——
   所以 HUD 弹的是 `未听清指令：<识别器听到的那串>`。
+- **OneCore 后端是「会话常开」**：按下 `start()` 只是"开始采信结果"，
+  会话本身从第一次按 Q 起一直开着。**这不是省事，是唯一可行的做法** ——
+  见下面「会话常开」那节。
+
+### ⚠️ OneCore 会话**常开**：不做 Start/Stop 往返
+
+SAPI5 是"按一下开一次、松手关掉"；**OneCore 不能这么用**。三条都是 2026-09-27
+实机撞出来的（连按两次 Q 就复现），而且**前两条光看构建结果与离线基线完全发现不了**：
+
+1. **`StopAsync` 没落地时再 `StartAsync` → 同步抛 `winrt::hresult_error`。**
+   `[mic] start 失败：winrt start: <码> <消息>`（本机连 message 都取不到，
+   所以 `hr_e_text` 必须把 HRESULT 打进日志，否则连是个什么错都看不见）。
+   异常虽然被 `try_start` 的 catch 接住、流程也走回退，
+   但 **VS 调试器是在"抛出点"中断的**（第一次异常通知对话框）——
+   玩家看到的就是"按住 Q 说话，游戏弹异常/崩了"。
+2. **`StopAsync` 还会等"当前这句话说完"才返回**，而我们不能 `.get()` 等它
+   （松键时卡几百毫秒很难受）。于是"推迟到 Stop 落地再 Start"这条看似稳妥的路
+   会**永久卡住**：第二下按 Q 连 `开始听` 都不出现，日志一片空白
+   （实测：`开始听=1 停止听=1`，之后无论按多少次都没反应）。
+3. **把 `StartAsync()` 返回的 `IAsyncAction` 临时对象丢掉 = 取消这个异步操作。**
+   原来那句 `I.session.StartAsync();` 正是这个写法（出了语句就析构）。
+   `Status()` 会从 `Started` 变 `Canceled`。
+
+所以现在：`start_op` / `stop_op` **两个 action 都存住**，`pump()` 里查 `Status()`
+（并且**只放非 `Started` 的** —— 放掉一个还在飞的同样是取消它）；
+`stop()` 对 OneCore **不调** `StopAsync`，真停会话只发生在 `teardown_winrt()`
+（换后端 / 析构）。没按住 Q 时收到的结果由 `poll()`（**只对 OneCore** ——
+SAPI 松手即 `INACTIVE`，队列里那句是"按着的时候"说的，必须照常下发）和
+`interim()` 丢掉。玩家侧语义不变：按住才生效。
+
+> 代价：麦克风从**第一次按 Q** 起一直开着（Windows 托盘会显示"正在使用麦克风"）。
+> 换来的是"连按多少次 Q 都不会抛异常"。
 
 ### 线程模型：回调只入队，主线程才碰 `va::`
 
@@ -2614,8 +2646,10 @@ reg add "HKCU\Software\Microsoft\Speech_OneCore\Settings\OnlineSpeechPrivacy" \
 "OneCore 起不来"是在 `start()` 里发现的，那时还在 `_input` 阶段；
 拆 COM 对象、建新对象只能在主线程做，所以回退推迟到下一帧的 `pump()`。
 
-`want_`（玩家**意图**在听，按着 Q）与 `listen_`（会话**实际**在听）是分开的两个标志 ——
+`want_`（玩家**意图**在听，按着 Q）与 `listen_`（**正在采信结果**）是分开的两个标志 ——
 只有分开才谈得上"回退时把玩家的意图续到新后端上"。
+⚠️ OneCore 常开之后，`listen_` **不再等于"会话在跑"**（会话一直在跑），
+它等于"玩家按着、结果该被采信"—— 这正好是 HUD 与 `poll()` 需要的口径。
 
 ### HUD：一条状态条
 
@@ -2644,10 +2678,16 @@ reg add "HKCU\Software\Microsoft\Speech_OneCore\Settings\OnlineSpeechPrivacy" \
 bash tools/capture_mic.sh probe [winrt|sapi|auto]  # 只建识别器，报 backend / 语言
 bash tools/capture_mic.sh wav   [后端]              # 离线喂 wav：识别→解析→下发全自动
 bash tools/capture_mic.sh pair  [后端]              # 实机按住 Q 4 秒，看"开始听/停止听"成对
+bash tools/capture_mic.sh say   [后端]              # 扬声器放指令音频让**内置麦**听见 + 按住 Q
+                                                    #  —— 唯一能自动证明"OneCore 真收到了音频"
 bash tools/capture_mic.sh hold  [后端]              # 按住 Q 截状态条（展开态）
 bash tools/capture_mic.sh shot                      # 收起态截图（对照）
 bash tools/capture_mic.sh off                       # VA_MIC=0 的对照
 ```
+
+> ⚠️ 窗口化各模式一律**按 PID 投键**（`press_key_post.py --pid`）：小卢经常同时
+> 用 VS 调着一份（窗口标题一模一样），按标题投会投进**正在调试**的那个窗口。
+> ffplay 默认取 `D:/ffmpeg/ffplay.exe`，可用 `VA_FFPLAY` 指定。
 
 wav 素材由 `tools/gen_mic_wav.py` 烘（复用 `gen_voice.py` 的 OneCore 离线 TTS，
 Kangkang 男声）：`全体开火` / `全体撤退` / `全体隐蔽` → `sweep/mic_wav/`（16k mono s16）。
@@ -2663,6 +2703,9 @@ Kangkang 男声）：`全体开火` / `全体撤退` / `全体隐蔽` → `sweep
 | ③ 会话起停（pair winrt，实机按住 4 秒） | `开始听=1 停止听=1 start失败=0` |
 | ④ HUD 状态条（hold auto 截图） | 展开态「红点 + 正在听...」；收起态「按住 Q 说话」 |
 | ⑤ apartment 不再抛（`probe auto`，2026-09-27 修） | `[mic] apartment: CoInitializeEx=0x80010106 本线程=MainSTA` —— 抛点换成普通返回值，F5 开局不再弹首次异常 |
+| ⑥ 连按 Q 不再抛（`say`，2026-09-27 修） | 连按 **4 次** Q：`开始听=4  start失败=0  回调异常=0`（修之前第 2 次**必抛**，VS 调试器必中断）|
+| ⑦ OneCore 真的在收话（`say`） | `[mic] 听到声音了（中间结果第 1 条：「…」）` + `StartAsync 回来了：成功（麦克风已开）` —— 用**扬声器放指令音频让内置麦听见**，第一次拿到"OneCore 收得到音频"的正面证据（此前 pair 模式没人说话，什么也证明不了）|
+| ⑧ 常开会话不泄漏下令（`say`） | 按一次 Q 起会话后**不按键**、只放 20 秒音频：`听到=1`（会话确实在听）而 `下发=0`（没泄漏下令）|
 | 自动回退全链路 | 临时把隐私开关设 0 → `start 失败：…privacy policy was not accepted` → `OneCore 起不来 → 回退 SAPI5` → `听清 → 下发`，之后恢复 1 |
 | 关掉整层（off 对照） | 只剩一行 `[mic] VA_MIC=0 —— 语音输入层关闭` |
 | 离线战役回归 | `va_sweep.exe campaign 7`：过关 4/5、阵亡 3、撤离 37 人次、总用时 1200 秒（**等价基线**，`src/sim/` 一行未改）|
@@ -2672,7 +2715,10 @@ Kangkang 男声）：`全体开火` / `全体撤退` / `全体隐蔽` → `sweep
 > 坏句子 .092/.089 —— 好与坏**分不开**）。不假装能用：写死 0.80，把引擎原值留在
 > 日志里备查。若哪天要用真置信度，得换 `ISpRecoResult::GetPhrase` 之外的路子。
 
-**尚未验证（只能由小卢本机做）**：实机麦克风采音 → 队友真的动起来。
+**尚未验证（只能由小卢本机做）**：实机**真人说话** → 队友真的动起来。
+`say` 模式已能自动证明"OneCore 收到了音频"（扬声器放音频喂内置麦 → `[mic] 听到声音了`），
+但"真人说话 → 定稿成句 → 解析出指令 → 队友动作"这一步仍无法自动化
+（放出来的音频失真，OneCore 定不了稿）。
 上面四条判据能自动拿到的都拿到了，但"对着麦克风说话"这一步无法自动化。
 跑法：`sdk\godot\Godot_v4.5-stable_win64.exe --path .`，进关后**按住 Q** 说
 「全体开火」，看队友是否动作、HUD 是否出现红点「正在听…」。
@@ -2834,8 +2880,12 @@ Kangkang 男声）：`全体开火` / `全体撤退` / `全体隐蔽` → `sweep
   （`Windows.Media.SpeechRecognition`，C++/WinRT）优先、老 SAPI5 桌面识别器
   （裸 COM）回退，`auto` 下 OneCore 起不来会自动切 SAPI5 并把这次会话续上。
   识别文本走 **`typed=false`** 喂进 `parse_command`（`asr` 形参第一次真派上用场），
-  不加二次确认。走独立一层 `src/node/mic.{h,cpp}`（识别回调只入队，主线程
+  不加二次确认。  走独立一层 `src/node/mic.{h,cpp}`（识别回调只入队，主线程
   `pump()` → `poll()` 消费），`src/sim/` 一行未改。`VA_MIC=0` 可整体关。
+  **OneCore 端会话常开**（第一次按 Q 起会话，之后只切"采信/不采信"）——
+  `StopAsync` 没落地时再 `StartAsync` 会**同步抛** `winrt::hresult_error`，
+  而 VS 调试器在**抛出点**就中断（症状 = "按住 Q 说话游戏崩了"）。
+  详见「OneCore 会话常开」一节。
   **待实机验证**：对着麦克风说话 → 队友动作。详见「语音指挥（按住 Q 说话）」。
   **未做的**：TTS 回话（队员用语音答"收到"，目前只有 HUD 无线电字幕）
 - **队友原地转圈已修**：表现层原来是**逐帧把 `Unit::facing` 原样上屏**，而逻辑层的朝向

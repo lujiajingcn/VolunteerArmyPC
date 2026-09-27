@@ -60,7 +60,16 @@ public:
     void set_enabled(bool p_on) { enabled_ = p_on; }
     bool listening() const;          // 正在听
 
-    // 按住说话：按下 start()，松开 stop()。stop 之后结果可能还要几百毫秒才回来。
+    /* 按住说话：按下 start()，松开 stop()。stop 之后结果可能还要几百毫秒才回来。
+
+       ⚠️ OneCore 后端是**会话常开**：只有第一次 start() 会真的 StartAsync 起会话，
+       之后 stop() 只是"不再采信结果"（会话不关，结果照样进队列、由 poll 丢掉）。
+       两条实测理由（2026-09-27，见 mic.cpp 的 MicVoice::start）：
+         ① StopAsync 是异步的，没落地时再 StartAsync 会**同步抛** hresult_error
+            ——VS 调试器在抛出点中断，玩家看到的就是"按 Q 说话游戏崩了"；
+         ② StopAsync 还要等"当前这句说完"，不等它就永远起不来第二次。
+       SAPI5 后端不变，仍是每次真开真关（它没有 Stopping 这个异步态）。
+       玩家侧语义完全一样：按住才生效。区别只是麦克风从第一次按 Q 起一直开着。 */
     void start();
     void stop();
 
