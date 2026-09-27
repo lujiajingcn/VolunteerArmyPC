@@ -549,6 +549,40 @@ constexpr float UNIT_MODEL_H = 1.68f;
 // 而不是靠重编译猜。
 constexpr float UNIT_MODEL_YAW_DEG = 90.0f;
 
+/* 逐键的朝向校正。**默认值**就是上面那个 90°，只有"参考图视角与别人不同"的模型
+   才需要单列一行。
+
+   【为什么必须能逐键给】图生3D 把**图像的横向**映到模型的哪个轴上，是服务端定的。
+   同一批生成里混了两种参考图视角时，出来的模型彼此会差 90°：正面参考图那批
+   （11 个 char_*）就是上面推导的 90°；而**侧面参考图**（据枪/侧身那类）重建出来的
+   模型自身轴向多转了 90°。这不是"模型做坏了"，是输入视角不同 —— 只能逐个量。
+
+   判据（与载具那条同构，取景注释在 world_sim.cpp 的 build_unit_showcase 里）：
+   检阅台近景的相机就摆在模型 **+X 侧**，于是
+       VA_UNIT_SHOW=one:<键>            （**不加**第三段临时偏航）
+   画面里看到的**应当是正脸**。看到背面 ⇒ 差 180°，看到侧脸 ⇒ 差 ±90°；
+   而"往哪边转 90°"再拍一张 ±90° 就能定，不必推。
+
+   ⚠️ 标定这条判据**本身**用的是 char_rifleman：已知它的 90° 是对的，
+   实测 dyaw=0 时画面里确实是正脸 —— 所以"看到正脸"才站得住。
+   别拿新模型自己去标定自己的判据，那是循环论证。
+
+   ⚠️ 铺开做其余角色时，凡是按"据枪/侧身"这类**侧面参考图**生成的，
+   都要在这里列一行，否则上战场就是"全队横着走"。 */
+float unit_model_yaw_deg(const std::string &p_key) {
+    // 2026-09-27 实测 char_rifleman_fire（四点自洽，互相印证）：
+    //   烘入  90°（默认）→ 左侧 profile、枪指画面左   ⇒ 正面落在 −右
+    //   烘入   0°        → 正背面
+    //   烘入 180°        → 正脸、枪管朝镜头缩短      ⇒ 正面落在 −相机方向 ✓
+    //   烘入 270°        → 右侧 profile、枪指画面右
+    // 解出来 θ* = 180°（推导：F(90)=−右，要 F(θ)=−相机方向 ⇒ 需再转 90°）。
+    static const std::map<std::string, float> k = {
+        { "char_rifleman_fire", 180.0f },
+    };
+    const std::map<std::string, float>::const_iterator it = k.find(p_key);
+    return (it == k.end()) ? UNIT_MODEL_YAW_DEG : it->second;
+}
+
 static std::map<std::string, Node3D *> s_unit_proto;   // 键 -> 外层原型（含完整的归一化子树）
 static std::map<std::string, bool> s_unit_failed;      // 失败过就别每个单位再试一次
 
@@ -681,7 +715,9 @@ static Node3D *load_unit_proto(const std::string &p_key, Node *p_parent) {
 
     const float k = UNIT_MODEL_H / box.size.y;
 
-    float yaw_deg = UNIT_MODEL_YAW_DEG;
+    // 逐键取默认值（见 unit_model_yaw_deg）；VA_MODEL_YAW 是**取证旋钮**，
+    // 显式给了就无条件盖过逐键表 —— 那正是"再拍一张 ±90° 就能定方向"用的。
+    float yaw_deg = unit_model_yaw_deg(p_key);
     if (const char *e = std::getenv("VA_MODEL_YAW")) {
         yaw_deg = (float)std::atof(e);
     }
