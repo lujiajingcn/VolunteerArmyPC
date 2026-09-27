@@ -32,6 +32,21 @@
 #   ②是唯一能全自动跑完"识别 → 解析 → 下发"的判据：它把识别器的输入从麦克风
 #   换成 wav 文件（mic.cpp 的 VA_MIC_WAV），不需要有人对着麦说话。
 #
+# 【采信尾窗 VA_MIC_TAIL —— "喊了没反应"就是这个（2026-09-27）】
+#   识别器是**滞后**的：一句「全体撤退」说完要等一小段静音才定稿，而玩家的自然
+#   动作是"说完就松手" ⇒ 定稿几乎必然落在松手**之后**。早先按 listen_ 一刀切
+#   （松手即丢命令），症状就是"按住 Q 喊了没有任何反应"—— 不崩、不报错、不留日志。
+#   现在：采信窗口 = 按住期间 + 松手后 tail 秒（默认 2.5）。
+#   ⚠️ 这条判据**只能靠 wav 模式**拿到（真人说话的定稿没法自动复现，放喇叭的
+#      音频 OneCore 定不了稿）：
+#        VA_MIC_TAIL=0 bash tools/capture_mic.sh wav sapi   → 听清=1 下发=0
+#            （run.log 里出现「丢弃窗口外结果 1 条（最后一条「全体开火」）」）
+#        bash tools/capture_mic.sh wav sapi                  → 听清=1 下发=1
+#            （「下发：「全体开火」→ fire」）
+#      换素材验别的口令：VA_MIC_WAV_REL=sweep/mic_wav/2_retreat.wav
+#        → 听清「全体撤退」→ 下发 retreat
+#   ⚠️ VA_MIC_TAIL 已进目录名指纹 —— 不进的话两次对照会落进同一个目录互相覆盖。
+#
 # 【三个坑，写在这里免得下次再踩】
 #   ⚠️ VA_CAPTURE 拍完最后一张会**自动退出**（capture_step → get_tree()->quit()）。
 #     所以「按住 Q 跨过截图时刻」这条路验的是**展开态**，keyup 大概率发不出去 ——
@@ -64,8 +79,8 @@ PY="C:/Users/lujiajing/.workbuddy/binaries/python/versions/3.13.12/python.exe"
 
 # 目录名吃进所有会改结果的输入（含后端选择）。本机 bash 的 `rm` 被安全策略拦
 # （FAIL_CLOSED，静默不执行）——「先清空再拍」不可用，只能靠命名隔离。
-TAG="$(printf '%s|%s|%s|%s|%s|%s|%s' "$MODE" "$BACKEND" "$VA_SEED" "$VA_MIC" "${VA_FF:-1}" \
-       "${VA_CAPTURE:-}" "${VA_MIC_WAV_REL:-}" \
+TAG="$(printf '%s|%s|%s|%s|%s|%s|%s|%s' "$MODE" "$BACKEND" "$VA_SEED" "$VA_MIC" "${VA_FF:-1}" \
+       "${VA_CAPTURE:-}" "${VA_MIC_WAV_REL:-}" "${VA_MIC_TAIL:-2.5}" \
        | cksum | awk '{print $1}')"
 OUT="sweep/v_mic_${MODE}_${BACKEND}_${TAG}"
 mkdir -p "$OUT"
@@ -109,7 +124,10 @@ if [ "$MODE" = "probe" ] || [ "$MODE" = "off" ] || [ "$MODE" = "wav" ]; then
       grep -E '\[mic\] (开始听|停止听)' "$LOG" | head -4
       echo "--- 判据：听清 / 下发 ---"
       grep -E '\[mic\] sapi 听清|\[mic\] 下发' "$LOG" | head -6
-      echo "听清=$(grep -c 'sapi 听清' "$LOG")   下发=$(grep -c ' \[mic\] 下发\|\[mic\] 下发' "$LOG")" ;;
+      echo "听清=$(grep -c 'sapi 听清' "$LOG")   下发=$(grep -c ' \[mic\] 下发\|\[mic\] 下发' "$LOG")"
+      # 采信尾窗：**非 0 就是有命令来晚了被丢**（玩家侧看到的是"喊了没反应"）。
+      # 正常应为 0；故意 VA_MIC_TAIL=0 做对照时应当是 1（并伴随 下发=0）。
+      echo "窗口外丢弃=$(grep -c '丢弃窗口外结果' "$LOG")（正常 0；VA_MIC_TAIL=0 对照时=1）" ;;
   esac
   echo "--- ERROR（关停噪音不算）---"
   grep 'ERROR' "$LOG" | grep -vE 'Unreferenced static string|RID allocations|PagedAllocator' | head -5
@@ -203,6 +221,9 @@ echo "开始听=$(grep -c '开始听' "$LOG")  停止听=$(grep -c '停止听' "
 # 这两行是 2026-09-27 加的 —— 语音层最容易"静默失败"：
 # "开始听"打出来了也可能一个字节音频都没进来。所以判据必须有"收到过音频"的正证。
 echo "听到声音了=$(grep -c '听到声音了' "$LOG")  定稿结果=$(grep -c '定稿结果' "$LOG")  回调异常=$(grep -c '接住' "$LOG")  StartAsync状态=$(grep -c 'StartAsync' "$LOG")"
+# 2026-09-27 加：采信尾窗。**非零就是"有命令被丢"** —— 玩家侧的表现是"喊了没反应"，
+# 所以这条计数必须是 0；不是 0 就把 VA_MIC_TAIL 调大（见文件头那段说明）。
+echo "窗口外丢弃=$(grep -c '丢弃窗口外结果' "$LOG")（应为 0；>0 = 有命令来晚了被丢、VA_MIC_TAIL 偏小。故意设 VA_MIC_TAIL=0 做对照时才允许非 0）"
 if [ -n "${VA_CAPTURE:-}" ]; then
   echo "--- 截图 ---"
   ls -1 "$OUT"/cap_*.png 2>/dev/null | head

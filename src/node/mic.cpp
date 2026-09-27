@@ -73,6 +73,21 @@ void dbg(const char *fmt, ...) {
     godot::UtilityFunctions::print(godot::String::utf8("[mic] "), godot::String::utf8(buf));
 }
 
+/* 不看 VA_DBG_MIC、**总是**打的日志。只给"玩家会看得出来但代码里不留痕"的
+   事件用 —— 目前就一条：采信窗口外丢掉的定稿。
+   为什么它够格无条件打：① 罕见（松开 Q 之后还回来的那句）；
+   ② 它是"喊了没反应"与"识别器没识别出来"的唯一分界点，而这俩的
+   处置完全相反（前者调 VA_MIC_TAIL，后者去查麦克风/识别器）。
+   不加区分地静默丢掉，正是这个 bug 藏了一整轮的原因。 */
+void dbg_always(const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    godot::UtilityFunctions::print(godot::String::utf8("[mic] "), godot::String::utf8(buf));
+}
+
 std::string from_wide(const wchar_t *w) {
     if (w == nullptr || *w == L'\0') return {};
     const int n = ::WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
@@ -267,6 +282,16 @@ struct MicVoice::Impl {
     std::atomic<long> hyp_seen{0};      // 中间结果（说话时每几个字一条）
     std::string hyp_last;               // 受 mu 保护
     long hyp_reported = 0;
+    /* 中间结果"落在采信窗口内 / 外"的分布。
+       这是**唯一能自动拿到"识别器在松手之后仍在出事件"这条证据**的东西：
+       真人说话的定稿只能靠人验（放喇叭的音频失真，OneCore 定不了稿），
+       但 hypothesis 是流式的，播一段音频就能看见它跨过松手时刻 ——
+       有了它，"定稿也会在松手之后到达"才是推论而不是猜测。
+       归类只能放在主线程：窗口状态是主线程的，回调线程不知道。 */
+    long hyp_stamped = 0;               // 已归类到的 hyp_seen 水位
+    long hyp_in = 0;                    // 采信窗口内
+    long hyp_out = 0;                   // 采信窗口外（松手之后）
+    bool hyp_out_reported = false;
     std::atomic<long> res_seen{0};      // 定稿结果
     std::atomic<long> res_bad{0};       // 定稿但 Status != Success
     long res_reported = 0;
@@ -717,6 +742,16 @@ void MicVoice::setup(bool p_dictation) {
     Impl &I = *impl_;
     I.wav_mode = (env_str("VA_MIC_WAV", nullptr) != nullptr);
 
+    /* 采信尾窗：松手之后还认多久的定稿（见 mic.h 的 start/stop 注释）。
+       调大 → 更不容易漏命令，代价是"松手后随口说的一句"也可能被采信；
+       调 0 → 退回"松手即丢"（那是本 bug 的原状）。 */
+    /* 默认 2.5 秒。取值理由：OneCore 的句尾静音检测 + DNN 推理通常落在
+       0.5~1.5 秒，2.5 留了一倍余量。宁可偶尔把"松手后随口一句"也采信
+       （它还得过 parse_command 那套严格匹配才会真下令），也不能丢玩家的命令。 */
+    tail_secs_ = (float)std::atof(env_str("VA_MIC_TAIL", "2.5"));
+    if (tail_secs_ < 0.0f) tail_secs_ = 0.0f;
+    dbg("采信尾窗 VA_MIC_TAIL=%.2f 秒（松手后这段时间内回来的定稿仍然作数）", tail_secs_);
+
     pref_ = env_str("VA_MIC_BACKEND", "auto");
     const bool want_winrt = (pref_ != "sapi");
     const bool want_sapi = (pref_ != "winrt");
@@ -801,6 +836,9 @@ void MicVoice::try_start() {
 
     if (ok) {
         listen_ = true;
+        /* 按住期间**一直**采信：截止时刻推到 max()，poll() 那条窗口判断就是恒真。
+           松手时 stop() 会把它改成 now + tail_secs_（尾窗）。 */
+        accept_until_ = std::chrono::steady_clock::time_point::max();
         I.sess_live = true;
         { std::lock_guard<std::mutex> lk(I.mu); I.interim.clear(); I.queue.clear(); }
         /* 每轮会话都让"听到声音了 / 定稿了"重新报一次：
@@ -861,6 +899,7 @@ void MicVoice::start() {
        poll() / interim() 丢掉（见那两处）。 */
     if (I.kind == Impl::Kind::Winrt && I.sess_live) {
         listen_ = true;
+        accept_until_ = std::chrono::steady_clock::time_point::max();   // 见 try_start
         { std::lock_guard<std::mutex> lk(I.mu); I.interim.clear(); I.queue.clear(); }
         // 和 try_start() 成功那条一样：每一轮按键都重新开始看"有没有听到声音"
         I.hyp_reported = -1;
@@ -884,7 +923,18 @@ void MicVoice::stop() {
         I.sapi_set_active(false, err);
     }
     listen_ = false;
-    dbg("停止听");
+    /* ⚠️⚠️ 松手**不等于**"别再收结果"。识别器是滞后的：一句「全体撤退」
+       说完要等一小段静音才定稿，而玩家的自然动作是"说完就松手" ——
+       于是定稿几乎必然落在这一行之后。早先按 listen_ 一刀切（松手即丢），
+       症状就是"按住 Q 喊了命令没有任何反应"，而且不崩、不留日志
+       （2026-09-27 玩家实测报的正是这个）。
+       现在改成开一个尾窗：这段时间内回来的定稿照样作数。
+       SAPI5 也给尾窗 —— 它松手即 INACTIVE、之后不会有新结果，
+       但松手**那一瞬**已经排进队列的还得取走（原来靠"只对 Winrt 判 kind"
+       特判，现在统一成窗口，那处特判可以退休了）。 */
+    accept_until_ = std::chrono::steady_clock::now()
+                  + std::chrono::milliseconds((long)(tail_secs_ * 1000.0f));
+    dbg("停止听（采信尾窗 %.2f 秒，期间回来的定稿仍作数）", tail_secs_);
 }
 
 void MicVoice::pump() {
@@ -909,7 +959,17 @@ void MicVoice::pump() {
        这是本层唯一能自证"会话真的在工作"的东西。没有它，
        "按 Q 说话没反应"与"麦克风没拾到"与"识别器没起会话"三者长得一模一样。 */
     const long hs = I.hyp_seen.load();
-    if (hs > I.hyp_reported) {
+    /* 先按"落在采信窗口内还是外"归类（主线程才知道窗口状态）。
+       两条都要，缺一不可：窗口内为 0 ⇒ 麦克风没拾到；窗口外不为 0 ⇒
+       识别器在松手之后仍在出事件，正是采信尾窗存在的理由。 */
+    if (hs > I.hyp_stamped) {
+        const long d = hs - I.hyp_stamped;
+        I.hyp_stamped = hs;
+        if (accepting()) I.hyp_in += d; else I.hyp_out += d;
+    }
+    /* ⚠️ 必须带 `hs > 0`：hyp_reported 每轮被置成哨兵 −1，而 hs 从 0 起 ——
+       少了这个条件，没听到任何声音也会打一条"听到声音了（「」）"的假阳性。 */
+    if (hs > 0 && hs > I.hyp_reported) {
         const bool first = (I.hyp_reported < 0);   // 每轮会话的哨兵（try_start 里置 -1）
         I.hyp_reported = hs;
         if (first) {
@@ -917,6 +977,11 @@ void MicVoice::pump() {
             { std::lock_guard<std::mutex> lk(I.mu); t = I.hyp_last; }
             dbg("听到声音了（中间结果第 1 条：「%s」）—— 会话确实在收话", t.c_str());
         }
+    }
+    if (I.hyp_out > 0 && !I.hyp_out_reported) {
+        I.hyp_out_reported = true;
+        dbg("松手之后仍收到中间结果 %ld 条（窗口内 %ld 条）—— 识别器不随松手停下，"
+            "定稿同理，所以必须有采信尾窗", I.hyp_out, I.hyp_in);
     }
     const long rs = I.res_seen.load();
     if (rs > I.res_reported) {
@@ -987,18 +1052,43 @@ void MicVoice::pump() {
     }
 }
 
+bool MicVoice::accepting() const {
+    return std::chrono::steady_clock::now() <= accept_until_;
+}
+
 bool MicVoice::poll(std::string &p_text, float &p_confidence) {
     if (!impl_) return false;
     Impl &I = *impl_;
     std::lock_guard<std::mutex> lk(I.mu);
-    /* 没按住 Q 时收到的结果一律**丢掉** —— 但**只对 OneCore**。
-       为什么只对它：OneCore 是"会话常开"（见 MicVoice::start），松手之后
-       识别还在继续跑、结果还在往队列里灌，不丢就会"松手后忽然下令"。
-       而 SAPI5 是松手即 SetRecoState(INACTIVE)，之后不会再有新结果，
-       队列里剩下的是**按着的时候**说的那句 —— 那必须照常下发
-       （实测：不加这个 kind 判断，wav 取证就从"听清+下发"退化成只有"听清"）。 */
-    if (I.kind == Impl::Kind::Winrt && !listen_) { I.queue.clear(); return false; }
     if (I.queue.empty()) return false;
+    /* 采信窗口之外的结果一律丢掉。
+       为什么需要这道闸：OneCore 是"会话常开"（见 MicVoice::start），
+       松手之后识别还在继续跑 —— 不丢，玩家没按 Q 时随口说的一句也会下令。
+       为什么是"窗口"而不是原来的"跟着 listen_"：见 MicVoice::stop。
+       ⚠️ 这道闸一旦判错，症状是**完全静默**的（不崩、不报错、HUD 也不弹），
+       所以丢掉的时候必须吭一声（下面那条 dbg_always）。 */
+    if (!accepting()) {
+        ++late_dropped_;
+        late_dropped_last_ = I.queue.front().first;
+        const size_t n = I.queue.size();
+        I.queue.clear();
+        /* ⚠️ 为什么要**限频**：OneCore 会话常开，玩家没按 Q 时环境里的人声
+           同样会定稿、同样落在这儿。每条都喊一遍会刷屏。
+           所以第一次无条件报，之后每 20 条报一次；VA_DBG_MIC=1 时每条都看得到。 */
+        const bool loud = (late_dropped_ == 1) || (late_dropped_ % 20 == 0);
+        if (loud) {
+            dbg_always("丢弃窗口外结果 %zu 条（最后一条「%s」）—— 松手超过 %.2f 秒才回来，"
+                       "不再采信。若这是你刚喊的命令，把 VA_MIC_TAIL 调大（累计丢 %ld 条）",
+                       n, late_dropped_last_.c_str(), (double)tail_secs_, late_dropped_);
+            /* 光写日志不够：玩家看不到控制台。"毫无反应"是最难自查的失败形态 ——
+               弹一句，他至少知道**话被听见了、只是来晚了**，而不是麦克风坏了。 */
+            notice_ = "语音结果来晚了未采信：「" + late_dropped_last_ + "」";
+        } else {
+            dbg("丢弃窗口外结果 %zu 条（「%s」，累计 %ld）",
+                n, late_dropped_last_.c_str(), late_dropped_);
+        }
+        return false;
+    }
     auto one = std::move(I.queue.front());
     I.queue.pop_front();
     I.accepted.fetch_add(1);

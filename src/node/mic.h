@@ -33,6 +33,7 @@
 //   跨线程直接碰 va:: 就是数据竞争 —— 所以回调只把文本塞进队列，
 //   由主线程每帧 poll() 取出来再下发。
 
+#include <chrono>
 #include <memory>
 #include <string>
 
@@ -69,7 +70,15 @@ public:
             ——VS 调试器在抛出点中断，玩家看到的就是"按 Q 说话游戏崩了"；
          ② StopAsync 还要等"当前这句说完"，不等它就永远起不来第二次。
        SAPI5 后端不变，仍是每次真开真关（它没有 Stopping 这个异步态）。
-       玩家侧语义完全一样：按住才生效。区别只是麦克风从第一次按 Q 起一直开着。 */
+       玩家侧语义完全一样：按住才生效。区别只是麦克风从第一次按 Q 起一直开着。
+
+       ⚠️⚠️ **采信窗口 = 按住期间 + 松手后一小段（尾窗）**，不是"按住期间"。
+       识别器是**滞后**的：一句「全体撤退」说完要等一小段静音才定稿
+       （OneCore 的 ResultGenerated 就是这么触发的）。玩家的自然动作是
+       "说完就松手" ⇒ 定稿几乎必然落在松手**之后**。
+       早先按 listen_ 一刀切（松手即丢），于是"按住 Q 喊了命令没有任何反应"，
+       而且**崩都不崩、一句日志都不留** —— 2026-09-27 实测踩到。
+       尾窗长度 VA_MIC_TAIL（秒，默认 2.0）。 */
     void start();
     void stop();
 
@@ -81,8 +90,13 @@ public:
     void pump();
 
     /* 主线程每帧调用。返回 true 时 p_text 是一句完整的话，可直接下发。
-       p_confidence 是识别置信度（0~1，低置信度由逻辑层按噪声模型打折）。 */
+       p_confidence 是识别置信度（0~1，低置信度由逻辑层按噪声模型打折）。
+       ⚠️ 只在**采信窗口**内返回结果（见 start/stop 上面那段）；窗口外的结果
+       连带清掉队列 —— 否则会话常开时，玩家没按 Q 的自言自语也会下令。 */
     bool poll(std::string &p_text, float &p_confidence);
+
+    // 当前是否处于采信窗口（按住期间，或松手后的尾窗内）。诊断用。
+    bool accepting() const;
 
     // HUD 用：正在识别中的**中间结果**（还没定稿那句），没有则为空串。
     std::string interim() const;
@@ -107,6 +121,16 @@ private:
     bool enabled_ = true;
     bool listen_ = false;       // 会话**实际**在听
     bool want_ = false;         // 玩家**意图**在听（按着 Q）；两者分开是为了回退
+
+    /* 采信窗口的截止时刻。按住期间置成 time_point::max()（"一直采信"），
+       松手时置成 now + tail_secs_。steady_clock：单调，不受系统时间调整影响。 */
+    std::chrono::steady_clock::time_point accept_until_{};
+    float tail_secs_ = 2.5f;    // VA_MIC_TAIL
+    /* 采信窗口外丢掉的定稿（只在主线程 poll 里改，不需要锁）。
+       这两项存在的原因：**"喊了没反应"与"没识别出来"必须能分开看** ——
+       前者是本层把结果丢了，后者是识别器没出结果，处置完全不同。 */
+    long late_dropped_ = 0;
+    std::string late_dropped_last_;
     bool pending_fallback_ = false;
     std::string pref_ = "auto"; // VA_MIC_BACKEND
     std::string backend_ = "none";
