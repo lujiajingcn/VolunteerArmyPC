@@ -575,6 +575,7 @@ void Hud::_draw() {
     draw_objectives();
     draw_alert();
     draw_retreat_prompt();
+    draw_mic_prompt();
     draw_killfeed();
     draw_squad();
     draw_command_panel();
@@ -1286,6 +1287,48 @@ void Hud::draw_retreat_prompt() {
            Color(0.90f, 0.94f, 0.97f, 0.96f));
     tx_mid(String::utf8("[2]  继续死守阵地"),       lx, box.position.y + 87.0f * s_, 17,
            Color(0.90f, 0.94f, 0.97f, 0.96f));
+}
+
+void Hud::set_mic_state(bool p_ready, bool p_listening, const std::string &p_interim) {
+    mic_ready_ = p_ready;
+    mic_listening_ = p_listening;
+    mic_interim_ = p_interim;
+}
+
+/* 语音输入状态条：贴着准星下方。
+   【为什么分"收起/展开"两态】只画展开态的话，玩家不按住 Q 就永远不知道
+   有这功能；只画收起态又会让"到底听没听见"变成瞎猜 —— 语音输入最怕的就是
+   静默失败（说了一句、什么也没发生、也不知道是没识别出来还是没下发）。
+   所以：平时一个小标提示按键，按住时展开成红点 + 实时转写，
+   识别到什么**当场就能看见**，不用等队员的反应去反推。 */
+void Hud::draw_mic_prompt() {
+    if (!mic_ready_ || screen_ != SCREEN_PLAY) return;
+
+    const float cy = vp_.y - 96.0f * s_;
+
+    if (!mic_listening_ && mic_interim_.empty()) {
+        // 收起态：一行小标
+        const String t = String::utf8("按住 Q 说话");
+        const float w = tw(t, 12) + 22.0f * s_;
+        const Rect2 b(vp_.x * 0.5f - w * 0.5f, cy - 10.0f * s_, w, 20.0f * s_);
+        poly_panel(b, 10.0f * s_, Color(0.06f, 0.07f, 0.08f, 0.40f),
+                   Color(0.72f, 0.78f, 0.84f, 0.24f), 1.0f * s_);
+        tx_c(t, vp_.x * 0.5f, cy, 12, Color(0.72f, 0.78f, 0.84f, 0.58f));
+        return;
+    }
+
+    // 展开态：红点（呼吸）+ 实时转写
+    const std::string body = mic_interim_.empty() ? std::string("正在听…")
+                                                  : ("「" + mic_interim_ + "」");
+    const String t = String::utf8(body.c_str());
+    const float w = tw(t, 15) + 44.0f * s_;
+    const Rect2 b(vp_.x * 0.5f - w * 0.5f, cy - 15.0f * s_, w, 30.0f * s_);
+    const float pulse = 0.55f + 0.45f * std::sin(clock_ * 7.0f);
+    poly_panel(b, 6.0f * s_, Color(0.10f, 0.064f, 0.060f, 0.80f),
+               Color(0.92f, 0.34f, 0.28f, 0.50f + 0.40f * pulse), 1.6f * s_);
+    draw_circle(Vector2(b.position.x + 15.0f * s_, cy), 4.2f * s_,
+                Color(0.96f, 0.32f, 0.24f, 0.55f + 0.45f * pulse));
+    tx_mid(t, b.position.x + 30.0f * s_, cy, 15, Color(0.97f, 0.94f, 0.91f, 0.98f));
 }
 
 // ===========================================================================

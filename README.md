@@ -444,6 +444,10 @@ sweep/sim/va_sweep.exe campaign   # 五个伏击阵地连着跑（见「五个�
 | `VA_VM_HAND_TINT` `VA_VM_HAND_METAL` `VA_VM_HAND_ROUGH` | 真手模的材质参数（**默认 `0.71,0.61,0.43`** / **0.0** / **0.88**；2026-09-24 随换件重标，旧值 0.50/0.42/0.36）。⚠️ `TINT` 是**按 sRGB 给的色相乘数**，与枪的 `VA_VM_ART_ALB`（线性标量乘数）**单位不同、不能混用**。手只乘色调、**不压成灰** —— 贴图上的指节褶皱/掌纹/指缝阴影是"这是一只手"的全部信息来源。⚠️ **它只在"贴图是另一种材质"时成立**：新件的贴图本身就是棉布色，同一个数就从"补偿"变成"污染"；而且**不是越亮越像棉布** —— 0.80 档亮面 R 冲到 233，布纹被冲平成"光滑乙烯基"。判据是**亮面还留不留得住布纹**，见「双手真模型」那节的四档扫描表 |
 | `VA_VM_HAND_NOMIRROR` | 借来的手模**不做左右镜像**，A/B 用。判定"左右手亮度不一样"到底是镜像翻了法线、还是那只手本来就更背光 —— 实测两者几乎逐位相同，见「双手真模型」那节 |
 | `VA_VM_ADS_HSHRINK` `VA_VM_ADS_HOFF` | **开镜时双手的让位量**：缩小比例（**默认 1.0 = 缩到看不见**，范围 0~1；2026-09-24 从 0.65 改，见下）与位移（默认 `0.06,-0.04,0.02` 米，枪局部系）。真手模在实尺下会**两只手一起压住照门**（开镜时枪轴与视轴重合），落位修不了 → 照真 FPS 的做法给视图模型分腰射/开镜两套姿态。腰射时 `ads = 0`，缩放 1、位移 0，**构造保证**不改画面。⚠️ 0.65 那一档是拿**程序化手套**标定的，换真手模后它留下的是"一块悬在机匣右侧的橙色残片"；而"别缩"也不行（相机离握把仅 22 cm，实尺手占 0.55 屏高）。所以终点设成 0，低于 `0.03` 时把 `hands` **整组藏掉**（避开 0 缩放的退化变换） |
+| `VA_MIC=0` | **语音输入层总开关**（见「语音指挥」）。关掉 = 不建识别器、不加载任何语音 DLL，与加这层之前逐像素相同 |
+| `VA_MIC_BACKEND` | 语音后端：`winrt` / `sapi` / `auto`（默认 auto）。**强制那条失败就不回退** —— 强制是"我要这条，别兜底" |
+| `VA_DBG_MIC=1` | 报"识别 → 解析 → 下发"（`[mic] 下发：「全体开火」→ fire  conf=0.8`）。离线验证全靠它 |
+| `VA_MIC_WAV=<路径>` | **把一条 wav 当音频输入喂给 SAPI5 识别器**（不碰麦克风）—— 唯一能全自动跑"识别→解析→下发"整链的路。素材由 `tools/gen_mic_wav.py` 烘 |
 
 例：固定种子拍夜战
 
@@ -2312,6 +2316,135 @@ bash tools/capture_vo.sh next        # 转进下一阵地，新关介绍自动�
    面板上按 `R` 才真的换关。第一次跑日志里明明写着"转进 233.2 高地"，
    播放次数却是 0 —— 换关根本没发生。
 
+## 语音指挥（按住 Q 说话）
+
+**这一层为什么空了很久**：`src/sim/` 从第一天起就是按"用嘴下令"写的 ——
+`parse_command(text, noise, asr, typed, source)` 里那个 **`asr` 形参就是语音识别置信度**
+（`conf = lerpf(conf, asr, 0.55)`），`noise` 是"战场噪声降低识别率"，
+`run_command_text` 的注释写着"供 HUD / 语音层调用"。网页版靠浏览器自带的
+`webkitSpeechRecognition` 收话（`../VolunteerArmy/index.html:5058`）；
+PC 版没有那个 API，于是这一层一直空着 —— 队员**会听、会回话、会拒绝**，
+但玩家没法把话说出去。这一节把"嘴"接上。
+
+### 两条后端，都不联网
+
+| 后端 | 是什么 | 依赖 |
+|---|---|---|
+| `winrt-onecore` | `Windows.Media.SpeechRecognition`（OneCore DNN），走 C++/WinRT | 要求系统「在线语音识别」**隐私开关是开的**（见下） |
+| `sapi5` | 老 Speech 8.0 桌面识别器（本机是 `MS-2052-80-DESK`），**裸 COM**，全本地 | **不需要任何隐私开关**；本机中文向导早就跑过 |
+
+默认 **`auto`**：先试 ①，①起得来就挂上（含下面那条隐私错误）→ 自动切 ② 并把这次
+会话续上。`VA_MIC_BACKEND=winrt|sapi|auto` 可强制；**强制那条失败就不回退**
+（强制就是"我要这条，别替我兜底"）。
+
+⚠️ **为什么"隐私开关"是最典型的静默失败**：`HKCU\Software\Microsoft\Speech_OneCore\
+Settings\OnlineSpeechPrivacy\HasAccepted`（REG_DWORD）**整个键都不存在**时，
+`setup()` 一切正常 —— 识别器建得起来、语言读得到 `zh-Hans-CN`、日志干干净净；
+**只有 `StartAsync()` 才报** `The speech privacy policy was not accepted`。
+本机麦克风权限本身是 `Allow`（不是它的问题）。打开就一条命令：
+
+```bash
+reg add "HKCU\Software\Microsoft\Speech_OneCore\Settings\OnlineSpeechPrivacy" \
+    /v HasAccepted /t REG_DWORD /d 1 /f
+```
+
+**本轮已按此开启** —— 但代码不指望它：开关没开时 auto 会走上面那条回退，
+玩家只会看到 HUD 上一句"语音后端已切到离线 SAPI5"，游戏照常。
+
+### 链路：按住 Q 说话
+
+```
+按住 Q ──► mic_press(true) ──► mic_.start() ──► 识别器开听
+                                                     │（识别线程回调）
+松开 Q ──► mic_press(false) ─► mic_.stop()           └──► 文本入队
+                                                     │
+每帧 _process ─► mic_step() ─► pump() 对账 ─► poll() 取话 ─► parse_command(.., false, "voice")
+                                                                        │
+                                                              issue_command(cmd, false)
+```
+
+- **`typed=false` 不能省**：这条路径的语义就是"用嘴说的"，该按噪声模型打折；
+  `typed=true` 会被抬到 **0.93 天花板**（那是打字路径的待遇），语音识别给的三档
+  置信度就白丢了。这是把 `asr` 真的喂进逻辑层的唯一入口。
+- **识别到就下发，不加二次确认**：逻辑层自己有一整套容错（置信度打分、噪声打折、
+  低置信度候选 `parse_candidates`、队员按 obey 值回"收到/拖延/拒绝"）。
+  外面再套一层确认，等于把已经写在 `sim` 里的规则重做一遍，还会磨掉
+  "喊一嗓子立刻有人回话"的节奏感。
+- **没解析出来要把听到的说出来**：识别错字与"这压根不是指令"是两回事。
+  只回一句"没听懂"，玩家分不清是自己说错了还是游戏没听见 ——
+  所以 HUD 弹的是 `未听清指令：<识别器听到的那串>`。
+
+### 线程模型：回调只入队，主线程才碰 `va::`
+
+两条后端的识别回调**都在各自的识别线程上**（WinRT 是识别器线程；SAPI5 是本层
+自己起的 worker，等 `ISpRecoContext` 的通知事件），而本工程所有逻辑推进都在主线程。
+跨线程直接碰 `va::` 就是数据竞争 —— 所以回调**只把文本塞进队列**，
+主线程每帧 `poll()` 取出来再下发。`pump()` 也因此在主线程、且必须在 `poll()` 之前：
+"OneCore 起不来"是在 `start()` 里发现的，那时还在 `_input` 阶段；
+拆 COM 对象、建新对象只能在主线程做，所以回退推迟到下一帧的 `pump()`。
+
+`want_`（玩家**意图**在听，按着 Q）与 `listen_`（会话**实际**在听）是分开的两个标志 ——
+只有分开才谈得上"回退时把玩家的意图续到新后端上"。
+
+### HUD：一条状态条
+
+`mic_sync_hud()` 每帧把"能不能用 / 正在听 / 实时中间结果"喂给 HUD：
+
+- **收起态**（没按 Q）：一行提示「**按住 Q 说话**」；
+- **展开态**（正在听）：**红点 + 正在听…**，识别出中间词就换成 `「<实时转写>」`。
+
+不可用时**整条不画**（`mic_ready_ == false`），只在第一次按 Q 时弹一次
+"语音输入不可用（识别器未就绪）"，连点不刷屏。
+
+### 旋钮
+
+| 旋钮 | 作用 |
+|---|---|
+| `VA_MIC=0` | **整体关闭**：`setup` 不跑、DLL 不加载识别器 —— 与加这一层之前**逐像素相同** |
+| `VA_MIC_BACKEND` | `winrt` / `sapi` / `auto`（默认 auto）。强制那条失败就**不回退** |
+| `VA_DBG_MIC=1` | 报"识别 → 解析 → 下发"三件事一次说清（`[mic] 下发：「全体开火」→ fire  conf=0.8`），离线验证全靠它 |
+| `VA_MIC_WAV=<路径>` | **把一条 wav 当成音频输入喂给 SAPI5 识别器**（不碰麦克风）。这是唯一能**全自动**跑"识别→解析→下发"整条链的路 |
+
+### 取证与验证
+
+脚本 `tools/capture_mic.sh`，五种模式：
+
+```bash
+bash tools/capture_mic.sh probe [winrt|sapi|auto]  # 只建识别器，报 backend / 语言
+bash tools/capture_mic.sh wav   [后端]              # 离线喂 wav：识别→解析→下发全自动
+bash tools/capture_mic.sh pair  [后端]              # 实机按住 Q 4 秒，看"开始听/停止听"成对
+bash tools/capture_mic.sh hold  [后端]              # 按住 Q 截状态条（展开态）
+bash tools/capture_mic.sh shot                      # 收起态截图（对照）
+bash tools/capture_mic.sh off                       # VA_MIC=0 的对照
+```
+
+wav 素材由 `tools/gen_mic_wav.py` 烘（复用 `gen_voice.py` 的 OneCore 离线 TTS，
+Kangkang 男声）：`全体开火` / `全体撤退` / `全体隐蔽` → `sweep/mic_wav/`（16k mono s16）。
+
+判据分三层，一层比一层强：**建得起来**（probe）→ **真的听得到**（wav 离线全自动）
+→ **会话起停与 HUD 状态条**（实机 pair / hold）。
+
+| 判据 | 结果 |
+|---|---|
+| 构建 | **0 error / 0 warning**；`bin/volunteer_army_pc.dll` **1,541,120 B** |
+| ① 建得起来（probe） | `winrt-onecore`（语言 `zh-Hans-CN`）与 `sapi5-804` 都能建（`SAPI token = …MS-2052-80-DESK`，`Language=804 命中 1 个`）|
+| ② 真的听得到（wav sapi，离线全自动） | 三条全部 `听清=1 下发=1`：`全体开火→fire`、`全体撤退→retreat`、**`全集隐蔽→takeCover`（容错也生效）** |
+| ③ 会话起停（pair winrt，实机按住 4 秒） | `开始听=1 停止听=1 start失败=0` |
+| ④ HUD 状态条（hold auto 截图） | 展开态「红点 + 正在听...」；收起态「按住 Q 说话」 |
+| 自动回退全链路 | 临时把隐私开关设 0 → `start 失败：…privacy policy was not accepted` → `OneCore 起不来 → 回退 SAPI5` → `听清 → 下发`，之后恢复 1 |
+| 关掉整层（off 对照） | 只剩一行 `[mic] VA_MIC=0 —— 语音输入层关闭` |
+| 离线战役回归 | `va_sweep.exe campaign 7`：过关 4/5、阵亡 3、撤离 37 人次、总用时 1200 秒（**等价基线**，`src/sim/` 一行未改）|
+
+> ⚠️ **SAPI 置信度用不了，回标称 0.80**（与 OneCore Medium 同档）。实测
+> `SPPHRASE` 的属性链是 **0 条**，只有 `rule.SREngineConfidence`（好句子 .304、
+> 坏句子 .092/.089 —— 好与坏**分不开**）。不假装能用：写死 0.80，把引擎原值留在
+> 日志里备查。若哪天要用真置信度，得换 `ISpRecoResult::GetPhrase` 之外的路子。
+
+**尚未验证（只能由小卢本机做）**：实机麦克风采音 → 队友真的动起来。
+上面四条判据能自动拿到的都拿到了，但"对着麦克风说话"这一步无法自动化。
+跑法：`sdk\godot\Godot_v4.5-stable_win64.exe --path .`，进关后**按住 Q** 说
+「全体开火」，看队友是否动作、HUD 是否出现红点「正在听…」。
+
 ## 当前进度
 
 **已完成**
@@ -2461,7 +2594,14 @@ bash tools/capture_vo.sh next        # 转进下一阵地，新关介绍自动�
   排查途中修掉四个真 bug：曳光弹长度单位混用（米 vs 逻辑单位，实际短了 20 倍）、
   光效被体积雾吞、世界空间固定尺寸导致远处只有 1~2 px、阵营色被 ACES 压成白。
   见「射击光效（枪口焰 / 曳光弹 / 弹着火花）」一节。
-- 语音指挥：计划走 **SAPI 识别 + TTS 回话 + 面板兜底**
+- **语音指挥**：**已接入**（按住 **Q** 说话）。两条离线后端 —— OneCore DNN
+  （`Windows.Media.SpeechRecognition`，C++/WinRT）优先、老 SAPI5 桌面识别器
+  （裸 COM）回退，`auto` 下 OneCore 起不来会自动切 SAPI5 并把这次会话续上。
+  识别文本走 **`typed=false`** 喂进 `parse_command`（`asr` 形参第一次真派上用场），
+  不加二次确认。走独立一层 `src/node/mic.{h,cpp}`（识别回调只入队，主线程
+  `pump()` → `poll()` 消费），`src/sim/` 一行未改。`VA_MIC=0` 可整体关。
+  **待实机验证**：对着麦克风说话 → 队友动作。详见「语音指挥（按住 Q 说话）」。
+  **未做的**：TTS 回话（队员用语音答"收到"，目前只有 HUD 无线电字幕）
 
 ## 许可
 

@@ -44,6 +44,7 @@ set(VA_SOURCES
     src/node/hud.cpp
     src/node/audio.cpp
     src/node/voice.cpp
+    src/node/mic.cpp
     src/node/unit_anim.cpp
     src/node/unit_leg.cpp
     src/node/fx_layer.cpp
@@ -68,6 +69,25 @@ target_include_directories(volunteer_army_pc PRIVATE
 )
 
 target_link_libraries(volunteer_army_pc PRIVATE godot::cpp)
+
+# 语音指令输入层（src/node/mic.cpp）有两条后端，都是 Windows 系统能力：
+#
+#   后端① winrt-onecore —— C++/WinRT 驱动 OneCore DNN 中文识别器
+#     windowsapp   : WinRT 类型激活（Windows.Media.SpeechRecognition 等）——
+#                    这些是 ABI 级导入，不是 COM 的 CoCreateInstance，必须链它
+#     runtimeobject: RoInitialize / RoGetActivationFactory
+#     ole32        : COM 基础设施（CoTaskMemFree 等）
+#
+#   后端② sapi5 —— 老 Speech 8.0 桌面识别器，裸 COM
+#     sapi         : CLSID_SpInprocRecognizer / IID_ISpRecognizer / SPDFID_WaveFormatEx
+#                    这些 GUID 常量是 sapi.lib 里的定义，不是 sapi.h 里的
+#                    `EXTERN_C const CLSID ...`（那只是声明）—— 漏链就是
+#                    LNK2001 无法解析的外部符号 CLSID_SpInprocRecognizer
+#
+# 都是系统库，DLL 不需要随包分发。本工程只出 Windows 版，这层不做跨平台降级。
+if(WIN32)
+    target_link_libraries(volunteer_army_pc PRIVATE windowsapp runtimeobject ole32 sapi)
+endif()
 
 # 输出到 bin/，文件名固定，由 .gdextension 引用
 foreach(cfg "" _DEBUG _RELEASE _RELWITHDEBINFO _MINSIZEREL)

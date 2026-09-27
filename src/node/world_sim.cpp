@@ -794,6 +794,31 @@ void WorldSim::_ready() {
     if (hud_ != nullptr) hud_->set_vo_ready(vo_.enabled() && vo_.loaded() > 0);
     va_trace("_ready:vo ok");
 
+    /* 语音指令输入（见 node/mic.h）。与那三层不同的一点：它**读麦克风**，
+       是全工程唯一一处"玩家往逻辑层写"的外部通道，所以默认开关写在明面上 ——
+       VA_MIC=0 整层不建（不 init_apartment、不碰麦克风、不占会话）。
+       失败不抛：识别器不可用时只是"没法用嘴下令"，键鼠一切照旧。 */
+    {
+        const char *mv = std::getenv("VA_MIC");
+        const bool mic_on = !(mv != nullptr && (*mv == '0' || *mv == 'f'));
+        mic_.set_enabled(mic_on);
+        if (mic_on) {
+            mic_.setup(true);
+            if (mic_.available()) {
+                UtilityFunctions::print(String::utf8("[mic] 语音下令就绪 backend="),
+                                        String::utf8(mic_.backend().c_str()),
+                                        String::utf8("  按住 Q 说话"));
+            } else {
+                UtilityFunctions::print(String::utf8("[mic] 语音下令不可用："),
+                                        String::utf8(mic_.last_error().c_str()),
+                                        String::utf8("  —— 键鼠操作不受影响"));
+            }
+        } else {
+            UtilityFunctions::print(String::utf8("[mic] VA_MIC=0 —— 语音输入层关闭"));
+        }
+    }
+    va_trace("_ready:mic ok");
+
     /* 跑动节奏层（见 node/unit_anim.h）。与音频层同性质：只读逻辑层状态。
        放在 sync 之前 —— 第一帧就要能算出姿态。 */
     anim_.setup();
@@ -1360,6 +1385,13 @@ void WorldSim::_process(double p_delta) {
     if (n == step_cap) acc_ = 0.0;   // 掉帧时放弃追帧，避免螺旋
     va_trace("_process:step ok");
 
+    /* 语音指令：放在固定步循环**外面**。
+       理由与 script_a_step 放进循环里正好相反 —— 那是一段"到点该下什么命令"的
+       时间轴剧本，必须与逻辑步对齐；而收话是个事件消费（识别结果什么时候回来
+       由识别器说了算），一帧处理一次就够，放循环里在 VA_FF>1 时反而会
+       被重复 poll（第一次就取空了，纯属白跑）。 */
+    mic_step();
+
     sync_entity_nodes();
     va_trace("_process:sync ok");
 
@@ -1628,6 +1660,10 @@ bool WorldSim::is_hold_key(Key p_code) {
         case Key::KEY_A: case Key::KEY_LEFT:
         case Key::KEY_D: case Key::KEY_RIGHT:
         case Key::KEY_SHIFT: case Key::KEY_CTRL:
+        /* Q = 按住说话。它必须进"按住"语义：丢一次 keyup 会让识别会话一直开着
+           （麦克风被占住、噪声也被一直当成指令），而 clear_held_input 只清
+           进这张表的键。 */
+        case Key::KEY_Q:
             return true;
         default:
             return false;
@@ -1660,7 +1696,7 @@ void WorldSim::apply_key(Key p_code, bool p_down) {
             break;
         case Key::KEY_G:     if (p_down) va::IN.grenade = true; break;
         case Key::KEY_F:     if (p_down) va::IN.smoke = true; break;
-        case Key::KEY_Q:     if (p_down) { /* 指令面板（待接入） */ } break;
+        case Key::KEY_Q:     mic_press(p_down); break;   // 按住说话（见 mic.h）
         /* V：切手里的武器外观（纯表现）。
            【为什么是 V】W/A/S/D 是移动、R 换弹、G 手雷、F 烟雾、Z 标记、Q 留给指令面板，
            余下的字母里 V 与"外观/装扮（visual）"对得上，也不会和上面任何一个撞。
@@ -1745,6 +1781,9 @@ void WorldSim::clear_held_input(bool p_reacquire_ok) {
     va::IN.w = va::IN.s = va::IN.a = va::IN.d = false;
     va::IN.shift = va::IN.ctrl = false;
     va::IN.fire = va::IN.ads = false;
+    /* 语音会话也要一起停：和"角色还在走"同理 —— 丢掉的 keyup 会让麦克风
+       一直被占着。失焦、进菜单、每帧兜底三条路径都经过这里。 */
+    if (mic_.listening()) mic_.stop();
     if (p_reacquire_ok) reacquire_ = true;
     // 什么都没按着就不吭声：这条路径每帧都可能被调用，否则日志会被刷屏
     if (any && dbg_input_) {
@@ -1780,6 +1819,89 @@ void WorldSim::vo_step() {
         vo_.play("menu");
     }
     vo_screen_ = sc;
+}
+
+// ===========================================================================
+//  语音指令输入（见 node/mic.h）
+// ===========================================================================
+//
+// 【它与 vo_step 是一对】vo_step 往外说（任务介绍），mic_step 往里收（用嘴下令）。
+//   两个都在 _process 里被调，但一个只在外壳期间跑、一个只在战斗期间跑 ——
+//   简报页上念的话不该被当成指令，战斗中也没有简报可念。
+//
+// 【为什么识别到就下发，不加二次确认】逻辑层自己有一整套容错：置信度打分、
+//   噪声打折、低置信度候选（parse_candidates）、队员按 obey 值回"收到/拖延/拒绝"。
+//   外面再套一层确认，等于把已经写在 sim 里的规则重做一遍，还会把
+//   "喊一嗓子立刻有人回话"的节奏感磨掉。
+void WorldSim::mic_press(bool p_down) {
+    if (p_down) {
+        if (!mic_.enabled() || !mic_.available()) {
+            if (!mic_hint_done_ && hud_ != nullptr) {
+                mic_hint_done_ = true;   // 连点不该刷屏
+                hud_->ev_alert(mic_.enabled() ? "语音输入不可用（识别器未就绪）"
+                                              : "语音输入已关闭（VA_MIC=0）", 2.4f);
+            }
+            return;
+        }
+        mic_.start();
+    } else {
+        mic_.stop();
+    }
+}
+
+void WorldSim::mic_step() {
+    mic_sync_hud();
+
+    /* 先对账再收话：pump() 负责"OneCore 起不来就换 SAPI5 并把这次会话续上"，
+       换完可能这一帧就有东西了。放在 poll 之前是约定（见 mic.h）。 */
+    mic_.pump();
+
+    /* 换后端玩家看不见 —— 得在 HUD 上说一句，否则他会以为 Q 坏了。
+       一次性通知，取走即清空。 */
+    {
+        std::string note = mic_.take_notice();
+        if (!note.empty() && hud_ != nullptr) hud_->ev_alert(note, 4.0f);
+    }
+
+    if (!mic_.enabled() || !mic_.available()) return;
+    if (hud_ != nullptr && hud_->shell_active()) return;   // 简报/菜单期间不收话
+    if (va::W.over) return;                                // 结算后不再下令
+
+    std::string text;
+    float conf = 0.0f;
+    while (mic_.poll(text, conf)) {
+        /* 把识别置信度**真的**喂进逻辑层：parse_command 的 asr 形参就是为它留的
+           （conf = lerpf(conf, asr, 0.55)）。若走 run_command_text，那里写死 asr=-1，
+           WinRT 给的三档置信度就白丢了。typed=false —— 这条路径的语义就是"用嘴说的"，
+           该按噪声模型打折，而不是当作打字（打字会被抬到 0.93 天花板）。 */
+        va::ParsedCmd cmd = va::parse_command(text, va::W.noise, conf, false, "voice");
+        if (cmd.valid()) {
+            /* 判据用的一条日志：识别 → 解析 → 下发 三件事一次说清。
+               离线验证（VA_MIC_WAV 喂 wav）全靠它 —— say() 只进字幕队列，
+               headless 下不落任何东西，光看 [mic] 听清说明不了指令真的生效了。 */
+            static const bool mic_dbg = [] {
+                const char *v = std::getenv("VA_DBG_MIC");
+                return v != nullptr && *v != '0' && *v != '\0';
+            }();
+            if (mic_dbg) {
+                UtilityFunctions::print(String::utf8("[mic] 下发：「"),
+                                        String::utf8(text.c_str()), String::utf8("」→ "),
+                                        String::utf8(cmd.actId.c_str()),
+                                        String::utf8("  conf="), conf);
+            }
+            va::issue_command(cmd, false);
+        } else if (hud_ != nullptr) {
+            /* 没解析出来要**把听到的说出来**：识别错字与"这压根不是指令"是两回事。
+               只回一句"没听懂"，玩家分不清是自己说错了还是游戏没听见 ——
+               下一次还是不知道该怎么喊。 */
+            hud_->ev_alert(std::string("未听清指令：") + (text.empty() ? "(空)" : text), 2.6f);
+        }
+    }
+}
+
+void WorldSim::mic_sync_hud() {
+    if (hud_ == nullptr) return;
+    hud_->set_mic_state(mic_.enabled() && mic_.available(), mic_.listening(), mic_.interim());
 }
 
 void WorldSim::enter_play() {

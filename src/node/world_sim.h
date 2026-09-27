@@ -15,6 +15,7 @@
 #include "node/audio.h"
 #include "node/fx_layer.h"
 #include "node/hud.h"
+#include "node/mic.h"
 #include "node/scene_builder.h"
 #include "node/unit_anim.h"
 #include "node/unit_leg.h"
@@ -112,6 +113,12 @@ private:
        念出来。与 snd_ 同一类 —— 表现层的东西，删掉不影响任何逻辑，
        **VA_VO=0 时素材不载、声部不建**。 */
     Voice vo_;
+    /* 语音指令输入（见 node/mic.h）：按住 Q 说话 → WinRT 离线中文识别 → 文本
+       交给逻辑层的 parse_command。与 snd_/vo_ 同一类，**VA_MIC=0 时整层不建**
+       （不 init_apartment、不碰麦克风），删掉不影响任何逻辑 ——
+       玩家只是没法再用嘴下令，键盘鼠标一切照旧。
+       ⚠️ 它是**输入**层，方向与 snd_（输出）相反：这里读麦克风、写 va::。 */
+    MicVoice mic_;
     /* 单位跑动节奏（见 node/unit_anim.h）。与 snd_ 同一类：只读逻辑层状态、
        挂在 sync_entity_nodes 里、删掉不影响任何逻辑。 */
     UnitAnim anim_;
@@ -163,6 +170,18 @@ private:
     void vo_step();
     int  vo_screen_ = -1;          // 上一帧的 HUD 屏幕（-1 = 还没样本）
     bool vo_menu_done_ = false;    // 菜单语音只播一次（回菜单不重复念）
+
+    /* 语音指令输入的两件事（见 node/mic.h）：
+         mic_step()       主线程每帧收话 —— 把识别线程排队的结果取出来下发
+         mic_press(bool)  按住/松开 Q 时起停"听"
+       ⚠️ 为什么不能只靠 apply_key 里的 start/stop：apply_key 只在非外壳期间被调用，
+       而玩家可能在菜单里按着 Q 不放再进战斗 —— 那样 keyup 永远收不到，
+       会话会一直占着麦克风。所以 clear_held_input（失焦/进菜单/每帧兜底）
+       也要能把"听"停掉。 */
+    void mic_step();
+    void mic_press(bool p_down);
+    void mic_sync_hud();           // 把"正在听 + 实时中间结果"喂给 HUD
+    bool mic_hint_done_ = false;   // "语音不可用"只提示一次（连点不刷屏）
 
     // 音频节流（同一音效 id 在极短时间内不重复触发）
     double last_sfx_t_ = 0.0;

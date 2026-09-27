@@ -104,6 +104,12 @@ public:
        比不提示更糟。 */
     void   set_vo_ready(bool p_on) { vo_ready_ = p_on; }
 
+    /* 语音指令输入的状态（world_sim 每帧同步一次，见 mic_step）。
+       ready=识别器可用、listening=正在收音、interim=识别器的实时转写。
+       与 set_vo_ready 同一个理由：不可用时**一个像素都不画** ——
+       提示一个按不出来的功能，比不提示更糟。 */
+    void   set_mic_state(bool p_ready, bool p_listening, const std::string &p_interim);
+
     // ---- 视图模型的引用（world_sim 在 _ready 里挂一次）----
     // 【为什么需要它】开镜时准星是**刻意**让位给枪上那颗红点的（见 draw_crosshair），
     // 理由是不想让屏幕中央同时出现两个准心。但换上真模型武器之后，
@@ -226,6 +232,9 @@ private:
     bool   quit_req_ = false;     // 玩家选择退出（take_quit 消费）
     bool   replay_req_ = false;   // 玩家按 V 重播语音（take_replay 消费）
     bool   vo_ready_ = false;     // 语音层可用？（决定简报页画不画 V 提示）
+    bool   mic_ready_ = false;    // 语音输入层可用？（不可用则不画状态条）
+    bool   mic_listening_ = false;
+    std::string mic_interim_;     // 识别器的实时转写（还没定稿那句）
 
     // ======================================================== 各区块
     void draw_compass();          // 顶部罗盘刻度带（含目标方位标记）
@@ -234,6 +243,7 @@ private:
     void draw_objectives();       // 中央目标横幅
     void draw_alert();            // 警报（伏击开始 / 炮击来袭 / 增援到达）
     void draw_retreat_prompt();   // 伤亡过半后的「1 撤 / 2 守」选择条
+    void draw_mic_prompt();       // 语音输入状态（收起=提示按键，展开=实时转写）
     void draw_killfeed();         // 右上击杀回执
     void draw_squad();            // 右侧小队状态板
     void draw_ammo();             // 右下弹药 + 装备 + 生命

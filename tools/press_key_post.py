@@ -13,6 +13,13 @@
 所以这个脚本不能用来验"按住"类手感问题（那类问题仍然必须走 inject_key.py）。
 
 用法: python tools/press_key_post.py R "VolunteerArmyPC (DEBUG)"
+      python tools/press_key_post.py Q "VolunteerArmyPC" 6      # 按住 6 秒
+
+【第 3 个参数：按住多久（秒）】默认 0.06（"点一下"）。语音输入是**按住说话**，
+0.06 秒只说得出一个字的一半，所以那类验证必须显式给时长。
+⚠️ 这里按住时**不会**产生系统按键重复（PostMessage 不生成）——
+本工程恰好需要这样：Q 是 is_hold_key，靠 keydown/keyup 两个状态即可，
+不需要 echo 重建。若要验"按住类手感"，仍得走 inject_key.py。
 """
 import ctypes
 import ctypes.wintypes as wt
@@ -24,7 +31,7 @@ WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 
 VK = {
-    "R": 0x52, "ESC": 0x1B, "ENTER": 0x0D, "V": 0x56, "B": 0x42,
+    "R": 0x52, "ESC": 0x1B, "ENTER": 0x0D, "V": 0x56, "B": 0x42, "Q": 0x51,
     "W": 0x57, "A": 0x41, "S": 0x53, "D": 0x44, "G": 0x47, "F": 0x46, "Z": 0x5A,
     # 数字键：伤亡过半那条选择条是 1 撤 / 2 守（F=烟雾、G=手雷已占，只能用数字键）
     "1": 0x31, "2": 0x32, "3": 0x33, "4": 0x34,
@@ -56,6 +63,7 @@ def find_window(substr):
 def main():
     key = (sys.argv[1] if len(sys.argv) > 1 else "R").upper()
     title = sys.argv[2] if len(sys.argv) > 2 else "VolunteerArmyPC"
+    hold = float(sys.argv[3]) if len(sys.argv) > 3 else 0.06
     if key not in VK:
         print("[press] 未知键:", key)
         return 2
@@ -67,9 +75,10 @@ def main():
     # lParam 让 Godot 能算出"是不是系统重复"：bit30(0x40000000)=上一次键态。
     # 这里按下/抬起各一次，bit30 都是 0 → 不会被标成 echo。
     user32.PostMessageW(hwnd, WM_KEYDOWN, vk, 0x00100001)
-    time.sleep(0.06)
+    time.sleep(hold)
     user32.PostMessageW(hwnd, WM_KEYUP, vk, 0xC0100001)
-    print("[press] 已向 pid 窗口 %r (hwnd=0x%08X) 投递 %s" % (found, hwnd, key))
+    print("[press] 已向 pid 窗口 %r (hwnd=0x%08X) 投递 %s（按住 %.2fs）"
+          % (found, hwnd, key, hold))
     return 0
 
 
