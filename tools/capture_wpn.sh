@@ -60,8 +60,8 @@ fi
 export VA_SEED=1
 [ -z "$KEEP_HUD" ] && export VA_HIDE_HUD=1
 # VA_CAPTURE 允许调用方覆盖（默认 1 秒那一帧）：要看"打到交火之后"的画面
-# 就得把时刻往后推，而车队要 175 秒才进地图 —— 那时必须配 VA_AUTO + VA_SCRIPT_A
-# + VA_FF 才跑得完，见下面那条枪口焰取证的用例。
+# 就得把时刻往后推，而车队要等 convoyIn 才进地图（战役五关都是 30 秒）—— 那时必须配
+# VA_AUTO + VA_SCRIPT_A + VA_FF 才跑得完，见下面那条枪口焰取证的用例。
 export VA_CAPTURE="${VA_CAPTURE:-1}"
 export VA_CAPTURE_DIR="res://$OUT"
 [ -n "$ADS" ] && export VA_ADS=1
