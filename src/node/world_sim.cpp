@@ -796,7 +796,7 @@ void WorldSim::_ready() {
 
     /* 语音指令输入（见 node/mic.h）。与那三层不同的一点：它**读麦克风**，
        是全工程唯一一处"玩家往逻辑层写"的外部通道，所以默认开关写在明面上 ——
-       VA_MIC=0 整层不建（不 init_apartment、不碰麦克风、不占会话）。
+       VA_MIC=0 整层不建（不初始化 COM apartment、不碰麦克风、不占会话）。
        失败不抛：识别器不可用时只是"没法用嘴下令"，键鼠一切照旧。 */
     {
         const char *mv = std::getenv("VA_MIC");

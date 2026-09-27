@@ -115,7 +115,7 @@ private:
     Voice vo_;
     /* 语音指令输入（见 node/mic.h）：按住 Q 说话 → WinRT 离线中文识别 → 文本
        交给逻辑层的 parse_command。与 snd_/vo_ 同一类，**VA_MIC=0 时整层不建**
-       （不 init_apartment、不碰麦克风），删掉不影响任何逻辑 ——
+       （不初始化 COM apartment、不碰麦克风），删掉不影响任何逻辑 ——
        玩家只是没法再用嘴下令，键盘鼠标一切照旧。
        ⚠️ 它是**输入**层，方向与 snd_（输出）相反：这里读麦克风、写 va::。 */
     MicVoice mic_;
