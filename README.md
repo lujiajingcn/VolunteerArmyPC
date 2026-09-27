@@ -2398,6 +2398,44 @@ reg add "HKCU\Software\Microsoft\Speech_OneCore\Settings\OnlineSpeechPrivacy" \
 **本轮已按此开启** —— 但代码不指望它：开关没开时 auto 会走上面那条回退，
 玩家只会看到 HUD 上一句"语音后端已切到离线 SAPI5"，游戏照常。
 
+### ⚠️ F5 调试时开局弹的那个 `winrt::hresult_error`（2026-09-27）
+
+**症状**：VS 附加调试器（F5）一进游戏，就弹一次 **首次异常**（first-chance），
+异常类型 `winrt::hresult_error`，位置在 `mic.cpp` 的 `setup_winrt`。
+**不点"继续"也照样能玩** —— 它被我们接住了，不是崩溃。
+
+**根因（已在本机用两条独立证据钉死）**：
+
+1. **Godot 主线程已经初始化过 COM，而且是 STA。** `Godot_v4.5-stable_win64.exe`
+   的导入表里有 `OleInitialize` / `OleUninitialize` / `RoInitialize`（`ole32.dll`）
+   —— 拖放要用 `OleInitialize`，那就是 **STA**。
+2. **`winrt::init_apartment(multi_threaded)` 在 STA 线程上必然抛。** SDK 里它就是
+   `CoInitializeEx(nullptr, type)`，`result < 0` 直接 `throw_hresult(result)`
+   （`base.h:6529` 原文）。MTA 版在 STA 线程上返回 **`RPC_E_CHANGED_MODE`
+   (`0x80010106`)** ⇒ 抛 `winrt::hresult_error`。
+
+同一线程上实测（`ctypes` 直调，与游戏主线程同样的调用序列）：
+
+| 调用 | 返回 | 含义 |
+|---|---|---|
+| `OleInitialize` | `0x00000000` | STA 建立成功 |
+| `CoGetApartmentType` | `APTTYPE_MAINSTA` | 线程 = **主 STA** |
+| `RoInitialize(RO_INIT_MULTITHREADED)` | **`0x80010106`** | `RPC_E_CHANGED_MODE` |
+
+**修法**：不再调 `winrt::init_apartment`，改成**直接调 `CoInitializeEx`**，
+把三个"预期"返回码都当成功 —— `S_OK`（本次初始化成功）/ `S_FALSE`（同模式已初始化）/
+`RPC_E_CHANGED_MODE`（已在另一种 apartment，**不改变现状**）—— 一个都不走异常。
+`VA_DBG_MIC=1` 时打一行实证：
+
+```
+[mic] apartment: CoInitializeEx=0x80010106 本线程=MainSTA（0x80010106 = 已是别的 apartment，正常）
+```
+
+**为什么之前注释里那句"本层没有窗口消息泵"不成立**：它只对**自建的**工作线程成立
+（SAPI5 那条就是这么干的，见 `sapi_thread`）。Godot **主线程**每帧
+`PeekMessage`/`DispatchMessage`，消息泵是现成的 ⇒ 落在 Main STA 上完全能用。
+真正要避开的只是那次**抛**，不是 STA 本身。
+
 ### 链路：按住 Q 说话
 
 ```
@@ -2473,11 +2511,12 @@ Kangkang 男声）：`全体开火` / `全体撤退` / `全体隐蔽` → `sweep
 
 | 判据 | 结果 |
 |---|---|
-| 构建 | **0 error / 0 warning**；`bin/volunteer_army_pc.dll` **1,541,120 B** |
+| 构建 | **0 error / 0 warning**；`bin/volunteer_army_pc.dll` **1,544,704 B** |
 | ① 建得起来（probe） | `winrt-onecore`（语言 `zh-Hans-CN`）与 `sapi5-804` 都能建（`SAPI token = …MS-2052-80-DESK`，`Language=804 命中 1 个`）|
 | ② 真的听得到（wav sapi，离线全自动） | 三条全部 `听清=1 下发=1`：`全体开火→fire`、`全体撤退→retreat`、**`全集隐蔽→takeCover`（容错也生效）** |
 | ③ 会话起停（pair winrt，实机按住 4 秒） | `开始听=1 停止听=1 start失败=0` |
 | ④ HUD 状态条（hold auto 截图） | 展开态「红点 + 正在听...」；收起态「按住 Q 说话」 |
+| ⑤ apartment 不再抛（`probe auto`，2026-09-27 修） | `[mic] apartment: CoInitializeEx=0x80010106 本线程=MainSTA` —— 抛点换成普通返回值，F5 开局不再弹首次异常 |
 | 自动回退全链路 | 临时把隐私开关设 0 → `start 失败：…privacy policy was not accepted` → `OneCore 起不来 → 回退 SAPI5` → `听清 → 下发`，之后恢复 1 |
 | 关掉整层（off 对照） | 只剩一行 `[mic] VA_MIC=0 —— 语音输入层关闭` |
 | 离线战役回归 | `va_sweep.exe campaign 7`：过关 4/5、阵亡 3、撤离 37 人次、总用时 1200 秒（**等价基线**，`src/sim/` 一行未改）|

@@ -40,6 +40,7 @@
 
 #include <windows.h>
 #include <objbase.h>
+#include <combaseapi.h>   // CoInitializeEx / CoGetApartmentType / RPC_E_CHANGED_MODE
 #include <oleauto.h>      // VARIANT（SPPHRASEPROPERTY::vValue 用到）
 #include <sapi.h>
 #include <wrl/client.h>   // Microsoft::WRL::ComPtr —— 只为了让几个临时 COM 对象不漏引用
@@ -279,13 +280,42 @@ struct MicVoice::Impl {
 bool MicVoice::Impl::setup_winrt(bool p_dictation, std::string &p_err, std::string &p_name) {
     p_name = "winrt-onecore";
     try {
-        /* COM apartment。Godot 主线程可能已经进过某个 apartment（MTA），
-           再 init 另一种模式会抛 RPC_E_CHANGED_MODE(0x80010106) —— 那不是故障，
-           说明已经初始化过，接着用就行。用 MTA 而不是 STA：本层没有窗口消息泵。 */
-        try {
-            winrt::init_apartment(winrt::apartment_type::multi_threaded);
-        } catch (const winrt::hresult_error &e) {
-            if (e.code().value != static_cast<std::int32_t>(0x80010106L)) throw;
+        /* ---- COM apartment ----
+           ⚠️ 【不要用 winrt::init_apartment】它内部就是 CoInitializeEx(nullptr, type)，
+           失败即 throw_hresult() **抛** winrt::hresult_error（SDK 原文，base.h:6529）。
+           Godot 主线程在 ole32 上已经 OleInitialize 过（拖放要用），是 **Main STA**，
+           于是 MTA 版本**必然**返回 RPC_E_CHANGED_MODE(0x80010106)：
+           异常虽然被接住、流程没错，但 VS 调试器会把它当"首次异常"，
+           **每次开局都弹一次**（2026-09-27 实测 + 下方 dbg 行的证据）。
+           所以直接调 CoInitializeEx，把三个"预期"返回码都当成功：
+             S_OK                本次初始化成功
+             S_FALSE              本线程已初始化过（同一模式）
+             RPC_E_CHANGED_MODE   本线程已在**另一种** apartment 里（不改变现状）
+           —— 三种都不该走异常。第三种就是本机实际遇到的：主线程是 Main STA。
+
+           为什么 STA 也能用：Godot 主线程每帧 PeekMessage/DispatchMessage，
+           消息泵是现成的 —— 旧注释里"本层没有窗口消息泵"只对**自建的**工作线程成立
+           （SAPI5 那条就是这么干的，见 sapi_thread）。 */
+        const HRESULT hr_apt = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (FAILED(hr_apt) && hr_apt != RPC_E_CHANGED_MODE) {
+            p_err = "winrt: CoInitializeEx " + hr_text(hr_apt);
+            return false;
+        }
+        if (dbg_on()) {
+            APTTYPE at = APTTYPE_CURRENT;
+            APTTYPEQUALIFIER aq = APTTYPEQUALIFIER_NONE;
+            const char *nm = "?";
+            if (SUCCEEDED(::CoGetApartmentType(&at, &aq))) {
+                switch (at) {
+                    case APTTYPE_STA:     nm = "STA";       break;
+                    case APTTYPE_MTA:     nm = "MTA";       break;
+                    case APTTYPE_MAINSTA: nm = "MainSTA";   break;
+                    case APTTYPE_NA:      nm = "NA(中立)";   break;
+                    default:              nm = "其它";       break;
+                }
+            }
+            dbg("apartment: CoInitializeEx=0x%08lX 本线程=%s（0x80010106 = 已是别的 apartment，正常）",
+                (unsigned long)hr_apt, nm);
         }
 
         rec = WSR::SpeechRecognizer();
