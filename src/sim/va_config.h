@@ -18,7 +18,7 @@ struct LevelCfg {
     float bridgeY1 = 566, bridgeY2 = 734;
     float tIntel = 30;         // 0:00-0:30 情报
     float tDeploy = 120;       // 0:30-2:00 部署
-    float convoyIn = 175;      // 2:55 先头车进入地图
+    float convoyIn = 175;      // 非战役默认（战役五关覆盖为 30 s）；原值 2:55 先头车进入地图
     float reinforceAt = 480;   // 8:00 增援
     float missionEnd = 600;    // 10:00 强制结束
     float tailSpeedUp = 250;   // 车队接近西侧出口

@@ -79,7 +79,7 @@ struct LevelDef {
     // ---- 时间轴（秒）----
     float tIntel     = 30;    // 情报阶段
     float tDeploy    = 120;   // 部署阶段
-    float convoyIn   = 175;   // 敌人进入地图
+    float convoyIn   = 175;   // 敌人进入地图（战役五关各自覆盖为 30 s，见 va_campaign.cpp）
     float missionEnd = 420;   // 本关时限（同时也是 Delay 类目标的判据）
     float reinforceAt = 480;  // 增援到达
 
