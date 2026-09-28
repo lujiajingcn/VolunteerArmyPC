@@ -1756,8 +1756,34 @@ static const PropArtDef kPropArt[] = {
     { "prop_rock_b", false, 0.50f },   // 苔覆圆石（矮而宽）
     { "prop_pine",   true,  0.00f },   // 针叶树
     { "prop_bush",   false, 0.36f },   // 低矮灌丛
+    /* 【2026-09-28 新增三个树种：路边不再只有一种树】
+       此前路边三十多棵全是 `prop_pine` **同一个模型**；而岩石当时特意做了
+       a / b 两份不同剪影按 hash 交替（README「变体是少钱多变化的便宜做法」）。
+       三个新件都用混元生3D 的**文生3D** 做（同一天的内置通道额度，5 次里用掉 3 次），
+       形制按 1950 年 11 月长津湖的冬季实景取 —— **落叶乔木的叶子已经掉光**：
+         prop_bare_a → 高大乔木剪影：粗主干 + 三四根粗主枝向上张开
+         prop_bare_b → 矮小乔木剪影：贴地分叉 + 五六根斜枝 + 略球形骨架
+         prop_birch  → 白桦：白色纸质剥落树皮 + 稀疏黑色横纹
+       三个都按**高**归一化（by_height=true），所以战场上的**树高分布一个字没变**
+       （Tree 分支的 h 仍是 7.0 + rng·3.0），变的只是"同一片林子里有几副面孔"。
+       ⚠️ 判据②（冠幅/高 ≥ 0.15）对这三个同样成立，实测 0.934 / 0.990 / 0.538。
+       ⚠️ 已知未修项：三个新件的**反照率贴图偏亮**（中位 130 / 118 / 167，
+          而现役 prop_pine 是 69）—— 实机里表现为"枝干发白、在雪地里对比度偏低"。
+          这是贴图本体的问题、不是材质（metallic 全 <0.12、roughness 全 >0.84），
+          要修得压反照率，留待下一轮；这一轮先接入看整体节奏对不对。 */
+    { "prop_bare_a", true,  0.00f },
+    { "prop_bare_b", true,  0.00f },
+    { "prop_birch",  true,  0.00f },
 };
 static const int kPropArtN = (int)(sizeof(kPropArt) / sizeof(kPropArt[0]));
+
+/* 树种表：Tree 分支按 hash 从这里选。**下标 0 兼作回退件**（见 Tree 分支的回退链），
+   所以它必须是"基线上一定有"的那个 —— prop_pine 是最早接入的，放这里。
+   表里每个键都必须同时出现在 kPropArt 里、且都是 by_height=true 那一档
+   （Tree 是按高归一化的，混进按宽归一化的键会得到尺寸完全不对的树）。
+   VA_TREE_MIX=0 → 只出 prop_pine，得到与"加新树种之前"逐像素相同的对照。 */
+static const char *kTreeKeys[] = { "prop_pine", "prop_bare_a", "prop_bare_b", "prop_birch" };
+static const int kTreeKeysN = (int)(sizeof(kTreeKeys) / sizeof(kTreeKeys[0]));
 
 static const PropArtDef *prop_art_def(const std::string &p_key) {
     for (int i = 0; i < kPropArtN; ++i) {
@@ -1960,10 +1986,36 @@ static void add_prop(Node3D *parent, Node *p_proto_parent, const va::Prop &p) {
                冠幅交给模型自己（约 4 m）：逻辑层的 p.r 对树只管"俯视遮挡半径"、
                高度不受它约束，若改按冠幅归一化，8 米的树会缩成 3 米的灌木。
                偏航按 hash 撒开 —— 针叶树是旋转体，但要的是"这片林子不是同一棵"。 */
-            if (Node3D *m = make_prop_node("prop_pine", h, p_proto_parent)) {
-                m->set_position(pos);
-                m->set_rotation(Vector3(0, (float)((uint32_t)(p.x * 7 + p.y * 13) % 360u) * DEG2RAD, 0));
-                parent->add_child(m);
+            /* 【2026-09-28 树种按 hash 分流】原来这里硬编码 prop_pine，于是路边
+               三十多棵是同一个模型。现在四个树种（针叶 + 落叶 ×2 剪影 + 白桦）
+               按 hash 分流 —— 与岩石 a/b 交替同一个手法（README 的"变体是
+               少钱多变化的便宜做法"）。
+               【树种 hash 为什么单起一个 Rng、不复用上面那条】上面那条 rng 后面
+               还要供**程序化回退**用（缺模型时的对照基准），多消耗一个 next
+               会让基准外观跟着变 —— 而基准必须稳定，否则"模型变没变好"就没法比。
+               【为什么乘子与偏航那对 (7,13) 不同】树种与偏航是两个正交的自由度；
+               若共用同一组系数，会出现"某个树种永远朝某个方向"的可见规律 ——
+               战场坐标是有空间聚集性的（同一片林子 p.x/p.y 相近）。
+               【回退链】选中的键缺失 → 退回 prop_pine → 再失败才落到下面的
+               程序化图元。没有这条链的话，只要有一个 .glb 缺失，那 25% 的树
+               会突然变成"程序化绿球"，在一整片真模型里格外扎眼。
+               VA_TREE_MIX=0 只出 prop_pine —— 与加新树种之前逐像素相同的对照。 */
+            va::Rng trng((uint32_t)(p.x * 73856093u) ^ (uint32_t)(p.y * 19349663u)
+                         ^ 0x85EBCA6Bu);
+            int ti = 0;
+            if (!env_off("VA_TREE_MIX")) {
+                ti = (int)(trng.next() * (float)kTreeKeysN);
+                if (ti < 0 || ti >= kTreeKeysN) ti = 0;   // next() 上界的保险
+            }
+            const char *tkey = kTreeKeys[ti];
+            Node3D *tm = make_prop_node(tkey, h, p_proto_parent);
+            if (tm == nullptr && tkey != kTreeKeys[0]) {
+                tm = make_prop_node(kTreeKeys[0], h, p_proto_parent);
+            }
+            if (tm != nullptr) {
+                tm->set_position(pos);
+                tm->set_rotation(Vector3(0, (float)((uint32_t)(p.x * 7 + p.y * 13) % 360u) * DEG2RAD, 0));
+                parent->add_child(tm);
                 break;
             }
             const float trunk_r = r * 0.15f + 0.030f;
