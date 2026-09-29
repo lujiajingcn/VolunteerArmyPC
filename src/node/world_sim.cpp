@@ -111,10 +111,14 @@ void WorldSim::aim_at_road() {
      VA_UNIT_SHOW=veh:<类型>[:<度>]  单车近景，类型 = jeep | apc | tank | truck
      VA_UNIT_SHOW=veh:row           四辆车的陈列排（按 jeep/apc/tank/truck 固定顺序）
 
-   地物还有两条（前缀 prop:，2026-09-22 加）：
+   地物还有三条（前缀 prop:，2026-09-22 加；row2 于 2026-09-29 加）：
      VA_UNIT_SHOW=prop:<键>[:<度>]  近景单体，键 = prop_rock_a | prop_rock_b |
-                                    prop_pine | prop_bush（按场上典型尺寸摆）
-     VA_UNIT_SHOW=prop:row          四件地物的陈列排（固定顺序，看彼此差异）
+                                    prop_pine | prop_bush | prop_barrel_a/b/c |
+                                    prop_wall_a/b（按场上典型尺寸摆，附 1.68 m 参照兵）
+     VA_UNIT_SHOW=prop:row          掩体组陈列排：岩石 a/b + 松树 + 灌丛（固定顺序）
+     VA_UNIT_SHOW=prop:row2         硬质小件组陈列排：油桶 a/b/c + 桥墩墙 a/b
+   【为什么陈列排要分两组】体量差一个量级的两批放一起必然有一批看不清：
+   8 m 的树与 0.88 m 的桶同框时，取景按大的算，桶只剩几个像素。
    地物这条的取景按**物体自身的实际高度**推（灌木 0.6 m 与松树 8 m 没法共用一套距离），
    且相机高取 0.5×H —— 低矮地物的判据是"底下那条地面余量"，相机太高就俯视、余量被压没。
    
@@ -410,60 +414,119 @@ void WorldSim::build_unit_showcase() {
         float dyaw = 0.0f;
         if (!yaw_s.empty()) dyaw = (float)std::strtod(yaw_s.c_str(), nullptr) * PI / 180.0f;
 
-        const bool row = (key == "row");
-        const char *pk[4] = { "prop_rock_a", "prop_rock_b", "prop_pine", "prop_bush" };
-        // 代表尺寸：岩石/灌木给的是**水平尺度**、树给的是**高**（与 kPropArt 的
-        // by_height 同口径）。取的是场上最常见的档：岩石 p.r≈22、灌木 p.r≈15、树 8 m。
-        const float pt[4] = { 2.20f, 2.20f, 8.00f, 1.65f };
-        // 高宽比只为算取景用，必须与 kPropArt 保持一致（岩石 0.50 / 灌木 0.36）
-        const float phw[4] = { 0.50f, 0.50f, 0.0f, 0.36f };
+        /* 【2026-09-29 改成表驱动 —— 加硬质小件时才发现这张表是硬编码的】
+           原来是三组写死的 4 元素数组（pk / pt / phw）：加一个地物键要同时改
+           三处长度 + 三处循环上界，而 09-29 一次要加 5 个键，漏一处就是**静默取错景**。
+           现在是一张表 + "这批陈列哪几件"的区间。
+           【hw 不在本文件里写第二份】它从 scene_builder 的 kPropArt 查
+           （prop_art_query）—— 抄一份的后果是"那边改了比例、这边还按旧口径取景"，
+           而取景一错，这条通道唯一的判据（比例对不对）就变成**反的**（2026-09-23 踩过）。
+           【为什么分两组陈列】体量差一个量级的两批放一起必然有一批看不清：
+           8 m 的树与 0.88 m 的桶同框时取景按大的算，桶只剩几个像素。
+             prop:row    → 掩体组（岩石 a/b + 树 + 灌丛），与加硬质小件之前完全一致
+             prop:row2   → 硬质小件组（油桶 a/b/c + 桥墩墙 a/b） */
+        /* 【第三列 yaw_off —— 2026-09-29 加，专治"长条地物被拍成一块竖板"】
+           展台的基准偏航是 a + π（a = 出生点朝公路的方位角 = player->facing），
+           它的含义是"把模型的**正面**转给镜头"。地物没有正面，而地物在 load 时
+           还额外做过一次**对轴**（scene_builder.cpp:1936 —— 把较长的那个水平轴
+           转到局部 X），于是长条地物（矮墙）的长边就落在了局部 X 上。
+           实测 2026-09-29：prop_wall_a 在 0° 下长边几乎**平行于视线** ——
+             节点局部 X 的世界方向 = (-cos a, 0, sin a)
+             相机前方             = ( cos a, 0, sin a)
+             两者夹角的 |sin| = |sin 2a|，本局 ≈ 0.42 ⇒ 长边只偏视线 25°。
+           透视于是把 2.00 m 的长边压成屏幕上约 1.2 m，**读起来是一块竖着的板**，
+           而它实际是 2.0(长) × 1.05(高) × 0.42(厚)。
+           ⚠️ 这条通道存在的唯一理由就是"比例对不对"，取景把长边压掉 = 判据变成反的，
+           与 2026-09-23 那次"取景表取错行"是同一类**静默偏差**，所以在这里补掉。
+           桶/岩石/灌木近各向同性，转不转看不出来，给 0 以保持与既有取证图一致；
+           只有长条地物给 90°。
+           【局限，别当成万能】90° 只在 |sin 2a| 不接近 1 时够用。a 由出生点决定、
+           本局是个常数，所以取证稳定；若要跟 a 无关地"长边永远垂直于视线"，
+           得把基准 yaw 换成相机 yaw（θ = -a - π/2 = yaw_），但那会同时改掉
+           row 组的既有取证口径（岩石/树/灌木的观感），与"与加硬质小件之前
+           完全一致"这条承诺冲突 —— 所以先只修长条这一档。
+           【只影响取证，不影响玩法】战场侧的墙走 add_prop 的 set_rotation
+           （yaw = p.y·0.3f，随机朝向），完全不读这一列。 */
+        struct ShowPropDef { const char *key; float t; float yaw_off; };
+        static const ShowPropDef kShowProps[] = {
+            { "prop_rock_a",   2.20f,  0.0f },   // 场上 p.r≈22 ⇒ 2·22·0.05 = 2.2 m（水平尺度）
+            { "prop_rock_b",   2.20f,  0.0f },
+            { "prop_pine",     8.00f,  0.0f },   // 树给的是**高**（by_height=true），取 7.0+rng·3.0 的中档
+            { "prop_bush",     1.65f,  0.0f },   // 灌木 p.r≈15 ⇒ 2.2·15·0.05 = 1.65 m（水平尺度）
+            { "prop_barrel_a", 0.60f,  0.0f },   // 桶给的是**直径**（by_height=false，高由 hw 定）
+            { "prop_barrel_b", 0.60f,  0.0f },
+            { "prop_barrel_c", 0.60f,  0.0f },
+            { "prop_wall_a",   2.00f, 90.0f },   // 墙给的是**长轴**；r=1.0 m ⇒ 2.0 m，高由 hw=0.525 定
+            { "prop_wall_b",   2.00f, 90.0f },   // 长条：必须 +90 才读得出长边（见上）
+        };
+        static const int kShowPropsN = (int)(sizeof(kShowProps) / sizeof(kShowProps[0]));
+        static const int kShowMaskN  = 4;    // 掩体组 = 下标 [0, kShowMaskN)
 
-        /* 【单体模式必须按**点中的那个键**取尺寸，不能一律用 pt[0]】（2026-09-23 修）
+        const bool row  = (key == "row");
+        const bool row2 = (key == "row2");
+
+        /* 【单体模式必须按**点中的那个键**取尺寸，不能一律用第 0 项】（2026-09-23 修）
            原来取景与建节点两处都写成 `row ? pt[i] : pt[0]`，于是 `prop:prop_pine`
            把 8 m 的树按 2.2 m 建出来、又按 2.2 m 取景 —— 截图上就是"树怎么跟人差不多高"，
            而战场上它是按 `7.0 + rng·3.0` 摆的，两边对不上。
-           这条通道存在的唯一理由就是回答"**比例对不对**"，所以这个 bug 恰好
-           把它的判据毁掉：拍出来偏小，看着像"树接错了"，其实是取景表取错了行 ——
+           这条通道存在的唯一理由就是回答"**比例对不对**"，所以那个 bug 恰好把它的判据毁掉：
+           拍出来偏小、看着像"模型接错了"，其实是取景表取错了行 ——
            最坏的一种错，因为它会让人去改一个本来正确的模型。
-           键写错时静默退回 pt[0]（= 改动前的行为），所以顺手把解析出的下标喊进日志。 */
-        int pick[4] = { 0, 1, 2, 3 };
-        if (!row) {
-            int idx = 0;
-            for (int i = 0; i < 4; ++i) {
-                if (key == pk[i]) { idx = i; break; }
+           键写错时仍退回第 0 项（= 改动前的行为），所以顺手把解析出的下标喊进日志。 */
+        int lo = 0, n = 1;
+        if (row) {
+            lo = 0; n = kShowMaskN;
+        } else if (row2) {
+            lo = kShowMaskN; n = kShowPropsN - kShowMaskN;
+        } else {
+            int idx = -1;
+            for (int i = 0; i < kShowPropsN; ++i) {
+                if (key == kShowProps[i].key) { idx = i; break; }
             }
-            pick[0] = idx;
-            if (key != pk[idx]) {
+            if (idx < 0) {
+                idx = 0;
                 UtilityFunctions::print(String::utf8("[show] 未知地物键 "),
                                         String::utf8(key.c_str()),
                                         String::utf8("（临时按 prop_rock_a 的尺寸取景）"));
             }
+            lo = idx;
         }
-        const int n = row ? 4 : 1;
 
         float max_h = 0.0f, sum_w = 0.0f;
-        for (int i = 0; i < n; ++i) {
-            const int j = pick[i];
-            const float h = (phw[j] > 0.0f) ? pt[j] * phw[j] : pt[j];
-            const float w = (phw[j] > 0.0f) ? pt[j] : pt[j] * 0.5f;   // 树冠估算 0.5H
+        for (int i = lo; i < lo + n; ++i) {
+            bool by_h = false; float hw = 0.0f;
+            prop_art_query(std::string(kShowProps[i].key), &by_h, &hw);
+            const float t = kShowProps[i].t;
+            const float h = by_h ? t : t * hw;
+            const float w = by_h ? t * 0.5f : t;   // 树冠估算 0.5H
             max_h = std::max(max_h, h);
             sum_w += w;
         }
-        const float GAP_P = row ? 1.60f : 0.0f;
+        /* 陈列间距：row2 用 0.50 而不是 1.60 —— 掩体组里有 8 m 的树，
+           1.6 m 的缝才拉得开；硬质小件最大才 2 m，1.6 的缝会把整个排推到 12 m 宽、
+           镜头跟着退到 13 m 外，桶就剩几个像素了。
+           【这一处 2026-09-29 漏改过】第一版只把 `row` 改成了 `(row || row2)` 的一半，
+           漏了 GAP_P 与 D_horz —— 症状是 row2 的件**紧贴在一起**
+           （间距 = 前一件的 w_i，桶挨桶、墙挨墙）。取景数字看着"正常"（横向跨 5.8），
+           所以只能从图上看出来 —— 这正是"分组的判据没跟着分组走"那类静默偏差。 */
+        const float GAP_P = row ? 1.60f : (row2 ? 0.50f : 0.0f);
         const float row_w = sum_w + GAP_P * (float)(n - 1);
         const float CAM_H  = std::max(0.90f, 0.50f * max_h);
         const float D_vert = 2.27f * max_h;
-        const float D_horz = (row ? (row_w * 0.5f * 1.15f) : (row_w * 0.5f + 2.0f)) / 0.536f;
+        // row2 也是"陈列排"，取景公式必须与 row 走同一支 —— 落到 else 支会按**单体**的
+        // 留白（row_w*0.5 + 2.0）算，等于把五件的排当成一件来拍，两端会被裁掉。
+        const float D_horz = ((row || row2) ? (row_w * 0.5f * 1.15f) : (row_w * 0.5f + 2.0f)) / 0.536f;
         const float DIST_M = std::max(6.0f, std::max(D_vert, D_horz));
         const float PITCH  = -0.06f;
         const float REF_OFF_M = 1.60f;
 
         int built = 0;
         float off_acc = -row_w * 0.5f;
-        for (int i = 0; i < n; ++i) {
-            const int j = pick[i];
-            const std::string k = row ? std::string(pk[i]) : key;
-            const float t = pt[j];
+        for (int i = lo; i < lo + n; ++i) {
+            bool by_h = false; float hw = 0.0f;
+            prop_art_query(std::string(kShowProps[i].key), &by_h, &hw);
+            const std::string k = (row || row2) ? std::string(kShowProps[i].key) : key;
+            const float t = kShowProps[i].t;
             Node3D *nd = make_prop_node(k, t, refs_.units);
             if (nd == nullptr) {
                 // 与角色/载具同口径：缺模型**留空位**而不是把后面的往前挪 ——
@@ -473,12 +536,24 @@ void WorldSim::build_unit_showcase() {
                                         String::utf8("）空置"));
                 continue;
             }
-            const float w_i = (phw[j] > 0.0f) ? pt[j] : 4.0f;
-            const float off_m = row ? (off_acc + w_i * 0.5f) : 0.0f;
+            const float w_i = by_h ? 4.0f : t;
+            const float off_m = (row || row2) ? (off_acc + w_i * 0.5f) : 0.0f;
             off_acc += w_i + GAP_P;
             const float lx = p->x + fx * DIST_M * U + rx * off_m * U;
             const float ly = p->y + fy * DIST_M * U + ry * off_m * U;
-            // 地物没有"正面"，偏航只用来核对"压扁/对轴有没有把它转歪"。
+            // 地物没有"正面"，偏航有两件事要管：
+            //   ① kShowProps[i].yaw_off —— 把**长条地物**的长边转成垂直于视线
+            //      （否则透视把 2 m 压成 1.2 m，读成一块竖板，见表头那段注释）；
+            //   ② 核对"压扁/对轴有没有把它转歪"。
+            const float yaw_off = kShowProps[i].yaw_off * PI / 180.0f;
+            // 逐件报，不在末尾报"首件" —— row2 的首件是桶（0°），末尾报就会
+            // 出现"日志说 0 度、图上墙却转了"的误导（2026-09-29 实际踩到）。
+            if (kShowProps[i].yaw_off != 0.0f) {
+                UtilityFunctions::print(String::utf8("[show] 长条地物 "),
+                                        String::utf8(kShowProps[i].key),
+                                        String::utf8(" 展台偏航 "), kShowProps[i].yaw_off,
+                                        String::utf8(" 度（把长边转成垂直于视线，长边才不被透视压掉）"));
+            }
             /* 【缩放必须合进 Basis，不能 set_transform 之后再想】set_transform 是
                **整体替换**：它会把 make_prop_node 里设好的 Vector3(t,t,t) 一并抹成 1。
                于是检阅台里每一件地物都按"归一化后的单位原型"渲染 —— 岩石 1.0 m 宽
@@ -488,15 +563,18 @@ void WorldSim::build_unit_showcase() {
                唯一理由就是回答"比例对不对"，它一错，判据就变成反的：
                拍出来树只有人一半高，看着像"模型接错了"，其实该改的是取景（这里）。
                2026-09-23 实测：树 135 px / 参照兵 236 px，反推 0.96 m，恰好是单位原型。 */
-            Basis pb(Vector3(0, 1, 0), a + PI + dyaw);
+            Basis pb(Vector3(0, 1, 0), a + PI + dyaw + yaw_off);
             pb.scale(Vector3(t, t, t));
             nd->set_transform(Transform3D(pb, to3(lx, ly, ground_h(lx, ly))));
             stage->add_child(nd);
             ++built;
         }
 
-        // 比例尺参照兵：与载具那条同一个理由 —— "跟人比多大"只能靠同框回答。
-        if (!row) {
+        /* 比例尺参照兵：与载具那条同一个理由 —— "跟人比多大"只能靠同框回答。
+           ⚠️ 只在**单体**模式下摆：陈列排的物心在排的正中，而参照兵固定偏 1.6 m ——
+           在 row2 那种十几米宽的排里，它会正好站在桶和墙中间、与展品重叠。
+           陈列排要回答的是"这几件彼此像不像"，绝对比例交给单体模式。 */
+        if (!row && !row2) {
             if (Node3D *ref = make_unit_node_by_key("char_rifleman", refs_.units)) {
                 const float lx = p->x + fx * DIST_M * U + rx * REF_OFF_M * U;
                 const float ly = p->y + fy * DIST_M * U + ry * REF_OFF_M * U;

@@ -146,6 +146,17 @@ godot::Node3D *make_unit_node_by_key(const std::string &p_key, godot::Node *p_pr
    界面道具按**最大维**缩放（章体、沙盘这类东西没有"身高"这个概念）。 */
 godot::Node3D *make_stage_model(const std::string &p_key);
 
+/* 地物的归一化口径查询（kPropArt 是**唯一**真值来源）。
+   返回 false = 这个键不在表里 —— 引擎侧会走回退路径、不渲染真模型。
+   *out_by_height：true = 按**高**归一化；false = 按**水平尺度**归一化、并把高宽比压到 hw。
+   *out_hw        ：by_height=false 时生效的高宽比（by_height=true 时恒为 0）。
+
+   【为什么值得开这个口子】检阅台（VA_UNIT_SHOW=prop:*）算取景与建节点的目标尺寸
+   要用到 hw，而它在 world_sim.cpp —— 在那边抄一份就会重演 2026-09-23 那个坑：
+   取景表按了旧口径，症状是"拍出来偏小、看着像模型接错了"，而**真正该改的是取景表**。
+   真值只留一处，两个调用方都从 kPropArt 读。 */
+bool prop_art_query(const std::string &p_key, bool *out_by_height, float *out_hw);
+
 // 单位在场景里的姿态：偏航（模型前方 = +X，故绕 Y 转 -facing）+ 倒地时绕**自身前方轴**
 // 的 84° 侧翻；p_x / p_y 是逻辑层的 2D 坐标。
 //

@@ -1774,6 +1774,36 @@ static const PropArtDef kPropArt[] = {
     { "prop_bare_a", true,  0.00f },
     { "prop_bare_b", true,  0.00f },
     { "prop_birch",  true,  0.00f },
+    /* 【2026-09-29 硬质小件：油桶 ×3 + 桥墩矮墙 ×2】
+       此前这三件（Barrel / Wall / Trench）是场上**最后一批纯几何体** ——
+       树 / 岩石 / 灌木在 09-22~09-28 三轮里已经全部换成真模型。
+       Barrel = CylinderMesh 单色红锈圆柱（每关 5~6 只）；
+       Wall   = BoxMesh 单色方块（每关 4 面，桥墩，矩形四角排布）。
+       Trench **有意不做**：它是 `blocksLos=false + low=true` 的 0.14 m 薄板，
+       语义是"能趴进去的浅沟"，任何有高度的实体模型都会把 `low` 读破 ——
+       摆上去就不是"沟"而是"矮墙"，等于凭空多一层掩体。见 README 待办。
+
+       ⚠️ 两件都用 by_height=false（按**水平尺度**归一化）+ 用 hw 钉死高度。
+          注意这里 hw 的作用与岩石/灌木**不同**：岩石/灌木是按宽归一化之后
+          "压扁"到 hw（它们本来就该矮）；这两件是用 hw **强制**高度 ——
+          因为生成器给的高宽比不可信（见下面墙上那条已知未修项）。
+       · 油桶：hw = 0.88/0.60 = 1.467（55 加仑桶实尺：直径 0.60 m、高 0.88 m）。
+         调用方传的 target 是**直径**、高由 hw 定成 0.88 m。
+         实测三个件原始 高/径 = 1.523 / 1.503 / 1.536，对目标 1.467 的拉伸量
+         |ys−1| ≤ 0.05 —— **几乎不动**，桶身没有可见变形。
+       · 矮墙：hw = 1.05/2.00 = 0.525（2.0 长 × 1.05 高 × 0.85 厚）。
+         调用方传的 target 是**长轴**。
+         ⚠️ **已知未修项**：生成器给的两个件原始 高/长 只有 **0.263 / 0.297**，
+            只有目标的一半 ⇒ 归一化必须把 Y **纵向拉伸 1.77~2.00 倍**才能压到 0.525。
+            两个后果：(a) 石砌/水泥纹理被纵向拉长；(b) 厚度**钉不死**（实测 0.42 / 0.60 m，
+            目标是 0.85 m）。根因在 prompt —— 写的是"长度大约是高度的两倍"这个
+            **比例关系的说法**，生成器没照做。下一轮改成**给实尺**（"长约两米、高约一米、
+            厚约八十厘米"）。本轮先接入，因为"拉 2 倍的石头墙到底难不难看"只能由画面回答。 */
+    { "prop_barrel_a", false, 1.467f },
+    { "prop_barrel_b", false, 1.467f },
+    { "prop_barrel_c", false, 1.467f },
+    { "prop_wall_a",   false, 0.525f },
+    { "prop_wall_b",   false, 0.525f },
 };
 static const int kPropArtN = (int)(sizeof(kPropArt) / sizeof(kPropArt[0]));
 
@@ -1785,11 +1815,42 @@ static const int kPropArtN = (int)(sizeof(kPropArt) / sizeof(kPropArt[0]));
 static const char *kTreeKeys[] = { "prop_pine", "prop_bare_a", "prop_bare_b", "prop_birch" };
 static const int kTreeKeysN = (int)(sizeof(kTreeKeys) / sizeof(kTreeKeys[0]));
 
+/* 硬质小件的变体表（2026-09-29）。与 kTreeKeys 同一个作用：让场上十几件道具
+   不是同一份模型复制出来的（每关 5~6 只油桶 + 4 面桥墩墙）。
+   **下标 0 兼作回退件** —— 选中的键缺失时退回它，再失败才走程序化图元；
+   所以它必须是"基线上一定有"的那个。
+   表里每个键都必须同时出现在 kPropArt 里、且都是 by_height=false 那一档
+   （两件都按**水平尺度**归一化；混进 by_height=true 的键会得到尺寸完全不对的道具）。
+   VA_PROP_HARD=0 → 两件都回退程序化图元，得到与"加硬质小件之前"逐像素相同的对照。 */
+static const char *kBarrelKeys[] = { "prop_barrel_a", "prop_barrel_b", "prop_barrel_c" };
+static const int kBarrelKeysN = (int)(sizeof(kBarrelKeys) / sizeof(kBarrelKeys[0]));
+/* ⚠️ `prop_wall_b`（粗石垒砌）**已生成、但 2026-09-29 实测否决、未接入**：
+   它的原始包围盒 高/长 = 0.297，而 kPropArt 的 hw = 0.525 ⇒ 归一化必须把 Y
+   **纵向拉伸 1.77 倍**。水泥墙（wall_a）的竖向木模板缝被拉长了看不出来，
+   但石砌墙的石块被拉成一根根**竖长条**、一层只剩 4 层，实机读作"冰砖砌的墙"；
+   它的色相同时偏青蓝，雪地里更强化了那个读感。
+   根因是生成器没照 prompt 里的比例走（"长度大约是高度的两倍"这种**比例关系的说法**
+   不如具体米数有效）—— 下一轮改成给实尺再试，本轮先用水泥那件。
+   件已归档 sweep/gen3d_prop/rejected/，raw 与 json 留在 sweep/gen3d_prop/。 */
+static const char *kWallKeys[] = { "prop_wall_a" };
+static const int kWallKeysN = (int)(sizeof(kWallKeys) / sizeof(kWallKeys[0]));
+
 static const PropArtDef *prop_art_def(const std::string &p_key) {
     for (int i = 0; i < kPropArtN; ++i) {
         if (p_key == kPropArt[i].key) return &kPropArt[i];
     }
     return nullptr;
+}
+
+// 口径查询的对外入口（声明在 scene_builder.h）。**实现在这里而不是 world_sim.cpp**，
+// 是为了让 kPropArt 保持唯一真值来源 —— 理由见头文件那段注释（取景按旧口径 = 只影响
+// 取证、却会让人去改一个本来正确的模型，2026-09-23 踩过）。
+bool prop_art_query(const std::string &p_key, bool *out_by_height, float *out_hw) {
+    const PropArtDef *d = prop_art_def(p_key);
+    if (d == nullptr) return false;
+    if (out_by_height != nullptr) *out_by_height = d->by_height;
+    if (out_hw != nullptr) *out_hw = d->hw;
+    return true;
 }
 
 static std::map<std::string, Node3D *> s_prop_proto;   // 键 -> 单位原型（已归一化，隐藏）
@@ -2103,6 +2164,31 @@ static void add_prop(Node3D *parent, Node *p_proto_parent, const va::Prop &p) {
             break;
         }
         case va::PropType::Barrel: {
+            /* 真模型：三只桶（军用绿 / 锈蚀 / 泥污）按 hash 分流 —— 与岩石 a/b、
+               树 4 树种同一个手法（README 的"变体是少钱多变化的便宜做法"）。
+               【为什么目标尺寸写死 0.60 而不是从 p.r 推】逻辑层 make_barrel 里
+               `p.r = 8`（= 0.40 m）是"俯视遮挡半径"的旧占位值，从来就不是桶的直径
+               （现役 CylinderMesh 也是写死 set_top_radius(0.30)），
+               而改逻辑层会重打平衡基线。所以这里与现役图元同口径：直径 0.60 m。
+               【为什么是 make_prop_node 而不是 add_mesh】模型原点已在**底面中心**
+               （load_prop_proto 里把包围盒底面挪到原点），所以直接 set_position(pos)
+               就是"桶底贴地"；而现役 CylinderMesh 的几何中心在中间，才要抬 0.44。 */
+            const char *bkey = kBarrelKeys[(uint32_t)(p.x * 37 + p.y * 61) % (uint32_t)kBarrelKeysN];
+            Node3D *bm = nullptr;
+            if (!env_off("VA_PROP_HARD")) {
+                bm = make_prop_node(bkey, 0.60f, p_proto_parent);
+                if (bm == nullptr && bkey != kBarrelKeys[0]) {
+                    bm = make_prop_node(kBarrelKeys[0], 0.60f, p_proto_parent);
+                }
+            }
+            if (bm != nullptr) {
+                // 桶是旋转体，偏航只为"这五六只不是同一只"，乘子与树/岩石的都不同（正交自由度）。
+                bm->set_position(pos);
+                bm->set_rotation(Vector3(0, (float)((uint32_t)(p.x * 23 + p.y * 41) % 360u) * DEG2RAD, 0));
+                parent->add_child(bm);
+                break;
+            }
+            // 回退：一根光溜溜的圆柱。同时是"真模型接坏了吗"的对照基准，**不要删**。
             Ref<CylinderMesh> m = memnew(CylinderMesh);
             m->set_top_radius(0.30f);
             m->set_bottom_radius(0.30f);
@@ -2111,6 +2197,33 @@ static void add_prop(Node3D *parent, Node *p_proto_parent, const va::Prop &p) {
             break;
         }
         case va::PropType::Wall: {
+            /* 真模型：两副面孔（水泥浇筑 / 粗石垒砌）按 hash 交替 ——
+               四段桥墩里出现两种材质不算穿帮，1951 年的桥反复被炸又反复抢修，
+               新旧混杂正是那种桥该有的样子。
+               ⚠️ **水坝（p.dam）必须排除**：`make_dam` 复用 PropType::Wall，
+                  而它的 r 是 `w*0.5`（内外加山那关 w=150 → r=3.75 m ⇒ 宽 7.5 m），
+                  拿桥墩模型去撑 7.5 m 会得到一段被拉长的巨墙。水坝每关最多一处、
+                  且是剧情道具（炸开断我方退路），本轮不碰它，保持程序化 BoxMesh ——
+                  与"先把数量最多的那批换掉"这个取舍一致。
+               【目标尺寸按 r 推】`r*2` 是长轴（= 现役 BoxMesh 的 size.x 口径），
+                  高由 kPropArt 的 hw=0.525 定成 1.05·r（r=1.0 m 时正好 1.05 m）。
+               【偏航保留原样】现役写的是 `p.y * 0.3f`，桥墩四角靠它转出朝向；
+                  模型的长轴已被 load_prop_proto 自动对到 X 轴，与 BoxMesh 的长边同轴，
+                  所以这个偏航的语义一个字没变。 */
+            if (!p.dam && !env_off("VA_PROP_HARD")) {
+                const char *wkey = kWallKeys[(uint32_t)(p.x * 53 + p.y * 29) % (uint32_t)kWallKeysN];
+                Node3D *wm = make_prop_node(wkey, 2.0f * r, p_proto_parent);
+                if (wm == nullptr && wkey != kWallKeys[0]) {
+                    wm = make_prop_node(kWallKeys[0], 2.0f * r, p_proto_parent);
+                }
+                if (wm != nullptr) {
+                    wm->set_position(pos);
+                    wm->set_rotation(Vector3(0, p.y * 0.3f, 0));
+                    parent->add_child(wm);
+                    break;
+                }
+            }
+            // 回退：一块水泥色砖头。同时是"真模型接坏了吗"的对照基准，**不要删**。
             Ref<BoxMesh> m = memnew(BoxMesh);
             m->set_size(Vector3(r * 2.0f, 1.05f, r * 0.85f));
             add_mesh(parent, m, pos + Vector3(0, 0.52f, 0), mat_solid(Color(0.40f, 0.39f, 0.36f), 0.95f), Vector3(0, p.y * 0.3f, 0));
